@@ -131,9 +131,15 @@ impl DeepBookClient {
 
         let oracles = self.oracle_list().await?;
         let now = Utc::now();
-        let mut snapshots = Vec::new();
 
-        for oracle in oracles.into_iter().filter(OracleListItem::is_btc) {
+        let active_btc_oracles = oracles
+            .into_iter()
+            .filter(|oracle| oracle.is_btc() && oracle.is_active_or_live())
+            .collect::<Vec<_>>();
+
+        let mut snapshots = Vec::with_capacity(active_btc_oracles.len());
+
+        for oracle in active_btc_oracles {
             let Some(oracle_id) = oracle.oracle_id.clone() else {
                 snapshots.push(MarketSnapshot::evaluate(
                     oracle,
