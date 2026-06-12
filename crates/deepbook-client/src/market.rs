@@ -88,14 +88,7 @@ impl MarketSnapshot {
             StructxMarketStatus::Rejected(reasons)
         };
 
-        Self {
-            list_item,
-            state,
-            latest_price,
-            latest_svi,
-            ask_bounds,
-            structx_status,
-        }
+        Self { list_item, state, latest_price, latest_svi, ask_bounds, structx_status }
     }
 
     #[must_use]
@@ -116,24 +109,17 @@ impl MarketSnapshot {
 
     #[must_use]
     pub fn status(&self) -> Option<&str> {
-        self.state
-            .as_ref()
-            .and_then(|s| s.status.as_deref())
-            .or(self.list_item.status.as_deref())
+        self.state.as_ref().and_then(|s| s.status.as_deref()).or(self.list_item.status.as_deref())
     }
 
     #[must_use]
     pub fn expiry_ms(&self) -> Option<i64> {
-        self.state
-            .as_ref()
-            .and_then(|s| s.expiry_ms)
-            .or(self.list_item.expiry_ms)
+        self.state.as_ref().and_then(|s| s.expiry_ms).or(self.list_item.expiry_ms)
     }
 
     #[must_use]
     pub fn expiry_datetime(&self) -> Option<DateTime<Utc>> {
-        self.expiry_ms()
-            .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+        self.expiry_ms().and_then(|ms| Utc.timestamp_millis_opt(ms).single())
     }
 
     #[must_use]
@@ -172,20 +158,15 @@ fn evaluate_rejection_reasons(
 ) -> Vec<MarketRejectionReason> {
     let mut reasons = Vec::new();
 
-    let underlying = state
-        .and_then(|s| s.underlying_asset.as_deref())
-        .or(list_item.underlying_asset.as_deref());
+    let underlying =
+        state.and_then(|s| s.underlying_asset.as_deref()).or(list_item.underlying_asset.as_deref());
 
-    if !underlying
-        .map(|value| value.eq_ignore_ascii_case("BTC"))
-        .unwrap_or(false)
-    {
+    if !underlying.map(|value| value.eq_ignore_ascii_case("BTC")).unwrap_or(false) {
         reasons.push(MarketRejectionReason::NonBtc);
     }
 
-    let active = state
-        .map(OracleState::is_active_or_live)
-        .unwrap_or_else(|| list_item.is_active_or_live());
+    let active =
+        state.map(OracleState::is_active_or_live).unwrap_or_else(|| list_item.is_active_or_live());
 
     if !active {
         reasons.push(MarketRejectionReason::NotActiveOrLive);
@@ -289,10 +270,7 @@ mod tests {
 
     #[test]
     fn market_freshness_filter_accepts_valid_market() {
-        let now = Utc
-            .timestamp_millis_opt(1_900_000_000_000)
-            .single()
-            .expect("valid timestamp");
+        let now = Utc.timestamp_millis_opt(1_900_000_000_000).single().expect("valid timestamp");
 
         let snapshot = MarketSnapshot::evaluate(
             base_list_item(now),
@@ -310,10 +288,7 @@ mod tests {
 
     #[test]
     fn stale_price_is_rejected() {
-        let now = Utc
-            .timestamp_millis_opt(1_900_000_000_000)
-            .single()
-            .expect("valid timestamp");
+        let now = Utc.timestamp_millis_opt(1_900_000_000_000).single().expect("valid timestamp");
 
         let snapshot = MarketSnapshot::evaluate(
             base_list_item(now),
@@ -336,10 +311,7 @@ mod tests {
 
     #[test]
     fn stale_svi_is_rejected() {
-        let now = Utc
-            .timestamp_millis_opt(1_900_000_000_000)
-            .single()
-            .expect("valid timestamp");
+        let now = Utc.timestamp_millis_opt(1_900_000_000_000).single().expect("valid timestamp");
 
         let snapshot = MarketSnapshot::evaluate(
             base_list_item(now),
@@ -362,10 +334,7 @@ mod tests {
 
     #[test]
     fn missing_optional_fields_reject_without_panic() {
-        let now = Utc
-            .timestamp_millis_opt(1_900_000_000_000)
-            .single()
-            .expect("valid timestamp");
+        let now = Utc.timestamp_millis_opt(1_900_000_000_000).single().expect("valid timestamp");
 
         let list_item = OracleListItem {
             oracle_id: Some("0xabc".to_string()),

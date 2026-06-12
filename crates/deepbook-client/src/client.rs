@@ -139,14 +139,10 @@ impl DeepBookClient {
         &self,
         freshness: FreshnessConfig,
     ) -> Result<Vec<MarketSnapshot>> {
-        let vault_available = self
-            .vault_summary()
-            .await
-            .map(|summary| summary.is_present())
-            .unwrap_or(false);
-
+        let vault_available = self.vault_summary().await.map(|v| v.is_present()).unwrap_or(false);
         let oracles = self.oracle_list().await?;
         let now = Utc::now();
+
         let mut snapshots = Vec::new();
 
         for oracle in oracles.into_iter().filter(OracleListItem::is_btc) {
@@ -189,7 +185,6 @@ impl DeepBookClient {
         T: DeserializeOwned,
     {
         let value = self.get_value(path).await?;
-
         serde_json::from_value(value).map_err(|source| DeepBookClientError::Decode {
             endpoint: path.to_string(),
             source,
@@ -203,7 +198,6 @@ impl DeepBookClient {
 
         if !status.is_success() {
             let body = response.text().await.unwrap_or_else(|_| String::new());
-
             return Err(DeepBookClientError::HttpStatus { status, body });
         }
 
@@ -215,6 +209,8 @@ impl DeepBookClient {
 }
 
 fn encode_path_segment(value: &str) -> String {
+    // Oracle IDs are 0x hex object IDs, so path-safe in practice.
+    // Keep this function isolated so we can tighten encoding if server schemas change.
     value.to_string()
 }
 
@@ -231,7 +227,6 @@ mod tests {
         .expect("client builds");
 
         let url = client.endpoint_url("/status").expect("url builds");
-
         assert_eq!(url.as_str(), "https://example.com/base/status");
     }
 

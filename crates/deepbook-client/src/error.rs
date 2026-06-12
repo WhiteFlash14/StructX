@@ -11,10 +11,7 @@ pub enum DeepBookClientError {
     Request(#[from] reqwest::Error),
 
     #[error("endpoint returned non-success status {status}: {body}")]
-    HttpStatus {
-        status: reqwest::StatusCode,
-        body: String,
-    },
+    HttpStatus { status: reqwest::StatusCode, body: String },
 
     #[error("failed to deserialize response from {endpoint}: {source}")]
     Decode {

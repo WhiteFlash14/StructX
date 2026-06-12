@@ -6,6 +6,8 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+chrono.workspace = true
 clap.workspace = true
+comfy-table.workspace = true
 deepbook-client = { path = "../deepbook-client" }
 tokio.workspace = true

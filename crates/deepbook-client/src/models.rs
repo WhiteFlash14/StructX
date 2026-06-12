@@ -54,12 +54,7 @@ pub struct OracleListItem {
     )]
     pub oracle_id: Option<String>,
 
-    #[serde(
-        default,
-        alias = "underlyingAsset",
-        alias = "underlying",
-        alias = "asset"
-    )]
+    #[serde(default, alias = "underlyingAsset", alias = "underlying", alias = "asset")]
     pub underlying_asset: Option<String>,
 
     #[serde(default, alias = "state", alias = "lifecycle", alias = "oracle_state")]
@@ -114,14 +109,7 @@ impl OracleState {
         Self {
             oracle_id: find_string(
                 body,
-                &[
-                    "oracle_id",
-                    "oracleId",
-                    "oracleID",
-                    "id",
-                    "object_id",
-                    "objectId",
-                ],
+                &["oracle_id", "oracleId", "oracleID", "id", "object_id", "objectId"],
             ),
             underlying_asset: find_string(
                 body,
@@ -218,14 +206,7 @@ impl LatestPrice {
             .and_then(normalize_epoch_millis),
             price: find_f64(
                 body,
-                &[
-                    "price",
-                    "spot",
-                    "spot_price",
-                    "spotPrice",
-                    "index_price",
-                    "indexPrice",
-                ],
+                &["price", "spot", "spot_price", "spotPrice", "index_price", "indexPrice"],
             ),
             raw,
         }
@@ -233,8 +214,7 @@ impl LatestPrice {
 
     #[must_use]
     pub fn timestamp_datetime(&self) -> Option<DateTime<Utc>> {
-        self.timestamp_ms
-            .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+        self.timestamp_ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single())
     }
 }
 
@@ -276,8 +256,7 @@ impl LatestSvi {
 
     #[must_use]
     pub fn timestamp_datetime(&self) -> Option<DateTime<Utc>> {
-        self.timestamp_ms
-            .and_then(|ms| Utc.timestamp_millis_opt(ms).single())
+        self.timestamp_ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single())
     }
 }
 
@@ -298,7 +277,9 @@ impl AskBounds {
     }
 }
 
-pub fn parse_oracle_list_from_value(value: Value) -> Result<Vec<OracleListItem>, serde_json::Error> {
+pub fn parse_oracle_list_from_value(
+    value: Value,
+) -> Result<Vec<OracleListItem>, serde_json::Error> {
     let body = unwrap_data_owned(value);
     serde_json::from_value(body)
 }
@@ -376,10 +357,9 @@ fn value_to_i64(value: &Value) -> Option<i64> {
         Value::String(s) => {
             let trimmed = s.trim();
 
-            trimmed
-                .parse::<i64>()
-                .ok()
-                .or_else(|| DateTime::parse_from_rfc3339(trimmed).ok().map(|dt| dt.timestamp_millis()))
+            trimmed.parse::<i64>().ok().or_else(|| {
+                DateTime::parse_from_rfc3339(trimmed).ok().map(|dt| dt.timestamp_millis())
+            })
         }
         _ => None,
     }
