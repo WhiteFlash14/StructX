@@ -1,9 +1,11 @@
+use chrono::Utc;
 use reqwest::Url;
 use serde::de::DeserializeOwned;
 use serde_json::Value;
 
 use crate::constants::{PREDICT_OBJECT_ID, PREDICT_SERVER_URL};
 use crate::error::{DeepBookClientError, Result};
+use crate::market::{FreshnessConfig, MarketSnapshot};
 use crate::models::{
     parse_oracle_list_from_value, parse_quote_assets_from_value, AskBounds, LatestPrice,
     LatestSvi, OracleListItem, OracleState, PredictState, QuoteAsset, ServerStatus,
@@ -131,6 +133,55 @@ impl DeepBookClient {
             .await?;
 
         Ok(LatestSvi::from_value(value))
+    }
+
+    pub async fn load_structx_markets(
+        &self,
+        freshness: FreshnessConfig,
+    ) -> Result<Vec<MarketSnapshot>> {
+        let vault_available = self
+            .vault_summary()
+            .await
+            .map(|summary| summary.is_present())
+            .unwrap_or(false);
+
+        let oracles = self.oracle_list().await?;
+        let now = Utc::now();
+        let mut snapshots = Vec::new();
+
+        for oracle in oracles.into_iter().filter(OracleListItem::is_btc) {
+            let Some(oracle_id) = oracle.oracle_id.clone() else {
+                snapshots.push(MarketSnapshot::evaluate(
+                    oracle,
+                    None,
+                    None,
+                    None,
+                    None,
+                    vault_available,
+                    now,
+                    freshness,
+                ));
+                continue;
+            };
+
+            let state = self.oracle_state(&oracle_id).await.ok();
+            let latest_price = self.oracle_latest_price(&oracle_id).await.ok();
+            let latest_svi = self.oracle_latest_svi(&oracle_id).await.ok();
+            let ask_bounds = self.oracle_ask_bounds(&oracle_id).await.ok();
+
+            snapshots.push(MarketSnapshot::evaluate(
+                oracle,
+                state,
+                latest_price,
+                latest_svi,
+                ask_bounds,
+                vault_available,
+                now,
+                freshness,
+            ));
+        }
+
+        Ok(snapshots)
     }
 
     async fn get_json<T>(&self, path: &str) -> Result<T>
