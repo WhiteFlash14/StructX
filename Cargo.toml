@@ -1,8 +1,15 @@
 [workspace]
-members = []
+members = [
+    "crates/deepbook-client",
+]
 resolver = "2"
 
 [workspace.package]
 edition = "2021"
 license = "MIT"
 repository = "https://github.com/WhiteFlash14/StructX"
+
+[workspace.dependencies]
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+serde_json = "1.0"
+thiserror = "2.0"
