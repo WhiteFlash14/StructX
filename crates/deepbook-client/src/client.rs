@@ -154,17 +154,19 @@ impl DeepBookClient {
                 continue;
             };
 
-            let state = self.oracle_state(&oracle_id).await.ok();
-            let latest_price = self.oracle_latest_price(&oracle_id).await.ok();
-            let latest_svi = self.oracle_latest_svi(&oracle_id).await.ok();
-            let ask_bounds = self.oracle_ask_bounds(&oracle_id).await.ok();
+            let (state, latest_price, latest_svi, ask_bounds) = tokio::join!(
+                self.oracle_state(&oracle_id),
+                self.oracle_latest_price(&oracle_id),
+                self.oracle_latest_svi(&oracle_id),
+                self.oracle_ask_bounds(&oracle_id),
+            );
 
             snapshots.push(MarketSnapshot::evaluate(
                 oracle,
-                state,
-                latest_price,
-                latest_svi,
-                ask_bounds,
+                state.ok(),
+                latest_price.ok(),
+                latest_svi.ok(),
+                ask_bounds.ok(),
                 vault_available,
                 now,
                 freshness,
