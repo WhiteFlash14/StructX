@@ -5,8 +5,9 @@ use serde_json::Value;
 use crate::constants::{PREDICT_OBJECT_ID, PREDICT_SERVER_URL};
 use crate::error::{DeepBookClientError, Result};
 use crate::models::{
-    parse_oracle_list_from_value, parse_quote_assets_from_value, OracleListItem,
-    PredictState, QuoteAsset, ServerStatus, VaultSummary,
+    parse_oracle_list_from_value, parse_quote_assets_from_value, AskBounds, LatestPrice,
+    LatestSvi, OracleListItem, OracleState, PredictState, QuoteAsset, ServerStatus,
+    VaultSummary,
 };
 
 #[derive(Debug, Clone)]
@@ -91,6 +92,47 @@ impl DeepBookClient {
         .await
     }
 
+    pub async fn oracle_state(&self, oracle_id: &str) -> Result<OracleState> {
+        let value = self
+            .get_value(&format!("/oracles/{}/state", encode_path_segment(oracle_id)))
+            .await?;
+
+        Ok(OracleState::from_value(value))
+    }
+
+    pub async fn oracle_ask_bounds(&self, oracle_id: &str) -> Result<AskBounds> {
+        let value = self
+            .get_value(&format!(
+                "/oracles/{}/ask-bounds",
+                encode_path_segment(oracle_id)
+            ))
+            .await?;
+
+        Ok(AskBounds::from_value(value))
+    }
+
+    pub async fn oracle_latest_price(&self, oracle_id: &str) -> Result<LatestPrice> {
+        let value = self
+            .get_value(&format!(
+                "/oracles/{}/prices/latest",
+                encode_path_segment(oracle_id)
+            ))
+            .await?;
+
+        Ok(LatestPrice::from_value(value))
+    }
+
+    pub async fn oracle_latest_svi(&self, oracle_id: &str) -> Result<LatestSvi> {
+        let value = self
+            .get_value(&format!(
+                "/oracles/{}/svi/latest",
+                encode_path_segment(oracle_id)
+            ))
+            .await?;
+
+        Ok(LatestSvi::from_value(value))
+    }
+
     async fn get_json<T>(&self, path: &str) -> Result<T>
     where
         T: DeserializeOwned,
@@ -119,6 +161,10 @@ impl DeepBookClient {
             .await
             .map_err(DeepBookClientError::Request)
     }
+}
+
+fn encode_path_segment(value: &str) -> String {
+    value.to_string()
 }
 
 #[cfg(test)]

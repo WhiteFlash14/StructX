@@ -8,6 +8,7 @@ pub use constants::{
 };
 pub use error::{DeepBookClientError, Result};
 pub use models::{
-    OracleListItem, PredictState, QuoteAsset, ServerStatus, VaultSummary,
+    AskBounds, LatestPrice, LatestSvi, OracleListItem, OracleState, PredictState,
+    QuoteAsset, ServerStatus, VaultSummary,
 };
 pub use client::{DeepBookClient, DeepBookConfig};
