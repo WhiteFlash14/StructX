@@ -9,7 +9,9 @@ pub use constants::{
     DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL,
 };
 pub use error::{DeepBookClientError, Result};
-pub use market::{FreshnessConfig, MarketRejectionReason, MarketSnapshot, StructxMarketStatus};
+pub use market::{
+    FreshnessConfig, MarketRejectionReason, MarketSnapshot, MarketWarning, StructxMarketStatus,
+};
 pub use models::{
     AskBounds, LatestPrice, LatestSvi, OracleListItem, OracleState, PredictState, QuoteAsset,
     ServerStatus, VaultSummary,
