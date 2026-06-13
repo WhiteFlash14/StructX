@@ -35,8 +35,6 @@ enum Command {
         #[arg(long, default_value_t = 300)]
         min_time_to_expiry_secs: i64,
 
-        /// In strict mode, missing price/SVI timestamps reject a market.
-        /// Default mode is lenient for DeepBook Predict Testnet indexer output.
         #[arg(long, default_value_t = false)]
         strict_freshness: bool,
     },
@@ -53,18 +51,14 @@ async fn main() -> std::process::ExitCode {
             min_time_to_expiry_secs,
             strict_freshness,
         } => {
-            list_markets(
-                cli.server_url,
-                cli.predict_id,
-                FreshnessConfig {
-                    max_price_age: Duration::seconds(max_price_age_secs),
-                    max_svi_age: Duration::seconds(max_svi_age_secs),
-                    min_time_to_expiry: Duration::seconds(min_time_to_expiry_secs),
-                    require_price_timestamp: strict_freshness,
-                    require_svi_timestamp: strict_freshness,
-                },
-            )
-            .await
+            let freshness = build_freshness(
+                max_price_age_secs,
+                max_svi_age_secs,
+                min_time_to_expiry_secs,
+                strict_freshness,
+            );
+
+            list_markets(cli.server_url, cli.predict_id, freshness).await
         }
     };
 
@@ -77,17 +71,36 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-async fn list_markets(
+fn build_freshness(
+    max_price_age_secs: i64,
+    max_svi_age_secs: i64,
+    min_time_to_expiry_secs: i64,
+    strict_freshness: bool,
+) -> FreshnessConfig {
+    FreshnessConfig {
+        max_price_age: Duration::seconds(max_price_age_secs),
+        max_svi_age: Duration::seconds(max_svi_age_secs),
+        min_time_to_expiry: Duration::seconds(min_time_to_expiry_secs),
+        require_price_timestamp: strict_freshness,
+        require_svi_timestamp: strict_freshness,
+    }
+}
+
+fn build_client(
     server_url: String,
     predict_id: String,
-    freshness: FreshnessConfig,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let client = DeepBookClient::new(DeepBookConfig {
+) -> Result<DeepBookClient, Box<dyn std::error::Error>> {
+    Ok(DeepBookClient::new(DeepBookConfig {
         server_url,
         predict_id,
         request_timeout: StdDuration::from_secs(15),
-    })?;
+    })?)
+}
 
+async fn load_markets(
+    client: &DeepBookClient,
+    freshness: FreshnessConfig,
+) -> Result<Vec<MarketSnapshot>, Box<dyn std::error::Error>> {
     let _status = client.status().await?;
     let _predict_state = client.predict_state().await?;
     let quote_assets = client.quote_assets().await?;
@@ -107,7 +120,17 @@ async fn list_markets(
     );
     println!();
 
-    let markets = client.load_structx_markets(freshness).await?;
+    Ok(client.load_structx_markets(freshness).await?)
+}
+
+async fn list_markets(
+    server_url: String,
+    predict_id: String,
+    freshness: FreshnessConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = build_client(server_url, predict_id)?;
+    let markets = load_markets(&client, freshness).await?;
+
     print_market_table(&markets);
 
     let usable = markets.iter().filter(|m| m.structx_status.is_usable()).count();
@@ -172,6 +195,7 @@ fn format_latest_price(market: &MarketSnapshot) -> String {
 
 fn format_price_like_value(value: f64) -> String {
     // DeepBook Predict BTC values in the current Testnet data are raw 1e9-scaled.
+    // If already human-sized, leave them alone.
     if value.abs() >= 1_000_000_000.0 {
         format!("{:.2}", value / 1_000_000_000.0)
     } else {
