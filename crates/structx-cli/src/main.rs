@@ -8,7 +8,7 @@ use deepbook_client::{
     DeepBookClient, DeepBookConfig, FreshnessConfig, MarketSnapshot, StructxMarketStatus,
     PREDICT_OBJECT_ID, PREDICT_SERVER_URL,
 };
-use structx_core::{select_best_market, DisplayPrice, PriceScale, SelectedMarket};
+use structx_core::{select_best_market, PriceScale, SelectedMarket};
 
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -27,6 +27,20 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     ListMarkets {
+        #[arg(long, default_value_t = 60)]
+        max_price_age_secs: i64,
+
+        #[arg(long, default_value_t = 60)]
+        max_svi_age_secs: i64,
+
+        #[arg(long, default_value_t = 300)]
+        min_time_to_expiry_secs: i64,
+
+        #[arg(long, default_value_t = false)]
+        strict_freshness: bool,
+    },
+
+    SelectMarket {
         #[arg(long, default_value_t = 60)]
         max_price_age_secs: i64,
 
@@ -60,6 +74,21 @@ async fn main() -> std::process::ExitCode {
             );
 
             list_markets(cli.server_url, cli.predict_id, freshness).await
+        }
+        Command::SelectMarket {
+            max_price_age_secs,
+            max_svi_age_secs,
+            min_time_to_expiry_secs,
+            strict_freshness,
+        } => {
+            let freshness = build_freshness(
+                max_price_age_secs,
+                max_svi_age_secs,
+                min_time_to_expiry_secs,
+                strict_freshness,
+            );
+
+            select_market(cli.server_url, cli.predict_id, freshness).await
         }
     };
 
@@ -143,6 +172,21 @@ async fn list_markets(
     Ok(())
 }
 
+async fn select_market(
+    server_url: String,
+    predict_id: String,
+    freshness: FreshnessConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = build_client(server_url, predict_id)?;
+    let markets = load_markets(&client, freshness).await?;
+
+    let selected = select_best_market(&markets, PriceScale::E9)?;
+
+    print_selected_market(&selected);
+
+    Ok(())
+}
+
 fn print_market_table(markets: &[MarketSnapshot]) {
     let now = Utc::now();
 
@@ -182,6 +226,27 @@ fn print_market_table(markets: &[MarketSnapshot]) {
     }
 
     println!("{table}");
+}
+
+fn print_selected_market(selected: &SelectedMarket<'_>) {
+    println!("Selected market");
+    println!("oracle_id: {}", selected.oracle_id);
+    println!("expiry: {}", selected.expiry.to_rfc3339());
+    println!("spot: {}", selected.spot_display);
+    println!("min_strike: {}", selected.grid.scale.display_from_raw(selected.grid.min_raw));
+    println!("tick_size: {}", selected.grid.scale.display_from_raw(selected.grid.tick_size_raw));
+
+    match &selected.market.structx_status {
+        StructxMarketStatus::Usable => println!("status: usable"),
+        StructxMarketStatus::UsableWithWarnings(warnings) => {
+            println!("status: usable with warnings: {warnings:?}");
+        }
+        StructxMarketStatus::Rejected { reasons, warnings } => {
+            println!("status: rejected: reasons={reasons:?}, warnings={warnings:?}");
+        }
+    }
+
+    println!();
 }
 
 fn format_latest_price(market: &MarketSnapshot) -> String {
