@@ -34,6 +34,11 @@ enum Command {
 
         #[arg(long, default_value_t = 300)]
         min_time_to_expiry_secs: i64,
+
+        /// In strict mode, missing price/SVI timestamps reject a market.
+        /// Default mode is lenient for DeepBook Predict Testnet indexer output.
+        #[arg(long, default_value_t = false)]
+        strict_freshness: bool,
     },
 }
 
@@ -42,7 +47,12 @@ async fn main() -> std::process::ExitCode {
     let cli = Cli::parse();
 
     let result = match cli.command {
-        Command::ListMarkets { max_price_age_secs, max_svi_age_secs, min_time_to_expiry_secs } => {
+        Command::ListMarkets {
+            max_price_age_secs,
+            max_svi_age_secs,
+            min_time_to_expiry_secs,
+            strict_freshness,
+        } => {
             list_markets(
                 cli.server_url,
                 cli.predict_id,
@@ -50,6 +60,8 @@ async fn main() -> std::process::ExitCode {
                     max_price_age: Duration::seconds(max_price_age_secs),
                     max_svi_age: Duration::seconds(max_svi_age_secs),
                     min_time_to_expiry: Duration::seconds(min_time_to_expiry_secs),
+                    require_price_timestamp: strict_freshness,
+                    require_svi_timestamp: strict_freshness,
                 },
             )
             .await
@@ -85,6 +97,14 @@ async fn list_markets(
     println!("Predict state: ok");
     println!("Quote assets: {}", quote_assets.len());
     println!("Vault summary fetched: {}", vault_summary.is_present());
+    println!(
+        "Freshness mode: {}",
+        if freshness.require_price_timestamp || freshness.require_svi_timestamp {
+            "strict"
+        } else {
+            "testnet-lenient"
+        }
+    );
     println!();
 
     let markets = client.load_structx_markets(freshness).await?;
@@ -163,11 +183,27 @@ fn format_age(value: Option<i64>) -> String {
 fn format_usable(status: &StructxMarketStatus) -> String {
     match status {
         StructxMarketStatus::Usable => "yes".to_string(),
-        StructxMarketStatus::Rejected(reasons) => {
+        StructxMarketStatus::UsableWithWarnings(warnings) => {
             let joined =
+                warnings.iter().map(|warning| format!("{warning:?}")).collect::<Vec<_>>().join(",");
+
+            format!("yes: warn {joined}")
+        }
+        StructxMarketStatus::Rejected { reasons, warnings } => {
+            let reason_text =
                 reasons.iter().map(|reason| format!("{reason:?}")).collect::<Vec<_>>().join(",");
 
-            format!("no: {joined}")
+            if warnings.is_empty() {
+                format!("no: {reason_text}")
+            } else {
+                let warning_text = warnings
+                    .iter()
+                    .map(|warning| format!("{warning:?}"))
+                    .collect::<Vec<_>>()
+                    .join(",");
+
+                format!("no: {reason_text}; warn {warning_text}")
+            }
         }
     }
 }
