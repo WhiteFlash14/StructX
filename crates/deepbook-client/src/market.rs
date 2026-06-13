@@ -8,6 +8,8 @@ pub struct FreshnessConfig {
     pub max_price_age: Duration,
     pub max_svi_age: Duration,
     pub min_time_to_expiry: Duration,
+    pub require_price_timestamp: bool,
+    pub require_svi_timestamp: bool,
 }
 
 impl Default for FreshnessConfig {
@@ -16,6 +18,12 @@ impl Default for FreshnessConfig {
             max_price_age: Duration::seconds(60),
             max_svi_age: Duration::seconds(60),
             min_time_to_expiry: Duration::minutes(5),
+
+            // Testnet public-server responses can expose latest values without
+            // timestamp fields in the shape our parser recognizes. For market
+            // discovery, missing timestamps should warn, not reject.
+            require_price_timestamp: false,
+            require_svi_timestamp: false,
         }
     }
 }
@@ -25,10 +33,8 @@ pub enum MarketRejectionReason {
     NonBtc,
     NotActiveOrLive,
     MissingLatestPrice,
-    MissingLatestPriceTimestamp,
     StalePrice,
     MissingLatestSvi,
-    MissingLatestSviTimestamp,
     StaleSvi,
     MissingExpiry,
     ExpiryTooClose,
@@ -37,16 +43,33 @@ pub enum MarketRejectionReason {
     VaultSummaryUnavailable,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum MarketWarning {
+    MissingLatestPriceTimestamp,
+    MissingLatestSviTimestamp,
+    AskBoundsUnavailable,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub enum StructxMarketStatus {
     Usable,
-    Rejected(Vec<MarketRejectionReason>),
+    UsableWithWarnings(Vec<MarketWarning>),
+    Rejected { reasons: Vec<MarketRejectionReason>, warnings: Vec<MarketWarning> },
 }
 
 impl StructxMarketStatus {
     #[must_use]
     pub fn is_usable(&self) -> bool {
-        matches!(self, Self::Usable)
+        matches!(self, Self::Usable | Self::UsableWithWarnings(_))
+    }
+
+    #[must_use]
+    pub fn warnings(&self) -> &[MarketWarning] {
+        match self {
+            Self::Usable => &[],
+            Self::UsableWithWarnings(warnings) => warnings,
+            Self::Rejected { warnings, .. } => warnings,
+        }
     }
 }
 
@@ -72,20 +95,26 @@ impl MarketSnapshot {
         now: DateTime<Utc>,
         config: FreshnessConfig,
     ) -> Self {
-        let reasons = evaluate_rejection_reasons(
+        let evaluation = evaluate_market(
             &list_item,
             state.as_ref(),
             latest_price.as_ref(),
             latest_svi.as_ref(),
+            ask_bounds.as_ref(),
             vault_summary_available,
             now,
             config,
         );
 
-        let structx_status = if reasons.is_empty() {
+        let structx_status = if evaluation.rejections.is_empty() && evaluation.warnings.is_empty() {
             StructxMarketStatus::Usable
+        } else if evaluation.rejections.is_empty() {
+            StructxMarketStatus::UsableWithWarnings(evaluation.warnings)
         } else {
-            StructxMarketStatus::Rejected(reasons)
+            StructxMarketStatus::Rejected {
+                reasons: evaluation.rejections,
+                warnings: evaluation.warnings,
+            }
         };
 
         Self { list_item, state, latest_price, latest_svi, ask_bounds, structx_status }
@@ -135,65 +164,80 @@ impl MarketSnapshot {
     #[must_use]
     pub fn price_age_seconds(&self, now: DateTime<Utc>) -> Option<i64> {
         let ts = self.latest_price.as_ref()?.timestamp_datetime()?;
-
         Some((now - ts).num_seconds())
     }
 
     #[must_use]
     pub fn svi_age_seconds(&self, now: DateTime<Utc>) -> Option<i64> {
         let ts = self.latest_svi.as_ref()?.timestamp_datetime()?;
-
         Some((now - ts).num_seconds())
     }
 }
 
-fn evaluate_rejection_reasons(
+#[derive(Debug, Default)]
+struct MarketEvaluation {
+    rejections: Vec<MarketRejectionReason>,
+    warnings: Vec<MarketWarning>,
+}
+
+fn evaluate_market(
     list_item: &OracleListItem,
     state: Option<&OracleState>,
     latest_price: Option<&LatestPrice>,
     latest_svi: Option<&LatestSvi>,
+    ask_bounds: Option<&AskBounds>,
     vault_summary_available: bool,
     now: DateTime<Utc>,
     config: FreshnessConfig,
-) -> Vec<MarketRejectionReason> {
-    let mut reasons = Vec::new();
+) -> MarketEvaluation {
+    let mut evaluation = MarketEvaluation::default();
 
     let underlying =
         state.and_then(|s| s.underlying_asset.as_deref()).or(list_item.underlying_asset.as_deref());
 
     if !underlying.map(|value| value.eq_ignore_ascii_case("BTC")).unwrap_or(false) {
-        reasons.push(MarketRejectionReason::NonBtc);
+        evaluation.rejections.push(MarketRejectionReason::NonBtc);
     }
 
     let active =
         state.map(OracleState::is_active_or_live).unwrap_or_else(|| list_item.is_active_or_live());
 
     if !active {
-        reasons.push(MarketRejectionReason::NotActiveOrLive);
+        evaluation.rejections.push(MarketRejectionReason::NotActiveOrLive);
     }
 
     match latest_price {
         Some(price) => match price.timestamp_datetime() {
             Some(ts) => {
                 if now.signed_duration_since(ts) > config.max_price_age {
-                    reasons.push(MarketRejectionReason::StalePrice);
+                    evaluation.rejections.push(MarketRejectionReason::StalePrice);
                 }
             }
-            None => reasons.push(MarketRejectionReason::MissingLatestPriceTimestamp),
+            None if config.require_price_timestamp => {
+                evaluation.rejections.push(MarketRejectionReason::StalePrice);
+            }
+            None => {
+                evaluation.warnings.push(MarketWarning::MissingLatestPriceTimestamp);
+            }
         },
-        None => reasons.push(MarketRejectionReason::MissingLatestPrice),
+        None => evaluation.rejections.push(MarketRejectionReason::MissingLatestPrice),
     }
 
     match latest_svi {
         Some(svi) => match svi.timestamp_datetime() {
             Some(ts) => {
                 if now.signed_duration_since(ts) > config.max_svi_age {
-                    reasons.push(MarketRejectionReason::StaleSvi);
+                    evaluation.rejections.push(MarketRejectionReason::StaleSvi);
                 }
             }
-            None => reasons.push(MarketRejectionReason::MissingLatestSviTimestamp),
+            None if config.require_svi_timestamp => {
+                evaluation.rejections.push(MarketRejectionReason::StaleSvi);
+            }
+            None => {
+                evaluation.warnings.push(MarketWarning::MissingLatestSviTimestamp);
+            }
         },
-        None => reasons.push(MarketRejectionReason::MissingLatestSvi),
+        None => evaluation.rejections.push(MarketRejectionReason::MissingLatestSvi),
     }
 
     let expiry_ms = state.and_then(|s| s.expiry_ms).or(list_item.expiry_ms);
@@ -201,25 +245,29 @@ fn evaluate_rejection_reasons(
     match expiry_ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
         Some(expiry) => {
             if expiry.signed_duration_since(now) < config.min_time_to_expiry {
-                reasons.push(MarketRejectionReason::ExpiryTooClose);
+                evaluation.rejections.push(MarketRejectionReason::ExpiryTooClose);
             }
         }
-        None => reasons.push(MarketRejectionReason::MissingExpiry),
+        None => evaluation.rejections.push(MarketRejectionReason::MissingExpiry),
     }
 
     if state.and_then(|s| s.min_strike).is_none() {
-        reasons.push(MarketRejectionReason::MissingMinStrike);
+        evaluation.rejections.push(MarketRejectionReason::MissingMinStrike);
     }
 
     if state.and_then(|s| s.tick_size).is_none() {
-        reasons.push(MarketRejectionReason::MissingTickSize);
+        evaluation.rejections.push(MarketRejectionReason::MissingTickSize);
     }
 
     if !vault_summary_available {
-        reasons.push(MarketRejectionReason::VaultSummaryUnavailable);
+        evaluation.rejections.push(MarketRejectionReason::VaultSummaryUnavailable);
     }
 
-    reasons
+    if ask_bounds.is_none() {
+        evaluation.warnings.push(MarketWarning::AskBoundsUnavailable);
+    }
+
+    evaluation
 }
 
 #[cfg(test)]
@@ -302,10 +350,10 @@ mod tests {
         );
 
         match snapshot.structx_status {
-            StructxMarketStatus::Rejected(reasons) => {
+            StructxMarketStatus::Rejected { reasons, .. } => {
                 assert!(reasons.contains(&MarketRejectionReason::StalePrice));
             }
-            StructxMarketStatus::Usable => panic!("stale market should be rejected"),
+            _ => panic!("stale market should be rejected"),
         }
     }
 
@@ -325,10 +373,10 @@ mod tests {
         );
 
         match snapshot.structx_status {
-            StructxMarketStatus::Rejected(reasons) => {
+            StructxMarketStatus::Rejected { reasons, .. } => {
                 assert!(reasons.contains(&MarketRejectionReason::StaleSvi));
             }
-            StructxMarketStatus::Usable => panic!("stale market should be rejected"),
+            _ => panic!("stale market should be rejected"),
         }
     }
 
@@ -356,14 +404,14 @@ mod tests {
         );
 
         match snapshot.structx_status {
-            StructxMarketStatus::Rejected(reasons) => {
+            StructxMarketStatus::Rejected { reasons, .. } => {
                 assert!(reasons.contains(&MarketRejectionReason::MissingLatestPrice));
                 assert!(reasons.contains(&MarketRejectionReason::MissingLatestSvi));
                 assert!(reasons.contains(&MarketRejectionReason::MissingExpiry));
                 assert!(reasons.contains(&MarketRejectionReason::MissingMinStrike));
                 assert!(reasons.contains(&MarketRejectionReason::MissingTickSize));
             }
-            StructxMarketStatus::Usable => panic!("incomplete market should be rejected"),
+            _ => panic!("incomplete market should be rejected"),
         }
     }
 }
