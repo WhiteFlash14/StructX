@@ -34,7 +34,7 @@ impl PriceScale {
             return None;
         }
 
-        // Current BTC Predict Testnet responses expose spot like values as raw
+        // Current BTC Predict Testnet responses expose spot-like values as raw
         // 1e9-scaled integers. If a future server returns human display prices,
         // this still handles them.
         if value >= self.factor as f64 {
@@ -68,5 +68,34 @@ impl std::fmt::Display for DisplayPrice {
         } else {
             write!(f, "{:.4}", self.0)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn converts_raw_to_display_price() {
+        let scale = PriceScale::E9;
+        assert_eq!(scale.display_from_raw(62_773_927_561_148).as_f64(), 62_773.927561148);
+    }
+
+    #[test]
+    fn converts_display_to_raw_price() {
+        let scale = PriceScale::E9;
+        assert_eq!(scale.raw_from_display(DisplayPrice(50_000.0)), Some(50_000_000_000_000));
+    }
+
+    #[test]
+    fn treats_large_api_number_as_raw() {
+        let scale = PriceScale::E9;
+        assert_eq!(scale.raw_from_api_number(62_773_927_561_148.0), Some(62_773_927_561_148));
+    }
+
+    #[test]
+    fn treats_small_api_number_as_display() {
+        let scale = PriceScale::E9;
+        assert_eq!(scale.raw_from_api_number(62_773.927561148), Some(62_773_927_561_148));
     }
 }
