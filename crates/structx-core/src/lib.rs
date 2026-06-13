@@ -1,1 +1,3 @@
-//! Core StructX market and strike-grid logic.
+pub mod price;
+
+pub use price::{DisplayPrice, PriceScale};
