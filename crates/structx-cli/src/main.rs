@@ -8,6 +8,7 @@ use deepbook_client::{
     DeepBookClient, DeepBookConfig, FreshnessConfig, MarketSnapshot, StructxMarketStatus,
     PREDICT_OBJECT_ID, PREDICT_SERVER_URL,
 };
+use structx_core::{select_best_market, DisplayPrice, PriceScale, SelectedMarket};
 
 #[derive(Debug, Parser)]
 #[command(name = "structx")]

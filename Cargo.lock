@@ -1074,6 +1074,7 @@ dependencies = [
  "clap",
  "comfy-table",
  "deepbook-client",
+ "structx-core",
  "tokio",
 ]
 
@@ -1084,6 +1085,7 @@ dependencies = [
  "chrono",
  "deepbook-client",
  "serde",
+ "serde_json",
  "thiserror",
 ]
 

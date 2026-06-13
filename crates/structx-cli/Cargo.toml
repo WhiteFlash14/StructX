@@ -10,4 +10,5 @@ chrono.workspace = true
 clap.workspace = true
 comfy-table.workspace = true
 deepbook-client = { path = "../deepbook-client" }
+structx-core = { path = "../structx-core" }
 tokio.workspace = true

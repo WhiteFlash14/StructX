@@ -10,3 +10,6 @@ chrono.workspace = true
 deepbook-client = { path = "../deepbook-client" }
 serde.workspace = true
 thiserror.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
