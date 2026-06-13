@@ -8,7 +8,7 @@ use deepbook_client::{
     DeepBookClient, DeepBookConfig, FreshnessConfig, MarketSnapshot, StructxMarketStatus,
     PREDICT_OBJECT_ID, PREDICT_SERVER_URL,
 };
-use structx_core::{select_best_market, PriceScale, SelectedMarket};
+use structx_core::{select_best_market, DisplayPrice, PriceScale, SelectedMarket};
 
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -52,6 +52,12 @@ enum Command {
 
         #[arg(long, default_value_t = false)]
         strict_freshness: bool,
+
+        #[arg(long, default_value_t = 250.0)]
+        bucket_step_usd: f64,
+
+        #[arg(long, default_value_t = 4)]
+        levels_each_side: u32,
     },
 }
 
@@ -80,6 +86,8 @@ async fn main() -> std::process::ExitCode {
             max_svi_age_secs,
             min_time_to_expiry_secs,
             strict_freshness,
+            bucket_step_usd,
+            levels_each_side,
         } => {
             let freshness = build_freshness(
                 max_price_age_secs,
@@ -88,7 +96,14 @@ async fn main() -> std::process::ExitCode {
                 strict_freshness,
             );
 
-            select_market(cli.server_url, cli.predict_id, freshness).await
+            select_market(
+                cli.server_url,
+                cli.predict_id,
+                freshness,
+                DisplayPrice(bucket_step_usd),
+                levels_each_side,
+            )
+            .await
         }
     };
 
@@ -176,6 +191,8 @@ async fn select_market(
     server_url: String,
     predict_id: String,
     freshness: FreshnessConfig,
+    bucket_step: DisplayPrice,
+    levels_each_side: u32,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let client = build_client(server_url, predict_id)?;
     let markets = load_markets(&client, freshness).await?;
@@ -183,6 +200,7 @@ async fn select_market(
     let selected = select_best_market(&markets, PriceScale::E9)?;
 
     print_selected_market(&selected);
+    print_strike_buckets(&selected, bucket_step, levels_each_side)?;
 
     Ok(())
 }
@@ -247,6 +265,71 @@ fn print_selected_market(selected: &SelectedMarket<'_>) {
     }
 
     println!();
+}
+
+fn print_strike_buckets(
+    selected: &SelectedMarket<'_>,
+    bucket_step: DisplayPrice,
+    levels_each_side: u32,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let strikes = selected.grid.centered_strikes_by_display_step(
+        selected.spot_raw,
+        bucket_step,
+        levels_each_side,
+    )?;
+
+    let buckets = selected.grid.buckets_from_ordered_strikes(&strikes);
+
+    let mut strike_table = Table::new();
+    strike_table.load_preset(UTF8_FULL);
+    strike_table.set_header(vec!["#", "raw strike", "display strike"]);
+
+    for (idx, strike) in strikes.iter().enumerate() {
+        strike_table.add_row(vec![
+            Cell::new(idx),
+            Cell::new(strike.raw),
+            Cell::new(selected.grid.display(*strike).to_string()),
+        ]);
+    }
+
+    println!("Generated strikes");
+    println!("{strike_table}");
+    println!();
+
+    let mut bucket_table = Table::new();
+    bucket_table.load_preset(UTF8_FULL);
+    bucket_table.set_header(vec!["bucket", "lower", "upper", "semantic"]);
+
+    for (idx, bucket) in buckets.iter().enumerate() {
+        let lower = bucket
+            .lower
+            .map(|strike| selected.grid.display(strike).to_string())
+            .unwrap_or_else(|| "−∞".to_string());
+
+        let upper = bucket
+            .upper
+            .map(|strike| selected.grid.display(strike).to_string())
+            .unwrap_or_else(|| "+∞".to_string());
+
+        let semantic = match (bucket.lower, bucket.upper) {
+            (None, Some(_)) => "downside tail",
+            (Some(_), Some(_)) => "bounded range",
+            (Some(_), None) => "upside tail",
+            (None, None) => "invalid",
+        };
+
+        bucket_table.add_row(vec![
+            Cell::new(idx),
+            Cell::new(lower),
+            Cell::new(upper),
+            Cell::new(semantic),
+        ]);
+    }
+
+    println!("Generated payoff buckets");
+    println!("{bucket_table}");
+
+    Ok(())
 }
 
 fn format_latest_price(market: &MarketSnapshot) -> String {
