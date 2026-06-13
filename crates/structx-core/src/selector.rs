@@ -89,3 +89,94 @@ fn market_status_rank(status: &StructxMarketStatus) -> u8 {
         StructxMarketStatus::Rejected { .. } => 2,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use chrono::{Duration, TimeZone};
+    use deepbook_client::{
+        AskBounds, LatestPrice, LatestSvi, OracleListItem, OracleState, StructxMarketStatus,
+    };
+    use serde_json::json;
+
+    use super::*;
+
+    fn market(
+        oracle_id: &str,
+        expiry_offset: Duration,
+        status: StructxMarketStatus,
+    ) -> MarketSnapshot {
+        let now = Utc.timestamp_millis_opt(1_900_000_000_000).single().expect("valid timestamp");
+
+        MarketSnapshot {
+            list_item: OracleListItem {
+                oracle_id: Some(oracle_id.to_string()),
+                underlying_asset: Some("BTC".to_string()),
+                status: Some("active".to_string()),
+                expiry_ms: Some((now + expiry_offset).timestamp_millis()),
+                extra: Default::default(),
+            },
+            state: Some(OracleState {
+                oracle_id: Some(oracle_id.to_string()),
+                underlying_asset: Some("BTC".to_string()),
+                status: Some("active".to_string()),
+                expiry_ms: Some((now + expiry_offset).timestamp_millis()),
+                min_strike: Some(50_000_000_000_000),
+                max_strike: Some(90_000_000_000_000),
+                tick_size: Some(1_000_000_000),
+                raw: json!({}),
+            }),
+            latest_price: Some(LatestPrice {
+                timestamp_ms: Some(now.timestamp_millis()),
+                price: Some(62_773_927_561_148.0),
+                raw: json!({}),
+            }),
+            latest_svi: Some(LatestSvi {
+                timestamp_ms: Some(now.timestamp_millis()),
+                spot: Some(62_773_927_561_148.0),
+                forward: Some(62_800_000_000_000.0),
+                raw: json!({}),
+            }),
+            ask_bounds: Some(AskBounds { raw: json!({}) }),
+            structx_status: status,
+        }
+    }
+
+    #[test]
+    fn selects_earliest_usable_market() {
+        let markets = vec![
+            market("0xlate", Duration::hours(2), StructxMarketStatus::Usable),
+            market("0xsoon", Duration::hours(1), StructxMarketStatus::Usable),
+        ];
+
+        let selected = select_best_market(&markets, PriceScale::E9).expect("market selected");
+
+        assert_eq!(selected.oracle_id, "0xsoon");
+    }
+
+    #[test]
+    fn prefers_clean_usable_over_warning_market() {
+        let markets = vec![
+            market(
+                "0xwarn",
+                Duration::minutes(30),
+                StructxMarketStatus::UsableWithWarnings(vec![]),
+            ),
+            market("0xclean", Duration::hours(3), StructxMarketStatus::Usable),
+        ];
+
+        let selected = select_best_market(&markets, PriceScale::E9).expect("market selected");
+
+        assert_eq!(selected.oracle_id, "0xclean");
+    }
+
+    #[test]
+    fn builds_selected_market_grid_and_spot() {
+        let markets = vec![market("0xabc", Duration::hours(1), StructxMarketStatus::Usable)];
+
+        let selected = select_best_market(&markets, PriceScale::E9).expect("market selected");
+
+        assert_eq!(selected.spot_raw, 62_773_927_561_148);
+        assert_eq!(selected.grid.min_raw, 50_000_000_000_000);
+        assert_eq!(selected.grid.tick_size_raw, 1_000_000_000);
+    }
+}
