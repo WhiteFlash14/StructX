@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "crates/deepbook-client",
+    "crates/structx-core",
     "crates/structx-cli",
 ]
 resolver = "2"

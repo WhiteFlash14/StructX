@@ -1,0 +1,12 @@
+[package]
+name = "structx-core"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+chrono.workspace = true
+deepbook-client = { path = "../deepbook-client" }
+serde.workspace = true
+thiserror.workspace = true
