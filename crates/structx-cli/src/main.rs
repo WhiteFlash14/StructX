@@ -149,8 +149,8 @@ fn print_market_table(markets: &[MarketSnapshot]) {
                     .unwrap_or_else(|| "—".to_string()),
             ),
             Cell::new(format_latest_price(market)),
-            Cell::new(format_optional_u64(market.min_strike())),
-            Cell::new(format_optional_u64(market.tick_size())),
+            Cell::new(format_scaled_price_raw(market.min_strike())),
+            Cell::new(format_scaled_price_raw(market.tick_size())),
             Cell::new(format_age(market.price_age_seconds(now))),
             Cell::new(format_age(market.svi_age_seconds(now))),
             Cell::new(format_usable(&market.structx_status)),
@@ -165,19 +165,34 @@ fn format_latest_price(market: &MarketSnapshot) -> String {
         .latest_price
         .as_ref()
         .and_then(|price| price.price)
-        .map(|price| format!("{price:.4}"))
-        .or_else(|| {
-            market.latest_svi.as_ref().and_then(|svi| svi.spot).map(|spot| format!("{spot:.4}"))
+        .or_else(|| market.latest_svi.as_ref().and_then(|svi| svi.spot))
+        .map(format_price_like_value)
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn format_price_like_value(value: f64) -> String {
+    // DeepBook Predict BTC values in the current Testnet data are raw 1e9-scaled.
+    if value.abs() >= 1_000_000_000.0 {
+        format!("{:.2}", value / 1_000_000_000.0)
+    } else {
+        format!("{value:.4}")
+    }
+}
+
+fn format_scaled_price_raw(value: Option<u64>) -> String {
+    value
+        .map(|v| {
+            if v >= 1_000_000_000 {
+                format!("{:.2}", v as f64 / 1_000_000_000.0)
+            } else {
+                v.to_string()
+            }
         })
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn format_optional_u64(value: Option<u64>) -> String {
-    value.map(|v| v.to_string()).unwrap_or_else(|| "—".to_string())
-}
-
 fn format_age(value: Option<i64>) -> String {
-    value.map(|secs| format!("{secs}s")).unwrap_or_else(|| "—".to_string())
+    value.map(|secs| format!("{secs}s")).unwrap_or_else(|| "unknown".to_string())
 }
 
 fn format_usable(status: &StructxMarketStatus) -> String {
