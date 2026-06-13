@@ -335,6 +335,66 @@ mod tests {
     }
 
     #[test]
+    fn missing_timestamps_warn_but_do_not_reject_in_default_testnet_mode() {
+        let now = Utc.timestamp_millis_opt(1_900_000_000_000).single().expect("valid timestamp");
+
+        let snapshot = MarketSnapshot::evaluate(
+            base_list_item(now),
+            Some(base_state(now)),
+            Some(LatestPrice { timestamp_ms: None, price: Some(63_000.0), raw: json!({}) }),
+            Some(LatestSvi {
+                timestamp_ms: None,
+                spot: Some(63_000.0),
+                forward: Some(63_100.0),
+                raw: json!({}),
+            }),
+            Some(AskBounds { raw: json!({}) }),
+            true,
+            now,
+            FreshnessConfig::default(),
+        );
+
+        assert!(snapshot.structx_status.is_usable());
+        assert_eq!(
+            snapshot.structx_status.warnings(),
+            &[MarketWarning::MissingLatestPriceTimestamp, MarketWarning::MissingLatestSviTimestamp,]
+        );
+    }
+
+    #[test]
+    fn missing_timestamps_reject_in_strict_mode() {
+        let now = Utc.timestamp_millis_opt(1_900_000_000_000).single().expect("valid timestamp");
+
+        let snapshot = MarketSnapshot::evaluate(
+            base_list_item(now),
+            Some(base_state(now)),
+            Some(LatestPrice { timestamp_ms: None, price: Some(63_000.0), raw: json!({}) }),
+            Some(LatestSvi {
+                timestamp_ms: None,
+                spot: Some(63_000.0),
+                forward: Some(63_100.0),
+                raw: json!({}),
+            }),
+            Some(AskBounds { raw: json!({}) }),
+            true,
+            now,
+            FreshnessConfig {
+                require_price_timestamp: true,
+                require_svi_timestamp: true,
+                ..FreshnessConfig::default()
+            },
+        );
+
+        match snapshot.structx_status {
+            StructxMarketStatus::Rejected { reasons, .. } => {
+                assert!(reasons.contains(&MarketRejectionReason::StalePrice));
+                assert!(reasons.contains(&MarketRejectionReason::StaleSvi));
+            }
+            _ => panic!("strict mode should reject missing timestamps"),
+        }
+    }
+
+    #[test]
     fn stale_price_is_rejected() {
         let now = Utc.timestamp_millis_opt(1_900_000_000_000).single().expect("valid timestamp");
 
