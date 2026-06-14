@@ -384,7 +384,42 @@ async fn plan_quote_breakout_command(
 
     print_selected_market(&selected);
 
-    let _ = (bucket_step, levels_each_side, tail_quantity, shoulder_quantity);
+    let strikes = selected.grid.centered_strikes_by_display_step(
+        selected.spot_raw,
+        bucket_step,
+        levels_each_side,
+    )?;
+
+    let center = selected
+        .grid
+        .snap_nearest(selected.spot_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
+
+    let center_idx = strikes
+        .iter()
+        .position(|strike| strike.raw == center.raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
+
+    if center_idx < 2 || center_idx + 2 >= strikes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not enough strikes around spot; increase --levels-each-side",
+        )
+        .into());
+    }
+
+    let k1 = strikes[center_idx - 2];
+    let k2 = strikes[center_idx - 1];
+    let k3 = strikes[center_idx + 1];
+    let k4 = strikes[center_idx + 2];
+
+    let compiled = compile_breakout(k1, k2, k3, k4, tail_quantity, shoulder_quantity)?;
+    let plan = build_quote_plan(&selected, &compiled)?;
+
+    print_breakout_boundaries(&selected, k1, k2, k3, k4);
+    print_compiled_payoff(&selected, &compiled);
+
+    let _ = plan;
 
     Ok(())
 }
