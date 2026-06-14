@@ -165,3 +165,98 @@ fn validate_bucket_shape(bucket: &PayoffBucket) -> Result<(), PayoffCompileError
         _ => Ok(()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn strike(raw: u64) -> Strike {
+        Strike { raw }
+    }
+
+    #[test]
+    fn compiles_custom_bucket_payoff_to_predict_legs() {
+        let k1 = strike(60);
+        let k2 = strike(61);
+        let k3 = strike(62);
+
+        let compiled = compile_bucket_payoff(&[
+            PayoffBucket::new(None, Some(k1), 1_000),
+            PayoffBucket::new(Some(k1), Some(k2), 400),
+            PayoffBucket::new(Some(k2), Some(k3), 0),
+            PayoffBucket::new(Some(k3), None, 1_200),
+        ])
+        .expect("payoff compiles");
+
+        assert_eq!(compiled.legs.len(), 3);
+        assert_eq!(compiled.max_payout_quantity, 1_200);
+
+        assert_eq!(
+            compiled.legs[0],
+            PredictLeg::Binary { direction: BinaryDirection::Down, strike: k1, quantity: 1_000 }
+        );
+
+        assert_eq!(compiled.legs[1], PredictLeg::Range { lower: k1, upper: k2, quantity: 400 });
+
+        assert_eq!(
+            compiled.legs[2],
+            PredictLeg::Binary { direction: BinaryDirection::Up, strike: k3, quantity: 1_200 }
+        );
+    }
+
+    #[test]
+    fn compiles_breakout_structure() {
+        let k1 = strike(60);
+        let k2 = strike(61);
+        let k3 = strike(63);
+        let k4 = strike(64);
+
+        let compiled = compile_breakout(k1, k2, k3, k4, 1_000, 400).expect("breakout compiles");
+
+        assert_eq!(compiled.legs.len(), 4);
+        assert_eq!(compiled.max_payout_quantity, 1_000);
+
+        assert_eq!(compiled.legs[0].kind_name(), "down_binary");
+        assert_eq!(compiled.legs[1].kind_name(), "range");
+        assert_eq!(compiled.legs[2].kind_name(), "range");
+        assert_eq!(compiled.legs[3].kind_name(), "up_binary");
+    }
+
+    #[test]
+    fn compiles_single_range_payout() {
+        let compiled = compile_range_payout(strike(60), strike(61), 500).expect("range compiles");
+
+        assert_eq!(compiled.legs.len(), 1);
+        assert_eq!(
+            compiled.legs[0],
+            PredictLeg::Range { lower: strike(60), upper: strike(61), quantity: 500 }
+        );
+    }
+
+    #[test]
+    fn rejects_invalid_range() {
+        let err = compile_range_payout(strike(61), strike(60), 500)
+            .expect_err("invalid range should fail");
+
+        assert_eq!(err, PayoffCompileError::InvalidRange { lower: 61, upper: 60 });
+    }
+
+    #[test]
+    fn rejects_empty_zero_payoff() {
+        let err = compile_bucket_payoff(&[
+            PayoffBucket::new(None, Some(strike(60)), 0),
+            PayoffBucket::new(Some(strike(60)), None, 0),
+        ])
+        .expect_err("zero payoff should fail");
+
+        assert_eq!(err, PayoffCompileError::NoPayingBuckets);
+    }
+
+    #[test]
+    fn rejects_invalid_breakout_ordering() {
+        let err = compile_breakout(strike(60), strike(61), strike(61), strike(64), 1_000, 400)
+            .expect_err("bad breakout should fail");
+
+        assert_eq!(err, PayoffCompileError::InvalidBreakoutStrikes);
+    }
+}
