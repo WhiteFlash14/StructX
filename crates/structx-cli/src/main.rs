@@ -235,8 +235,8 @@ fn print_market_table(markets: &[MarketSnapshot]) {
                     .unwrap_or_else(|| "—".to_string()),
             ),
             Cell::new(format_latest_price(market)),
-            Cell::new(format_scaled_price_raw(market.min_strike())),
-            Cell::new(format_scaled_price_raw(market.tick_size())),
+            Cell::new(format_scaled_raw(market.min_strike())),
+            Cell::new(format_scaled_raw(market.tick_size())),
             Cell::new(format_age(market.price_age_seconds(now))),
             Cell::new(format_age(market.svi_age_seconds(now))),
             Cell::new(format_usable(&market.structx_status)),
@@ -338,29 +338,19 @@ fn format_latest_price(market: &MarketSnapshot) -> String {
         .as_ref()
         .and_then(|price| price.price)
         .or_else(|| market.latest_svi.as_ref().and_then(|svi| svi.spot))
-        .map(format_price_like_value)
+        .map(|value| {
+            let scale = PriceScale::E9;
+            scale
+                .raw_from_api_number(value)
+                .map(|raw| scale.display_from_raw(raw).to_string())
+                .unwrap_or_else(|| "—".to_string())
+        })
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn format_price_like_value(value: f64) -> String {
-    // DeepBook Predict BTC values in the current Testnet data are raw 1e9-scaled.
-    // If already human-sized, leave them alone.
-    if value.abs() >= 1_000_000_000.0 {
-        format!("{:.2}", value / 1_000_000_000.0)
-    } else {
-        format!("{value:.4}")
-    }
-}
-
-fn format_scaled_price_raw(value: Option<u64>) -> String {
+fn format_scaled_raw(value: Option<u64>) -> String {
     value
-        .map(|v| {
-            if v >= 1_000_000_000 {
-                format!("{:.2}", v as f64 / 1_000_000_000.0)
-            } else {
-                v.to_string()
-            }
-        })
+        .map(|raw| PriceScale::E9.display_from_raw(raw).to_string())
         .unwrap_or_else(|| "—".to_string())
 }
 
