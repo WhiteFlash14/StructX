@@ -418,8 +418,7 @@ async fn plan_quote_breakout_command(
 
     print_breakout_boundaries(&selected, k1, k2, k3, k4);
     print_compiled_payoff(&selected, &compiled);
-
-    let _ = plan;
+    print_quote_plan(&selected, &plan);
 
     Ok(())
 }
@@ -498,6 +497,58 @@ fn print_compiled_payoff(selected: &SelectedMarket<'_>, compiled: &CompiledPayof
     println!("{leg_table}");
     println!();
     println!("Max payout quantity: {}", compiled.max_payout_quantity);
+}
+
+fn print_quote_plan(selected: &SelectedMarket<'_>, plan: &QuotePlan) {
+    println!("Quote target");
+    println!("package_id: {}", plan.target.package_id);
+    println!("predict_object_id: {}", plan.target.predict_object_id);
+    println!("module: {}", plan.target.module);
+    println!("oracle_id: {}", plan.oracle_id);
+    println!("expiry_ms: {}", plan.expiry_ms);
+    println!();
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "#",
+        "Move function",
+        "leg",
+        "direction",
+        "strike/lower",
+        "upper",
+        "quantity",
+    ]);
+
+    for (idx, call) in plan.calls.iter().enumerate() {
+        match call {
+            QuoteCall::Binary { function, direction, strike, quantity, .. } => {
+                table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new(format!("predict::{function}")),
+                    Cell::new("binary"),
+                    Cell::new(direction.to_string()),
+                    Cell::new(selected.grid.display(*strike).to_string()),
+                    Cell::new("—"),
+                    Cell::new(quantity),
+                ]);
+            }
+            QuoteCall::Range { function, lower, upper, quantity, .. } => {
+                table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new(format!("predict::{function}")),
+                    Cell::new("range"),
+                    Cell::new("—"),
+                    Cell::new(selected.grid.display(*lower).to_string()),
+                    Cell::new(selected.grid.display(*upper).to_string()),
+                    Cell::new(quantity),
+                ]);
+            }
+        }
+    }
+
+    println!("Semantic quote plan");
+    println!("{table}");
 }
 
 fn print_market_table(markets: &[MarketSnapshot]) {
