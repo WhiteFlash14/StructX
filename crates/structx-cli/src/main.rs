@@ -278,9 +278,55 @@ async fn compile_breakout_command(
 
     print_selected_market(&selected);
 
-    let _ = (bucket_step, levels_each_side, tail_quantity, shoulder_quantity);
+    let strikes = selected.grid.centered_strikes_by_display_step(
+        selected.spot_raw,
+        bucket_step,
+        levels_each_side,
+    )?;
+
+    let center = selected
+        .grid
+        .snap_nearest(selected.spot_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
+
+    let center_idx = strikes
+        .iter()
+        .position(|strike| strike.raw == center.raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
+
+    if center_idx < 2 || center_idx + 2 >= strikes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not enough strikes around spot; increase --levels-each-side",
+        )
+        .into());
+    }
+
+    let k1 = strikes[center_idx - 2];
+    let k2 = strikes[center_idx - 1];
+    let k3 = strikes[center_idx + 1];
+    let k4 = strikes[center_idx + 2];
+
+    let _ = (tail_quantity, shoulder_quantity);
+
+    print_breakout_boundaries(&selected, k1, k2, k3, k4);
 
     Ok(())
+}
+
+fn print_breakout_boundaries(
+    selected: &SelectedMarket<'_>,
+    k1: Strike,
+    k2: Strike,
+    k3: Strike,
+    k4: Strike,
+) {
+    println!("Breakout boundaries");
+    println!("K1 downside tail: {}", selected.grid.display(k1));
+    println!("K2 downside shoulder upper: {}", selected.grid.display(k2));
+    println!("K3 upside shoulder lower: {}", selected.grid.display(k3));
+    println!("K4 upside tail: {}", selected.grid.display(k4));
+    println!();
 }
 
 fn print_market_table(markets: &[MarketSnapshot]) {
