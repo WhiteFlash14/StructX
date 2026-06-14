@@ -9,6 +9,8 @@ pub use payoff::{
     PayoffBucket, PayoffCompileError, PredictLeg,
 };
 pub use price::{DisplayPrice, PriceScale};
-pub use quote_plan::{QuoteFunction, QuoteTarget};
+pub use quote_plan::{
+    build_quote_plan, QuoteCall, QuoteFunction, QuotePlan, QuotePlanError, QuoteTarget,
+};
 pub use selector::{select_best_market, MarketSelectionError, SelectedMarket};
 pub use strike_grid::{Strike, StrikeBucket, StrikeGrid, StrikeGridError};
