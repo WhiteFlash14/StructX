@@ -307,9 +307,10 @@ async fn compile_breakout_command(
     let k3 = strikes[center_idx + 1];
     let k4 = strikes[center_idx + 2];
 
-    let _ = (tail_quantity, shoulder_quantity);
+    let compiled = compile_breakout(k1, k2, k3, k4, tail_quantity, shoulder_quantity)?;
 
     print_breakout_boundaries(&selected, k1, k2, k3, k4);
+    print_compiled_payoff(&selected, &compiled);
 
     Ok(())
 }
@@ -327,6 +328,67 @@ fn print_breakout_boundaries(
     println!("K3 upside shoulder lower: {}", selected.grid.display(k3));
     println!("K4 upside tail: {}", selected.grid.display(k4));
     println!();
+}
+
+fn print_compiled_payoff(selected: &SelectedMarket<'_>, compiled: &CompiledPayoff) {
+    let mut payoff_table = Table::new();
+    payoff_table.load_preset(UTF8_FULL);
+    payoff_table.set_header(vec!["bucket", "lower", "upper", "payout quantity"]);
+
+    for (idx, bucket) in compiled.buckets.iter().enumerate() {
+        let lower = bucket
+            .lower
+            .map(|strike| selected.grid.display(strike).to_string())
+            .unwrap_or_else(|| "−∞".to_string());
+
+        let upper = bucket
+            .upper
+            .map(|strike| selected.grid.display(strike).to_string())
+            .unwrap_or_else(|| "+∞".to_string());
+
+        payoff_table.add_row(vec![
+            Cell::new(idx),
+            Cell::new(lower),
+            Cell::new(upper),
+            Cell::new(bucket.payout_quantity),
+        ]);
+    }
+
+    println!("Compiled payoff table");
+    println!("{payoff_table}");
+    println!();
+
+    let mut leg_table = Table::new();
+    leg_table.load_preset(UTF8_FULL);
+    leg_table.set_header(vec!["#", "leg type", "strike/lower", "upper", "quantity"]);
+
+    for (idx, leg) in compiled.legs.iter().enumerate() {
+        match leg {
+            PredictLeg::Binary { direction, strike, quantity } => {
+                leg_table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new(format!("{direction}_binary")),
+                    Cell::new(selected.grid.display(*strike).to_string()),
+                    Cell::new("—"),
+                    Cell::new(quantity),
+                ]);
+            }
+            PredictLeg::Range { lower, upper, quantity } => {
+                leg_table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new("range"),
+                    Cell::new(selected.grid.display(*lower).to_string()),
+                    Cell::new(selected.grid.display(*upper).to_string()),
+                    Cell::new(quantity),
+                ]);
+            }
+        }
+    }
+
+    println!("Compiled Predict legs");
+    println!("{leg_table}");
+    println!();
+    println!("Max payout quantity: {}", compiled.max_payout_quantity);
 }
 
 fn print_market_table(markets: &[MarketSnapshot]) {
