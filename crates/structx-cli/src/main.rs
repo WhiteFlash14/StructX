@@ -13,6 +13,7 @@ use structx_core::{
     build_quote_plan, compile_breakout, select_best_market, CompiledPayoff, DisplayPrice,
     PredictLeg, PriceScale, QuoteCall, QuotePlan, SelectedMarket, Strike,
 };
+
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
 #[command(about = "StructX CLI for DeepBook Predict market inspection")]
@@ -64,6 +65,32 @@ enum Command {
     },
 
     CompileBreakout {
+        #[arg(long, default_value_t = 60)]
+        max_price_age_secs: i64,
+
+        #[arg(long, default_value_t = 60)]
+        max_svi_age_secs: i64,
+
+        #[arg(long, default_value_t = 300)]
+        min_time_to_expiry_secs: i64,
+
+        #[arg(long, default_value_t = false)]
+        strict_freshness: bool,
+
+        #[arg(long, default_value_t = 250.0)]
+        bucket_step_usd: f64,
+
+        #[arg(long, default_value_t = 4)]
+        levels_each_side: u32,
+
+        #[arg(long, default_value_t = 1000)]
+        tail_quantity: u64,
+
+        #[arg(long, default_value_t = 400)]
+        shoulder_quantity: u64,
+    },
+
+    PlanQuoteBreakout {
         #[arg(long, default_value_t = 60)]
         max_price_age_secs: i64,
 
@@ -152,6 +179,34 @@ async fn main() -> std::process::ExitCode {
             );
 
             compile_breakout_command(
+                cli.server_url,
+                cli.predict_id,
+                freshness,
+                DisplayPrice(bucket_step_usd),
+                levels_each_side,
+                tail_quantity,
+                shoulder_quantity,
+            )
+            .await
+        }
+        Command::PlanQuoteBreakout {
+            max_price_age_secs,
+            max_svi_age_secs,
+            min_time_to_expiry_secs,
+            strict_freshness,
+            bucket_step_usd,
+            levels_each_side,
+            tail_quantity,
+            shoulder_quantity,
+        } => {
+            let freshness = build_freshness(
+                max_price_age_secs,
+                max_svi_age_secs,
+                min_time_to_expiry_secs,
+                strict_freshness,
+            );
+
+            plan_quote_breakout_command(
                 cli.server_url,
                 cli.predict_id,
                 freshness,
@@ -310,6 +365,26 @@ async fn compile_breakout_command(
 
     print_breakout_boundaries(&selected, k1, k2, k3, k4);
     print_compiled_payoff(&selected, &compiled);
+
+    Ok(())
+}
+
+async fn plan_quote_breakout_command(
+    server_url: String,
+    predict_id: String,
+    freshness: FreshnessConfig,
+    bucket_step: DisplayPrice,
+    levels_each_side: u32,
+    tail_quantity: u64,
+    shoulder_quantity: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = build_client(server_url, predict_id)?;
+    let markets = load_markets(&client, freshness).await?;
+    let selected = select_best_market(&markets, PriceScale::E9)?;
+
+    print_selected_market(&selected);
+
+    let _ = (bucket_step, levels_each_side, tail_quantity, shoulder_quantity);
 
     Ok(())
 }
