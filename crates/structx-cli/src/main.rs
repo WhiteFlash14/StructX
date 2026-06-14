@@ -10,10 +10,9 @@ use deepbook_client::{
     PREDICT_OBJECT_ID, PREDICT_SERVER_URL,
 };
 use structx_core::{
-    compile_breakout, select_best_market, CompiledPayoff, DisplayPrice, PredictLeg, PriceScale,
-    SelectedMarket, Strike,
+    build_quote_plan, compile_breakout, select_best_market, CompiledPayoff, DisplayPrice,
+    PredictLeg, PriceScale, QuoteCall, QuotePlan, SelectedMarket, Strike,
 };
-
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
 #[command(about = "StructX CLI for DeepBook Predict market inspection")]
