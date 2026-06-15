@@ -12,10 +12,10 @@ use deepbook_client::{
     PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
 };
 use structx_core::{
-    build_quote_plan, compile_breakout, select_best_market, CompiledPayoff, DisplayPrice,
-    PredictLeg, PriceScale, QuoteCall, QuotePlan, SelectedMarket, Strike,
+    build_quote_plan, build_quote_tx_kind, compile_breakout, select_best_market, CompiledPayoff,
+    DisplayPrice, PredictLeg, PriceScale, QuoteCall, QuoteObjectRefs, QuotePlan, QuoteTxKind,
+    SelectedMarket, Strike,
 };
-
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
 #[command(about = "StructX CLI for DeepBook Predict market inspection")]
@@ -119,6 +119,38 @@ enum Command {
 
         #[arg(long, default_value_t = 400)]
         shoulder_quantity: u64,
+    },
+
+    DevinspectQuoteBreakout {
+        #[arg(long, default_value_t = 60)]
+        max_price_age_secs: i64,
+
+        #[arg(long, default_value_t = 60)]
+        max_svi_age_secs: i64,
+
+        #[arg(long, default_value_t = 300)]
+        min_time_to_expiry_secs: i64,
+
+        #[arg(long, default_value_t = false)]
+        strict_freshness: bool,
+
+        #[arg(long, default_value_t = 250.0)]
+        bucket_step_usd: f64,
+
+        #[arg(long, default_value_t = 4)]
+        levels_each_side: u32,
+
+        #[arg(long, default_value_t = 1000)]
+        tail_quantity: u64,
+
+        #[arg(long, default_value_t = 400)]
+        shoulder_quantity: u64,
+
+        #[arg(
+            long,
+            default_value = "0x0000000000000000000000000000000000000000000000000000000000000000"
+        )]
+        sender: String,
     },
 
     ResolveQuoteObjects {
@@ -235,6 +267,37 @@ async fn main() -> std::process::ExitCode {
                 levels_each_side,
                 tail_quantity,
                 shoulder_quantity,
+            )
+            .await
+        }
+        Command::DevinspectQuoteBreakout {
+            max_price_age_secs,
+            max_svi_age_secs,
+            min_time_to_expiry_secs,
+            strict_freshness,
+            bucket_step_usd,
+            levels_each_side,
+            tail_quantity,
+            shoulder_quantity,
+            sender,
+        } => {
+            let freshness = build_freshness(
+                max_price_age_secs,
+                max_svi_age_secs,
+                min_time_to_expiry_secs,
+                strict_freshness,
+            );
+
+            devinspect_quote_breakout_command(
+                cli.server_url,
+                cli.predict_id,
+                cli.rpc_url,
+                freshness,
+                DisplayPrice(bucket_step_usd),
+                levels_each_side,
+                tail_quantity,
+                shoulder_quantity,
+                sender,
             )
             .await
         }
@@ -461,6 +524,86 @@ async fn plan_quote_breakout_command(
     Ok(())
 }
 
+async fn devinspect_quote_breakout_command(
+    server_url: String,
+    predict_id: String,
+    rpc_url: String,
+    freshness: FreshnessConfig,
+    bucket_step: DisplayPrice,
+    levels_each_side: u32,
+    tail_quantity: u64,
+    shoulder_quantity: u64,
+    sender: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = build_client(server_url, predict_id)?;
+    let markets = load_markets(&client, freshness).await?;
+    let selected = select_best_market(&markets, PriceScale::E9)?;
+
+    print_selected_market(&selected);
+
+    let strikes = selected.grid.centered_strikes_by_display_step(
+        selected.spot_raw,
+        bucket_step,
+        levels_each_side,
+    )?;
+
+    let center = selected
+        .grid
+        .snap_nearest(selected.spot_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
+
+    let center_idx = strikes
+        .iter()
+        .position(|strike| strike.raw == center.raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
+
+    if center_idx < 2 || center_idx + 2 >= strikes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not enough strikes around spot; increase --levels-each-side",
+        )
+        .into());
+    }
+
+    let k1 = strikes[center_idx - 2];
+    let k2 = strikes[center_idx - 1];
+    let k3 = strikes[center_idx + 1];
+    let k4 = strikes[center_idx + 2];
+
+    let compiled = compile_breakout(k1, k2, k3, k4, tail_quantity, shoulder_quantity)?;
+    let plan = build_quote_plan(&selected, &compiled)?;
+
+    print_breakout_boundaries(&selected, k1, k2, k3, k4);
+    print_compiled_payoff(&selected, &compiled);
+    print_quote_plan(&selected, &plan);
+
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+
+    let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let oracle = resolve_sui_object(&rpc, selected.oracle_id).await?;
+    let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
+
+    validate_quote_object_refs(&predict, &oracle, &clock)?;
+
+    let tx_kind = build_quote_tx_kind(
+        &plan,
+        QuoteObjectRefs { predict: &predict, oracle: &oracle, clock: &clock },
+        &sender,
+    )?;
+
+    print_quote_tx_kind(&tx_kind);
+
+    Ok(())
+}
+
+fn print_quote_tx_kind(tx_kind: &QuoteTxKind) {
+    println!("Built quote TransactionKind");
+    println!("sender: {}", tx_kind.sender);
+    println!("tx_kind_b64_len: {}", tx_kind.tx_kind_b64.len());
+    println!("quote result command indices: {:?}", tx_kind.quote_result_command_indices);
+    println!();
+}
+
 async fn resolve_quote_objects_command(
     server_url: String,
     predict_id: String,
@@ -535,11 +678,7 @@ fn validate_quote_object_refs(
     oracle: &SuiObjectInfo,
     clock: &SuiObjectInfo,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let checks = [
-        ("predict", predict),
-        ("oracle", oracle),
-        ("clock", clock),
-    ];
+    let checks = [("predict", predict), ("oracle", oracle), ("clock", clock)];
 
     for (role, object) in checks {
         if object.owner_kind != ObjectOwnerKind::Shared {

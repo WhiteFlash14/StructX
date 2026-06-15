@@ -6,6 +6,7 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+serde_json.workspace = true
 chrono.workspace = true
 clap.workspace = true
 comfy-table.workspace = true
