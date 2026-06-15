@@ -6,8 +6,9 @@ use clap::{Parser, Subcommand};
 use comfy_table::{presets::UTF8_FULL, Cell, Table};
 
 use deepbook_client::{
-    DeepBookClient, DeepBookConfig, FreshnessConfig, MarketSnapshot, StructxMarketStatus,
-    PREDICT_OBJECT_ID, PREDICT_SERVER_URL,
+    verify_predict_abi, AbiCheckStatus, AbiVerificationReport, DeepBookClient, DeepBookConfig,
+    FreshnessConfig, MarketSnapshot, StructxMarketStatus, SuiRpcClient,
+    DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL,
 };
 use structx_core::{
     build_quote_plan, compile_breakout, select_best_market, CompiledPayoff, DisplayPrice,
@@ -23,6 +24,9 @@ struct Cli {
 
     #[arg(long, default_value = PREDICT_OBJECT_ID)]
     predict_id: String,
+
+    #[arg(long, default_value = DEFAULT_SUI_TESTNET_RPC_URL)]
+    rpc_url: String,
 
     #[command(subcommand)]
     command: Command,
@@ -115,6 +119,8 @@ enum Command {
         #[arg(long, default_value_t = 400)]
         shoulder_quantity: u64,
     },
+
+    VerifyAbi,
 }
 
 #[tokio::main]
@@ -217,6 +223,7 @@ async fn main() -> std::process::ExitCode {
             )
             .await
         }
+        Command::VerifyAbi => verify_abi_command(cli.rpc_url).await,
     };
 
     match result {
@@ -421,6 +428,92 @@ async fn plan_quote_breakout_command(
     print_quote_plan(&selected, &plan);
 
     Ok(())
+}
+
+async fn verify_abi_command(rpc_url: String) -> Result<(), Box<dyn std::error::Error>> {
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+
+    let modules = rpc.get_normalized_move_modules_by_package(PREDICT_PACKAGE_ID).await?;
+
+    let report = verify_predict_abi(PREDICT_PACKAGE_ID, &modules);
+
+    print_abi_report(&report);
+
+    if !report.is_pass() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "DeepBook Predict ABI verification failed",
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn print_abi_report(report: &AbiVerificationReport) {
+    println!("ABI verification");
+    println!("package_id: {}", report.package_id);
+    println!("modules found: {}", report.module_count);
+    println!();
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "status",
+        "module",
+        "function",
+        "visibility",
+        "params",
+        "returns",
+        "source",
+        "message",
+    ]);
+
+    for check in &report.checks {
+        table.add_row(vec![
+            Cell::new(check.status.to_string()),
+            Cell::new(&check.module),
+            Cell::new(&check.function),
+            Cell::new(check.visibility.as_deref().unwrap_or("—")),
+            Cell::new(format!(
+                "{}/{}",
+                check
+                    .actual_parameter_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                check.expected_parameter_count
+            )),
+            Cell::new(format!(
+                "{}/{}",
+                check
+                    .actual_return_count
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+                check.expected_return_count
+            )),
+            Cell::new(&check.source_note),
+            Cell::new(check.message.as_deref().unwrap_or("")),
+        ]);
+    }
+
+    println!("{table}");
+    println!();
+
+    for check in &report.checks {
+        if check.status == AbiCheckStatus::Pass {
+            println!("{}::{} parameters:", check.module, check.function);
+            for (idx, param) in check.parameters.iter().enumerate() {
+                println!("  [{idx}] {param}");
+            }
+
+            println!("{}::{} returns:", check.module, check.function);
+            for (idx, return_type) in check.returns.iter().enumerate() {
+                println!("  [{idx}] {return_type}");
+            }
+
+            println!();
+        }
+    }
 }
 
 fn print_breakout_boundaries(
