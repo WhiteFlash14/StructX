@@ -7,8 +7,9 @@ use comfy_table::{presets::UTF8_FULL, Cell, Table};
 
 use deepbook_client::{
     verify_predict_abi, AbiCheckStatus, AbiVerificationReport, DeepBookClient, DeepBookConfig,
-    FreshnessConfig, MarketSnapshot, StructxMarketStatus, SuiRpcClient,
-    DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL,
+    FreshnessConfig, MarketSnapshot, ObjectOwnerKind, StructxMarketStatus, SuiObjectInfo,
+    SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID,
+    PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
 };
 use structx_core::{
     build_quote_plan, compile_breakout, select_best_market, CompiledPayoff, DisplayPrice,
@@ -120,6 +121,20 @@ enum Command {
         shoulder_quantity: u64,
     },
 
+    ResolveQuoteObjects {
+        #[arg(long, default_value_t = 60)]
+        max_price_age_secs: i64,
+
+        #[arg(long, default_value_t = 60)]
+        max_svi_age_secs: i64,
+
+        #[arg(long, default_value_t = 300)]
+        min_time_to_expiry_secs: i64,
+
+        #[arg(long, default_value_t = false)]
+        strict_freshness: bool,
+    },
+
     VerifyAbi,
 }
 
@@ -222,6 +237,22 @@ async fn main() -> std::process::ExitCode {
                 shoulder_quantity,
             )
             .await
+        }
+        Command::ResolveQuoteObjects {
+            max_price_age_secs,
+            max_svi_age_secs,
+            min_time_to_expiry_secs,
+            strict_freshness,
+        } => {
+            let freshness = build_freshness(
+                max_price_age_secs,
+                max_svi_age_secs,
+                min_time_to_expiry_secs,
+                strict_freshness,
+            );
+
+            resolve_quote_objects_command(cli.server_url, cli.predict_id, cli.rpc_url, freshness)
+                .await
         }
         Command::VerifyAbi => verify_abi_command(cli.rpc_url).await,
     };
@@ -427,6 +458,108 @@ async fn plan_quote_breakout_command(
     print_compiled_payoff(&selected, &compiled);
     print_quote_plan(&selected, &plan);
 
+    Ok(())
+}
+
+async fn resolve_quote_objects_command(
+    server_url: String,
+    predict_id: String,
+    rpc_url: String,
+    freshness: FreshnessConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = build_client(server_url, predict_id)?;
+    let markets = load_markets(&client, freshness).await?;
+    let selected = select_best_market(&markets, PriceScale::E9)?;
+
+    print_selected_market(&selected);
+
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+
+    let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let oracle = resolve_sui_object(&rpc, selected.oracle_id).await?;
+    let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
+
+    print_quote_object_refs(&predict, &oracle, &clock);
+    validate_quote_object_refs(&predict, &oracle, &clock)?;
+
+    Ok(())
+}
+
+async fn resolve_sui_object(
+    rpc: &SuiRpcClient,
+    object_id: &str,
+) -> Result<SuiObjectInfo, Box<dyn std::error::Error>> {
+    let value = rpc.get_object(object_id).await?;
+    Ok(SuiObjectInfo::from_get_object_result(object_id, value)?)
+}
+
+fn print_quote_object_refs(predict: &SuiObjectInfo, oracle: &SuiObjectInfo, clock: &SuiObjectInfo) {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "role",
+        "object id",
+        "type",
+        "owner",
+        "version",
+        "digest",
+        "initial shared version",
+    ]);
+
+    for (role, object) in [("predict", predict), ("oracle", oracle), ("clock", clock)] {
+        table.add_row(vec![
+            Cell::new(role),
+            Cell::new(&object.object_id),
+            Cell::new(object.object_type.as_deref().unwrap_or("—")),
+            Cell::new(object.owner_kind.to_string()),
+            Cell::new(
+                object.version.map(|value| value.to_string()).unwrap_or_else(|| "—".to_string()),
+            ),
+            Cell::new(object.digest.as_deref().unwrap_or("—")),
+            Cell::new(
+                object
+                    .initial_shared_version
+                    .map(|value| value.to_string())
+                    .unwrap_or_else(|| "—".to_string()),
+            ),
+        ]);
+    }
+
+    println!("Quote object refs");
+    println!("{table}");
+    println!();
+}
+
+fn validate_quote_object_refs(
+    predict: &SuiObjectInfo,
+    oracle: &SuiObjectInfo,
+    clock: &SuiObjectInfo,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let checks = [
+        ("predict", predict),
+        ("oracle", oracle),
+        ("clock", clock),
+    ];
+
+    for (role, object) in checks {
+        if object.owner_kind != ObjectOwnerKind::Shared {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{role} object is not shared: owner={}", object.owner_kind),
+            )
+            .into());
+        }
+
+        if object.initial_shared_version.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{role} object is missing initial_shared_version"),
+            )
+            .into());
+        }
+    }
+
+    println!("Quote object refs: ok");
     Ok(())
 }
 

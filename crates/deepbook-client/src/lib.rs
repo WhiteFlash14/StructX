@@ -24,4 +24,5 @@ pub use models::{
     AskBounds, LatestPrice, LatestSvi, OracleListItem, OracleState, PredictState, QuoteAsset,
     ServerStatus, VaultSummary,
 };
+pub use object_ref::{ObjectOwnerKind, SuiObjectInfo};
 pub use rpc::SuiRpcClient;
