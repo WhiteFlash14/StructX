@@ -7,3 +7,5 @@ pub const PREDICT_PACKAGE_ID: &str =
     "0xf5ea2b3749c65d6e56507cc35388719aadb28f9cab873696a2f8687f5c785138";
 
 pub const DEFAULT_SUI_TESTNET_RPC_URL: &str = "https://fullnode.testnet.sui.io:443";
+
+pub const SUI_CLOCK_OBJECT_ID: &str = "0x6";

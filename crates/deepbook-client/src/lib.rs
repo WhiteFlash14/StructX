@@ -4,6 +4,7 @@ pub mod constants;
 pub mod error;
 pub mod market;
 pub mod models;
+pub mod object_ref;
 pub mod rpc;
 
 pub use abi::{
@@ -13,6 +14,7 @@ pub use abi::{
 pub use client::{DeepBookClient, DeepBookConfig};
 pub use constants::{
     DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL,
+    SUI_CLOCK_OBJECT_ID,
 };
 pub use error::{DeepBookClientError, Result};
 pub use market::{
