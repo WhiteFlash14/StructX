@@ -1,8 +1,10 @@
+pub mod abi;
 pub mod client;
 pub mod constants;
 pub mod error;
 pub mod market;
 pub mod models;
+pub mod rpc;
 
 pub use client::{DeepBookClient, DeepBookConfig};
 pub use constants::{
@@ -16,3 +18,4 @@ pub use models::{
     AskBounds, LatestPrice, LatestSvi, OracleListItem, OracleState, PredictState, QuoteAsset,
     ServerStatus, VaultSummary,
 };
+pub use rpc::SuiRpcClient;
