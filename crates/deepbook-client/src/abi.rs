@@ -1,4 +1,5 @@
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 #[derive(Debug, Clone, Copy)]
 pub struct ExpectedAbiFunction {
@@ -89,5 +90,125 @@ impl AbiVerificationReport {
     #[must_use]
     pub fn is_pass(&self) -> bool {
         self.checks.iter().all(|check| check.status == AbiCheckStatus::Pass)
+    }
+}
+
+pub fn verify_predict_abi(package_id: impl Into<String>, modules: &Value) -> AbiVerificationReport {
+    let package_id = package_id.into();
+    let module_count = modules.as_object().map(|map| map.len()).unwrap_or(0);
+
+    let checks = REQUIRED_PREDICT_ABI
+        .iter()
+        .map(|expected| verify_function(modules, expected))
+        .collect::<Vec<_>>();
+
+    AbiVerificationReport { package_id, module_count, checks }
+}
+
+fn verify_function(modules: &Value, expected: &ExpectedAbiFunction) -> AbiFunctionCheck {
+    let Some(module) = modules.as_object().and_then(|map| map.get(expected.module)) else {
+        return AbiFunctionCheck {
+            module: expected.module.to_string(),
+            function: expected.function.to_string(),
+            status: AbiCheckStatus::Fail,
+            visibility: None,
+            expected_parameter_count: expected.parameter_count,
+            actual_parameter_count: None,
+            expected_return_count: expected.return_count,
+            actual_return_count: None,
+            parameters: vec![],
+            returns: vec![],
+            source_note: expected.source_note.to_string(),
+            message: Some(format!("missing module `{}`", expected.module)),
+        };
+    };
+
+    let Some(function) = module
+        .get("exposedFunctions")
+        .and_then(Value::as_object)
+        .and_then(|functions| functions.get(expected.function))
+    else {
+        return AbiFunctionCheck {
+            module: expected.module.to_string(),
+            function: expected.function.to_string(),
+            status: AbiCheckStatus::Fail,
+            visibility: None,
+            expected_parameter_count: expected.parameter_count,
+            actual_parameter_count: None,
+            expected_return_count: expected.return_count,
+            actual_return_count: None,
+            parameters: vec![],
+            returns: vec![],
+            source_note: expected.source_note.to_string(),
+            message: Some(format!("missing function `{}::{}`", expected.module, expected.function)),
+        };
+    };
+
+    let parameters = function
+        .get("parameters")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(type_to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let returns = function
+        .get("return")
+        .or_else(|| function.get("returns"))
+        .and_then(Value::as_array)
+        .map(|items| items.iter().map(type_to_string).collect::<Vec<_>>())
+        .unwrap_or_default();
+
+    let visibility = function.get("visibility").and_then(Value::as_str).map(ToString::to_string);
+
+    let parameter_count_ok = parameters.len() == expected.parameter_count;
+    let return_count_ok = returns.len() == expected.return_count;
+
+    let visibility_ok =
+        visibility.as_deref().map(|value| value.eq_ignore_ascii_case("public")).unwrap_or(true);
+
+    let mut failures = Vec::new();
+
+    if !parameter_count_ok {
+        failures.push(format!(
+            "parameter count mismatch: expected {}, got {}",
+            expected.parameter_count,
+            parameters.len()
+        ));
+    }
+
+    if !return_count_ok {
+        failures.push(format!(
+            "return count mismatch: expected {}, got {}",
+            expected.return_count,
+            returns.len()
+        ));
+    }
+
+    if !visibility_ok {
+        failures.push(format!(
+            "visibility mismatch: expected public, got {}",
+            visibility.as_deref().unwrap_or("unknown")
+        ));
+    }
+
+    AbiFunctionCheck {
+        module: expected.module.to_string(),
+        function: expected.function.to_string(),
+        status: if failures.is_empty() { AbiCheckStatus::Pass } else { AbiCheckStatus::Fail },
+        visibility,
+        expected_parameter_count: expected.parameter_count,
+        actual_parameter_count: Some(parameters.len()),
+        expected_return_count: expected.return_count,
+        actual_return_count: Some(returns.len()),
+        parameters,
+        returns,
+        source_note: expected.source_note.to_string(),
+        message: if failures.is_empty() { None } else { Some(failures.join("; ")) },
+    }
+}
+
+fn type_to_string(value: &Value) -> String {
+    match value {
+        Value::String(s) => s.clone(),
+        other => serde_json::to_string(other).unwrap_or_else(|_| "<unprintable>".to_string()),
     }
 }

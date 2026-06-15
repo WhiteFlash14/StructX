@@ -25,12 +25,8 @@ impl SuiRpcClient {
         Ok(Self { http, rpc_url })
     }
 
-    pub async fn get_normalized_move_modules_by_package(
-        &self,
-        package_id: &str,
-    ) -> Result<Value> {
-        self.call("sui_getNormalizedMoveModulesByPackage", json!([package_id]))
-            .await
+    pub async fn get_normalized_move_modules_by_package(&self, package_id: &str) -> Result<Value> {
+        self.call("sui_getNormalizedMoveModulesByPackage", json!([package_id])).await
     }
 
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
@@ -49,10 +45,7 @@ impl SuiRpcClient {
             return Err(DeepBookClientError::HttpStatus { status, body });
         }
 
-        let payload = response
-            .json::<Value>()
-            .await
-            .map_err(DeepBookClientError::Request)?;
+        let payload = response.json::<Value>().await.map_err(DeepBookClientError::Request)?;
 
         if let Some(error) = payload.get("error") {
             return Err(DeepBookClientError::UnexpectedShape {
@@ -61,12 +54,9 @@ impl SuiRpcClient {
             });
         }
 
-        payload
-            .get("result")
-            .cloned()
-            .ok_or_else(|| DeepBookClientError::UnexpectedShape {
-                endpoint: method.to_string(),
-                message: "missing RPC result field".to_string(),
-            })
+        payload.get("result").cloned().ok_or_else(|| DeepBookClientError::UnexpectedShape {
+            endpoint: method.to_string(),
+            message: "missing RPC result field".to_string(),
+        })
     }
 }
