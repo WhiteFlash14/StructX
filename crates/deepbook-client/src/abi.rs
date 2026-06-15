@@ -1,3 +1,5 @@
+use serde::{Deserialize, Serialize};
+
 #[derive(Debug, Clone, Copy)]
 pub struct ExpectedAbiFunction {
     pub module: &'static str,
@@ -44,3 +46,48 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
         source_note: "official Market Keys docs",
     },
 ];
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AbiCheckStatus {
+    Pass,
+    Fail,
+}
+
+impl std::fmt::Display for AbiCheckStatus {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Pass => write!(f, "pass"),
+            Self::Fail => write!(f, "fail"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbiFunctionCheck {
+    pub module: String,
+    pub function: String,
+    pub status: AbiCheckStatus,
+    pub visibility: Option<String>,
+    pub expected_parameter_count: usize,
+    pub actual_parameter_count: Option<usize>,
+    pub expected_return_count: usize,
+    pub actual_return_count: Option<usize>,
+    pub parameters: Vec<String>,
+    pub returns: Vec<String>,
+    pub source_note: String,
+    pub message: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AbiVerificationReport {
+    pub package_id: String,
+    pub module_count: usize,
+    pub checks: Vec<AbiFunctionCheck>,
+}
+
+impl AbiVerificationReport {
+    #[must_use]
+    pub fn is_pass(&self) -> bool {
+        self.checks.iter().all(|check| check.status == AbiCheckStatus::Pass)
+    }
+}
