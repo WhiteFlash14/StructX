@@ -114,3 +114,62 @@ fn value_to_u64(value: &Value) -> Option<u64> {
         _ => None,
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_shared_object_info() {
+        let value = serde_json::json!({
+            "data": {
+                "objectId": "0xabc",
+                "version": "123",
+                "digest": "digest123",
+                "type": "0xpackage::predict::Predict",
+                "owner": {
+                    "Shared": {
+                        "initial_shared_version": "77"
+                    }
+                }
+            }
+        });
+
+        let info =
+            SuiObjectInfo::from_get_object_result("0xabc", value).expect("object info parses");
+
+        assert_eq!(info.object_id, "0xabc");
+        assert_eq!(info.version, Some(123));
+        assert_eq!(info.digest.as_deref(), Some("digest123"));
+        assert_eq!(info.owner_kind, ObjectOwnerKind::Shared);
+        assert_eq!(info.initial_shared_version, Some(77));
+        assert!(info.is_shared());
+        assert!(info.has_shared_version());
+    }
+
+    #[test]
+    fn parses_immutable_object_info() {
+        let value = serde_json::json!({
+            "data": {
+                "objectId": "0xabc",
+                "owner": "Immutable"
+            }
+        });
+
+        let info =
+            SuiObjectInfo::from_get_object_result("0xabc", value).expect("object info parses");
+
+        assert_eq!(info.owner_kind, ObjectOwnerKind::Immutable);
+        assert_eq!(info.initial_shared_version, None);
+    }
+
+    #[test]
+    fn errors_on_missing_data() {
+        let value = serde_json::json!({});
+
+        let err = SuiObjectInfo::from_get_object_result("0xabc", value)
+            .expect_err("missing data should fail");
+
+        assert!(err.to_string().contains("missing `data` field"));
+    }
+}

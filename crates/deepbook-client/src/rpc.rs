@@ -29,6 +29,25 @@ impl SuiRpcClient {
         self.call("sui_getNormalizedMoveModulesByPackage", json!([package_id])).await
     }
 
+    pub async fn get_object(&self, object_id: &str) -> Result<Value> {
+        self.call(
+            "sui_getObject",
+            json!([
+                object_id,
+                {
+                    "showType": true,
+                    "showOwner": true,
+                    "showPreviousTransaction": false,
+                    "showDisplay": false,
+                    "showContent": false,
+                    "showBcs": false,
+                    "showStorageRebate": false
+                }
+            ]),
+        )
+        .await
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({
             "jsonrpc": "2.0",
