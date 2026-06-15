@@ -502,6 +502,7 @@ fn print_abi_report(report: &AbiVerificationReport) {
     for check in &report.checks {
         if check.status == AbiCheckStatus::Pass {
             println!("{}::{} parameters:", check.module, check.function);
+            println!("source: {}", check.source_url);
             for (idx, param) in check.parameters.iter().enumerate() {
                 println!("  [{idx}] {param}");
             }
