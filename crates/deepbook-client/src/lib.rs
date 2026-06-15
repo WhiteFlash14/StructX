@@ -6,6 +6,10 @@ pub mod market;
 pub mod models;
 pub mod rpc;
 
+pub use abi::{
+    verify_predict_abi, AbiCheckStatus, AbiFunctionCheck, AbiVerificationReport,
+    ExpectedAbiFunction, REQUIRED_PREDICT_ABI,
+};
 pub use client::{DeepBookClient, DeepBookConfig};
 pub use constants::{
     DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL,

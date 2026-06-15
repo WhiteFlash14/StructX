@@ -212,3 +212,111 @@ fn type_to_string(value: &Value) -> String {
         other => serde_json::to_string(other).unwrap_or_else(|_| "<unprintable>".to_string()),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn verifies_expected_predict_abi_shape() {
+        let modules = serde_json::json!({
+            "predict": {
+                "exposedFunctions": {
+                    "get_trade_amounts": {
+                        "visibility": "Public",
+                        "parameters": [1, 2, 3, 4, 5],
+                        "return": [1, 2]
+                    },
+                    "get_range_trade_amounts": {
+                        "visibility": "Public",
+                        "parameters": [1, 2, 3, 4, 5],
+                        "return": [1, 2]
+                    }
+                }
+            },
+            "market_key": {
+                "exposedFunctions": {
+                    "up": {
+                        "visibility": "Public",
+                        "parameters": [1, 2, 3],
+                        "return": [1]
+                    },
+                    "down": {
+                        "visibility": "Public",
+                        "parameters": [1, 2, 3],
+                        "return": [1]
+                    }
+                }
+            },
+            "range_key": {
+                "exposedFunctions": {
+                    "new": {
+                        "visibility": "Public",
+                        "parameters": [1, 2, 3, 4],
+                        "return": [1]
+                    }
+                }
+            }
+        });
+
+        let report = verify_predict_abi("0xpackage", &modules);
+
+        assert!(report.is_pass());
+        assert_eq!(report.checks.len(), 5);
+    }
+
+    #[test]
+    fn detects_missing_abi_function() {
+        let modules = serde_json::json!({
+            "predict": {
+                "exposedFunctions": {}
+            }
+        });
+
+        let report = verify_predict_abi("0xpackage", &modules);
+
+        assert!(!report.is_pass());
+        assert!(report
+            .checks
+            .iter()
+            .any(|check| check.function == "get_trade_amounts"
+                && check.status == AbiCheckStatus::Fail));
+    }
+
+    #[test]
+    fn detects_parameter_count_mismatch() {
+        let modules = serde_json::json!({
+            "predict": {
+                "exposedFunctions": {
+                    "get_trade_amounts": {
+                        "visibility": "Public",
+                        "parameters": [1, 2],
+                        "return": [1, 2]
+                    }
+                }
+            },
+            "market_key": {
+                "exposedFunctions": {
+                    "up": {"visibility": "Public", "parameters": [1,2,3], "return": [1]},
+                    "down": {"visibility": "Public", "parameters": [1,2,3], "return": [1]}
+                }
+            },
+            "range_key": {
+                "exposedFunctions": {
+                    "new": {"visibility": "Public", "parameters": [1,2,3,4], "return": [1]}
+                }
+            }
+        });
+
+        let report = verify_predict_abi("0xpackage", &modules);
+
+        let check = report
+            .checks
+            .iter()
+            .find(|check| check.function == "get_trade_amounts")
+            .expect("check exists");
+
+        assert_eq!(check.status, AbiCheckStatus::Fail);
+        assert_eq!(check.actual_parameter_count, Some(2));
+    }
+}
