@@ -7,14 +7,16 @@ use comfy_table::{presets::UTF8_FULL, Cell, Table};
 
 use deepbook_client::{
     verify_predict_abi, AbiCheckStatus, AbiVerificationReport, DeepBookClient, DeepBookConfig,
-    DUSDC_DECIMALS, FreshnessConfig, MarketSnapshot, ObjectOwnerKind, StructxMarketStatus,
-    SuiObjectInfo, SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_OBJECT_ID,
+    FreshnessConfig, MarketSnapshot, ObjectOwnerKind, StructxMarketStatus, SuiObjectInfo,
+    SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, DUSDC_DECIMALS, PREDICT_OBJECT_ID,
     PREDICT_PACKAGE_ID, PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
-};use structx_core::{
+};
+use structx_core::{
     build_quote_plan, build_quote_tx_kind, compile_breakout, select_best_market, CompiledPayoff,
-    DisplayPrice, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteObjectRefs,
-    QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
-};#[derive(Debug, Parser)]
+    DisplayPrice, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteObjectRefs, QuotePlan,
+    QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
+};
+#[derive(Debug, Parser)]
 #[command(name = "structx")]
 #[command(about = "StructX CLI for DeepBook Predict market inspection")]
 struct Cli {
@@ -651,20 +653,14 @@ fn print_devinspect_quote_response(
         .and_then(serde_json::Value::as_array)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing devInspect results"))?;
 
-    let asset = QuoteAssetDisplay {
-        symbol: "dUSDC".to_string(),
-        decimals: DUSDC_DECIMALS,
-    };
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
 
     let mut preview_legs = Vec::with_capacity(plan.calls.len());
 
     for (quote_idx, call) in plan.calls.iter().enumerate() {
-        let command_idx = tx_kind
-            .quote_result_command_indices
-            .get(quote_idx)
-            .ok_or_else(|| {
-                io::Error::new(io::ErrorKind::InvalidData, "missing quote command index")
-            })?;
+        let command_idx = tx_kind.quote_result_command_indices.get(quote_idx).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing quote command index")
+        })?;
 
         let result = results.get(*command_idx).ok_or_else(|| {
             io::Error::new(
@@ -673,10 +669,8 @@ fn print_devinspect_quote_response(
             )
         })?;
 
-        let return_values = result
-            .get("returnValues")
-            .and_then(serde_json::Value::as_array)
-            .ok_or_else(|| {
+        let return_values =
+            result.get("returnValues").and_then(serde_json::Value::as_array).ok_or_else(|| {
                 io::Error::new(
                     io::ErrorKind::InvalidData,
                     format!("missing returnValues for command {command_idx}"),
@@ -698,38 +692,30 @@ fn print_devinspect_quote_response(
         let redeem_payout_raw = decode_devinspect_u64(&return_values[1])?;
 
         match call {
-            QuoteCall::Binary {
-                function,
-                direction,
-                strike,
-                quantity,
-                ..
-            } => preview_legs.push(QuotePreviewLeg {
-                index: quote_idx,
-                function: function.to_string(),
-                leg: format!("{direction}_binary"),
-                strike_or_lower: selected.grid.display(*strike).to_string(),
-                upper: None,
-                quantity: *quantity,
-                mint_cost_raw,
-                redeem_payout_raw,
-            }),
-            QuoteCall::Range {
-                function,
-                lower,
-                upper,
-                quantity,
-                ..
-            } => preview_legs.push(QuotePreviewLeg {
-                index: quote_idx,
-                function: function.to_string(),
-                leg: "range".to_string(),
-                strike_or_lower: selected.grid.display(*lower).to_string(),
-                upper: Some(selected.grid.display(*upper).to_string()),
-                quantity: *quantity,
-                mint_cost_raw,
-                redeem_payout_raw,
-            }),
+            QuoteCall::Binary { function, direction, strike, quantity, .. } => {
+                preview_legs.push(QuotePreviewLeg {
+                    index: quote_idx,
+                    function: function.to_string(),
+                    leg: format!("{direction}_binary"),
+                    strike_or_lower: selected.grid.display(*strike).to_string(),
+                    upper: None,
+                    quantity: *quantity,
+                    mint_cost_raw,
+                    redeem_payout_raw,
+                })
+            }
+            QuoteCall::Range { function, lower, upper, quantity, .. } => {
+                preview_legs.push(QuotePreviewLeg {
+                    index: quote_idx,
+                    function: function.to_string(),
+                    leg: "range".to_string(),
+                    strike_or_lower: selected.grid.display(*lower).to_string(),
+                    upper: Some(selected.grid.display(*upper).to_string()),
+                    quantity: *quantity,
+                    mint_cost_raw,
+                    redeem_payout_raw,
+                })
+            }
         }
     }
 
@@ -777,14 +763,45 @@ fn print_quote_preview(preview: &QuotePreview) {
     println!("Quote summary");
     println!("total mint cost raw: {}", preview.total_mint_cost_raw);
     println!("total mint cost: {}", preview.total_mint_cost_display());
-    println!(
-        "total redeem payout raw: {}",
-        preview.total_redeem_payout_raw
-    );
-    println!(
-        "total redeem payout: {}",
-        preview.total_redeem_payout_display()
-    );
+    println!("total redeem payout raw: {}", preview.total_redeem_payout_raw);
+    println!("total redeem payout: {}", preview.total_redeem_payout_display());
+}
+
+fn decode_devinspect_u64(value: &serde_json::Value) -> Result<u64, Box<dyn std::error::Error>> {
+    let arr = value.as_array().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("return value is not array: {value}"))
+    })?;
+
+    let bytes_value = arr
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "return value missing bytes"))?;
+
+    let bytes_array = bytes_value.as_array().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("return bytes are not array: {bytes_value}"),
+        )
+    })?;
+
+    if bytes_array.len() != 8 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("u64 return must have 8 bytes, got {}", bytes_array.len()),
+        )
+        .into());
+    }
+
+    let mut bytes = [0u8; 8];
+
+    for (idx, byte_value) in bytes_array.iter().enumerate() {
+        let byte = byte_value.as_u64().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid byte value: {byte_value}"))
+        })?;
+
+        bytes[idx] = u8::try_from(byte)?;
+    }
+
+    Ok(u64::from_le_bytes(bytes))
 }
 
 fn print_devinspect_response_summary(

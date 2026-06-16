@@ -1,5 +1,6 @@
 pub mod payoff;
 pub mod price;
+pub mod quote_guard;
 pub mod quote_plan;
 pub mod quote_preview;
 pub mod quote_tx;
@@ -11,6 +12,7 @@ pub use payoff::{
     PayoffBucket, PayoffCompileError, PredictLeg,
 };
 pub use price::{DisplayPrice, PriceScale};
+pub use quote_guard::{guard_quote_preview, GuardedQuotePreview, QuoteCostGuard, QuoteGuardError};
 pub use quote_plan::{
     build_quote_plan, QuoteCall, QuoteFunction, QuotePlan, QuotePlanError, QuoteTarget,
 };
