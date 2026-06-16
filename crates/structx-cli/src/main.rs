@@ -288,17 +288,17 @@ async fn main() -> std::process::ExitCode {
                 strict_freshness,
             );
 
-            devinspect_quote_breakout_command(
-                cli.server_url,
-                cli.predict_id,
-                cli.rpc_url,
+            devinspect_quote_breakout_command(DevinspectQuoteBreakoutArgs {
+                server_url: cli.server_url,
+                predict_id: cli.predict_id,
+                rpc_url: cli.rpc_url,
                 freshness,
-                DisplayPrice(bucket_step_usd),
+                bucket_step: DisplayPrice(bucket_step_usd),
                 levels_each_side,
                 tail_quantity,
                 shoulder_quantity,
                 sender,
-            )
+            })
             .await
         }
         Command::ResolveQuoteObjects {
@@ -524,7 +524,7 @@ async fn plan_quote_breakout_command(
     Ok(())
 }
 
-async fn devinspect_quote_breakout_command(
+struct DevinspectQuoteBreakoutArgs {
     server_url: String,
     predict_id: String,
     rpc_url: String,
@@ -534,17 +534,21 @@ async fn devinspect_quote_breakout_command(
     tail_quantity: u64,
     shoulder_quantity: u64,
     sender: String,
+}
+
+async fn devinspect_quote_breakout_command(
+    args: DevinspectQuoteBreakoutArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let client = build_client(server_url, predict_id)?;
-    let markets = load_markets(&client, freshness).await?;
+    let client = build_client(args.server_url, args.predict_id)?;
+    let markets = load_markets(&client, args.freshness).await?;
     let selected = select_best_market(&markets, PriceScale::E9)?;
 
     print_selected_market(&selected);
 
     let strikes = selected.grid.centered_strikes_by_display_step(
         selected.spot_raw,
-        bucket_step,
-        levels_each_side,
+        args.bucket_step,
+        args.levels_each_side,
     )?;
 
     let center = selected
@@ -570,14 +574,14 @@ async fn devinspect_quote_breakout_command(
     let k3 = strikes[center_idx + 1];
     let k4 = strikes[center_idx + 2];
 
-    let compiled = compile_breakout(k1, k2, k3, k4, tail_quantity, shoulder_quantity)?;
+    let compiled = compile_breakout(k1, k2, k3, k4, args.tail_quantity, args.shoulder_quantity)?;
     let plan = build_quote_plan(&selected, &compiled)?;
 
     print_breakout_boundaries(&selected, k1, k2, k3, k4);
     print_compiled_payoff(&selected, &compiled);
     print_quote_plan(&selected, &plan);
 
-    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+    let rpc = SuiRpcClient::new(args.rpc_url, StdDuration::from_secs(20))?;
 
     let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
     let oracle = resolve_sui_object(&rpc, selected.oracle_id).await?;
@@ -588,7 +592,7 @@ async fn devinspect_quote_breakout_command(
     let tx_kind = build_quote_tx_kind(
         &plan,
         QuoteObjectRefs { predict: &predict, oracle: &oracle, clock: &clock },
-        &sender,
+        &args.sender,
     )?;
 
     print_quote_tx_kind(&tx_kind);

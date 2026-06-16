@@ -9,3 +9,8 @@ pub const PREDICT_PACKAGE_ID: &str =
 pub const DEFAULT_SUI_TESTNET_RPC_URL: &str = "https://fullnode.testnet.sui.io:443";
 
 pub const SUI_CLOCK_OBJECT_ID: &str = "0x6";
+
+pub const DUSDC_COIN_TYPE: &str =
+    "0xe95040085976bfd54a1a07225cd46c8a2b4e8e2b6732f140a0fc49850ba73e1a::dusdc::DUSDC";
+
+pub const DUSDC_DECIMALS: u8 = 6;
