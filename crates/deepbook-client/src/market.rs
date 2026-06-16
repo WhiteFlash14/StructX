@@ -85,6 +85,7 @@ pub struct MarketSnapshot {
 
 impl MarketSnapshot {
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         list_item: OracleListItem,
         state: Option<OracleState>,
@@ -180,6 +181,7 @@ struct MarketEvaluation {
     warnings: Vec<MarketWarning>,
 }
 
+#[allow(clippy::too_many_arguments)]
 fn evaluate_market(
     list_item: &OracleListItem,
     state: Option<&OracleState>,

@@ -11,6 +11,7 @@ pub struct ExpectedAbiFunction {
     pub source_url: &'static str,
 }
 
+#[cfg(test)]
 const PREDICT_PACKAGE: &str = "0xf5ea2b3749c65d6e56507cc35388719aadb28f9cab873696a2f8687f5c785138";
 
 const PREDICT_REF: &str =

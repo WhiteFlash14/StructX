@@ -7,16 +7,14 @@ use comfy_table::{presets::UTF8_FULL, Cell, Table};
 
 use deepbook_client::{
     verify_predict_abi, AbiCheckStatus, AbiVerificationReport, DeepBookClient, DeepBookConfig,
-    FreshnessConfig, MarketSnapshot, ObjectOwnerKind, StructxMarketStatus, SuiObjectInfo,
-    SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID,
-    PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
-};
-use structx_core::{
+    DUSDC_DECIMALS, FreshnessConfig, MarketSnapshot, ObjectOwnerKind, StructxMarketStatus,
+    SuiObjectInfo, SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_OBJECT_ID,
+    PREDICT_PACKAGE_ID, PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
+};use structx_core::{
     build_quote_plan, build_quote_tx_kind, compile_breakout, select_best_market, CompiledPayoff,
-    DisplayPrice, PredictLeg, PriceScale, QuoteCall, QuoteObjectRefs, QuotePlan, QuoteTxKind,
-    SelectedMarket, Strike,
-};
-#[derive(Debug, Parser)]
+    DisplayPrice, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteObjectRefs,
+    QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
+};#[derive(Debug, Parser)]
 #[command(name = "structx")]
 #[command(about = "StructX CLI for DeepBook Predict market inspection")]
 struct Cli {
@@ -600,7 +598,7 @@ async fn devinspect_quote_breakout_command(
 
     let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
 
-    print_devinspect_response_summary(&response)?;
+    print_devinspect_quote_response(&selected, &plan, &tx_kind, &response)?;
 
     Ok(())
 }
@@ -640,6 +638,155 @@ fn print_quote_call_execution_plan(plan: &QuotePlan) {
     println!();
 }
 
+fn print_devinspect_quote_response(
+    selected: &SelectedMarket<'_>,
+    plan: &QuotePlan,
+    tx_kind: &QuoteTxKind,
+    response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    print_devinspect_response_summary(response)?;
+
+    let results = response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing devInspect results"))?;
+
+    let asset = QuoteAssetDisplay {
+        symbol: "dUSDC".to_string(),
+        decimals: DUSDC_DECIMALS,
+    };
+
+    let mut preview_legs = Vec::with_capacity(plan.calls.len());
+
+    for (quote_idx, call) in plan.calls.iter().enumerate() {
+        let command_idx = tx_kind
+            .quote_result_command_indices
+            .get(quote_idx)
+            .ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing quote command index")
+            })?;
+
+        let result = results.get(*command_idx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing devInspect result for command {command_idx}"),
+            )
+        })?;
+
+        let return_values = result
+            .get("returnValues")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing returnValues for command {command_idx}"),
+                )
+            })?;
+
+        if return_values.len() != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected 2 return values for command {command_idx}, got {}",
+                    return_values.len()
+                ),
+            )
+            .into());
+        }
+
+        let mint_cost_raw = decode_devinspect_u64(&return_values[0])?;
+        let redeem_payout_raw = decode_devinspect_u64(&return_values[1])?;
+
+        match call {
+            QuoteCall::Binary {
+                function,
+                direction,
+                strike,
+                quantity,
+                ..
+            } => preview_legs.push(QuotePreviewLeg {
+                index: quote_idx,
+                function: function.to_string(),
+                leg: format!("{direction}_binary"),
+                strike_or_lower: selected.grid.display(*strike).to_string(),
+                upper: None,
+                quantity: *quantity,
+                mint_cost_raw,
+                redeem_payout_raw,
+            }),
+            QuoteCall::Range {
+                function,
+                lower,
+                upper,
+                quantity,
+                ..
+            } => preview_legs.push(QuotePreviewLeg {
+                index: quote_idx,
+                function: function.to_string(),
+                leg: "range".to_string(),
+                strike_or_lower: selected.grid.display(*lower).to_string(),
+                upper: Some(selected.grid.display(*upper).to_string()),
+                quantity: *quantity,
+                mint_cost_raw,
+                redeem_payout_raw,
+            }),
+        }
+    }
+
+    let preview = QuotePreview::new(asset, preview_legs);
+    print_quote_preview(&preview);
+
+    Ok(())
+}
+
+fn print_quote_preview(preview: &QuotePreview) {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "#",
+        "function",
+        "leg",
+        "strike/lower",
+        "upper",
+        "quantity",
+        "mint raw",
+        "mint",
+        "redeem raw",
+        "redeem",
+    ]);
+
+    for leg in &preview.legs {
+        table.add_row(vec![
+            Cell::new(leg.index),
+            Cell::new(&leg.function),
+            Cell::new(&leg.leg),
+            Cell::new(&leg.strike_or_lower),
+            Cell::new(leg.upper.as_deref().unwrap_or("—")),
+            Cell::new(leg.quantity),
+            Cell::new(leg.mint_cost_raw),
+            Cell::new(preview.asset.format_amount(leg.mint_cost_raw)),
+            Cell::new(leg.redeem_payout_raw),
+            Cell::new(preview.asset.format_amount(leg.redeem_payout_raw)),
+        ]);
+    }
+
+    println!("devInspect quote preview");
+    println!("{table}");
+    println!();
+
+    println!("Quote summary");
+    println!("total mint cost raw: {}", preview.total_mint_cost_raw);
+    println!("total mint cost: {}", preview.total_mint_cost_display());
+    println!(
+        "total redeem payout raw: {}",
+        preview.total_redeem_payout_raw
+    );
+    println!(
+        "total redeem payout: {}",
+        preview.total_redeem_payout_display()
+    );
+}
+
 fn print_devinspect_response_summary(
     response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -653,17 +800,13 @@ fn print_devinspect_response_summary(
     if let Some(error) = response.get("error") {
         println!("devInspect error:");
         println!("{}", serde_json::to_string_pretty(error)?);
-        return Err(io::Error::new(
-            io::ErrorKind::Other,
-            "devInspect quote preview returned an RPC error",
-        )
-        .into());
+        return Err(io::Error::other("devInspect quote preview returned an RPC error").into());
     }
 
     if status != "success" {
         println!("devInspect response:");
         println!("{}", compact_json_preview(response)?);
-        return Err(io::Error::new(io::ErrorKind::Other, "devInspect quote preview failed").into());
+        return Err(io::Error::other("devInspect quote preview failed").into());
     }
 
     println!("devInspect quote preview executed");
