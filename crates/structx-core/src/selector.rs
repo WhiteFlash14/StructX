@@ -33,10 +33,10 @@ pub struct SelectedMarket<'a> {
     pub grid: StrikeGrid,
 }
 
-pub fn select_best_market<'a>(
+pub fn select_candidate_markets<'a>(
     markets: &'a [MarketSnapshot],
     scale: PriceScale,
-) -> Result<SelectedMarket<'a>, MarketSelectionError> {
+) -> Vec<SelectedMarket<'a>> {
     let mut candidates = markets
         .iter()
         .filter(|market| market.structx_status.is_usable())
@@ -49,7 +49,17 @@ pub fn select_best_market<'a>(
             .then_with(|| a.expiry.cmp(&b.expiry))
     });
 
-    candidates.into_iter().next().ok_or(MarketSelectionError::NoUsableMarket)
+    candidates
+}
+
+pub fn select_best_market<'a>(
+    markets: &'a [MarketSnapshot],
+    scale: PriceScale,
+) -> Result<SelectedMarket<'a>, MarketSelectionError> {
+    select_candidate_markets(markets, scale)
+        .into_iter()
+        .next()
+        .ok_or(MarketSelectionError::NoUsableMarket)
 }
 
 fn build_candidate<'a>(
