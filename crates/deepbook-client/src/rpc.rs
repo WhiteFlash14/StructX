@@ -48,6 +48,14 @@ impl SuiRpcClient {
         .await
     }
 
+    pub async fn dev_inspect_transaction_kind(
+        &self,
+        sender: &str,
+        tx_kind_b64: &str,
+    ) -> Result<Value> {
+        self.call("sui_devInspectTransactionBlock", json!([sender, tx_kind_b64])).await
+    }
+
     async fn call(&self, method: &str, params: Value) -> Result<Value> {
         let body = json!({
             "jsonrpc": "2.0",

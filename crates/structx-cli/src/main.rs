@@ -592,8 +592,104 @@ async fn devinspect_quote_breakout_command(
     )?;
 
     print_quote_tx_kind(&tx_kind);
+    print_quote_call_execution_plan(&plan);
+
+    let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+
+    print_devinspect_response_summary(&response)?;
 
     Ok(())
+}
+
+fn print_quote_call_execution_plan(plan: &QuotePlan) {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec!["#", "function", "leg", "strike/lower", "upper", "quantity"]);
+
+    for (idx, call) in plan.calls.iter().enumerate() {
+        match call {
+            QuoteCall::Binary { function, direction, strike, quantity, .. } => {
+                table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new(function.to_string()),
+                    Cell::new(format!("{direction:?}_binary")),
+                    Cell::new(strike.raw),
+                    Cell::new("—"),
+                    Cell::new(quantity),
+                ]);
+            }
+            QuoteCall::Range { function, lower, upper, quantity, .. } => {
+                table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new(function.to_string()),
+                    Cell::new("range"),
+                    Cell::new(lower.raw),
+                    Cell::new(upper.raw),
+                    Cell::new(quantity),
+                ]);
+            }
+        }
+    }
+
+    println!("devInspect quote call execution plan");
+    println!("{table}");
+    println!();
+}
+
+fn print_devinspect_response_summary(
+    response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = devinspect_status(response);
+    let result_count =
+        response.get("results").and_then(serde_json::Value::as_array).map(Vec::len).unwrap_or(0);
+
+    println!("devInspect status: {status}");
+    println!("devInspect result count: {result_count}");
+
+    if let Some(error) = response.get("error") {
+        println!("devInspect error:");
+        println!("{}", serde_json::to_string_pretty(error)?);
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            "devInspect quote preview returned an RPC error",
+        )
+        .into());
+    }
+
+    if status != "success" {
+        println!("devInspect response:");
+        println!("{}", compact_json_preview(response)?);
+        return Err(io::Error::new(io::ErrorKind::Other, "devInspect quote preview failed").into());
+    }
+
+    println!("devInspect quote preview executed");
+    println!();
+
+    Ok(())
+}
+
+fn devinspect_status(response: &serde_json::Value) -> &str {
+    response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+}
+
+fn compact_json_preview(response: &serde_json::Value) -> Result<String, serde_json::Error> {
+    let pretty = serde_json::to_string_pretty(response)?;
+
+    const MAX_CHARS: usize = 8_000;
+
+    if pretty.len() <= MAX_CHARS {
+        return Ok(pretty);
+    }
+
+    let mut preview = pretty.chars().take(MAX_CHARS).collect::<String>();
+    preview.push_str("\n... truncated ...");
+
+    Ok(preview)
 }
 
 fn print_quote_tx_kind(tx_kind: &QuoteTxKind) {
