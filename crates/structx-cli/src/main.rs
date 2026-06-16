@@ -12,9 +12,10 @@ use deepbook_client::{
     PREDICT_PACKAGE_ID, PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
 };
 use structx_core::{
-    build_quote_plan, build_quote_tx_kind, compile_breakout, select_best_market, CompiledPayoff,
-    DisplayPrice, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteObjectRefs, QuotePlan,
-    QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
+    build_quote_plan, build_quote_tx_kind, compile_breakout, guard_quote_preview,
+    select_best_market, CompiledPayoff, DisplayPrice, PredictLeg, PriceScale, QuoteAssetDisplay,
+    QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg,
+    QuoteTxKind, SelectedMarket, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -145,6 +146,12 @@ enum Command {
 
         #[arg(long, default_value_t = 400)]
         shoulder_quantity: u64,
+
+        #[arg(long)]
+        max_total_mint_cost_raw: Option<u64>,
+
+        #[arg(long, default_value_t = 100)]
+        slippage_bps: u16,
 
         #[arg(
             long,
@@ -279,6 +286,8 @@ async fn main() -> std::process::ExitCode {
             levels_each_side,
             tail_quantity,
             shoulder_quantity,
+            max_total_mint_cost_raw,
+            slippage_bps,
             sender,
         } => {
             let freshness = build_freshness(
@@ -298,6 +307,8 @@ async fn main() -> std::process::ExitCode {
                 tail_quantity,
                 shoulder_quantity,
                 sender,
+                max_total_mint_cost_raw,
+                slippage_bps,
             })
             .await
         }
@@ -534,6 +545,8 @@ struct DevinspectQuoteBreakoutArgs {
     tail_quantity: u64,
     shoulder_quantity: u64,
     sender: String,
+    max_total_mint_cost_raw: Option<u64>,
+    slippage_bps: u16,
 }
 
 async fn devinspect_quote_breakout_command(
@@ -600,7 +613,23 @@ async fn devinspect_quote_breakout_command(
 
     let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
 
-    print_devinspect_quote_response(&selected, &plan, &tx_kind, &response)?;
+    let preview = print_devinspect_quote_response(&selected, &plan, &tx_kind, &response)?;
+
+    if let Some(max_total_mint_cost_raw) = args.max_total_mint_cost_raw {
+        let guard = QuoteCostGuard { max_total_mint_cost_raw, slippage_bps: args.slippage_bps };
+
+        let guarded = guard_quote_preview(&preview, guard)?;
+
+        println!();
+        println!("Quote guard: accepted");
+        println!("max_total_mint_cost_raw: {}", guarded.max_total_mint_cost_raw);
+        println!("max_allowed_after_slippage_raw: {}", guarded.max_allowed_after_slippage_raw);
+        println!("actual_total_mint_cost_raw: {}", guarded.total_mint_cost_raw);
+        println!("slippage_bps: {}", guarded.slippage_bps);
+    } else {
+        println!();
+        println!("Quote guard: skipped; pass --max-total-mint-cost-raw to enforce a cap");
+    }
 
     Ok(())
 }
@@ -645,7 +674,7 @@ fn print_devinspect_quote_response(
     plan: &QuotePlan,
     tx_kind: &QuoteTxKind,
     response: &serde_json::Value,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> Result<QuotePreview, Box<dyn std::error::Error>> {
     print_devinspect_response_summary(response)?;
 
     let results = response
@@ -722,7 +751,7 @@ fn print_devinspect_quote_response(
     let preview = QuotePreview::new(asset, preview_legs);
     print_quote_preview(&preview);
 
-    Ok(())
+    Ok(preview)
 }
 
 fn print_quote_preview(preview: &QuotePreview) {
