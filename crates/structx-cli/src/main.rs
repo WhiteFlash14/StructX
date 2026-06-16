@@ -833,6 +833,41 @@ fn decode_devinspect_u64(value: &serde_json::Value) -> Result<u64, Box<dyn std::
     Ok(u64::from_le_bytes(bytes))
 }
 
+fn devinspect_failure_summary(response: &serde_json::Value) -> String {
+    let status_error = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("error"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown status error");
+
+    let abort_module = response
+        .get("effects")
+        .and_then(|effects| effects.get("abortError"))
+        .and_then(|abort| abort.get("module_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown module");
+
+    let abort_function = response
+        .get("effects")
+        .and_then(|effects| effects.get("abortError"))
+        .and_then(|abort| abort.get("function"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown function");
+
+    let abort_code = response
+        .get("effects")
+        .and_then(|effects| effects.get("abortError"))
+        .and_then(|abort| abort.get("error_code"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    format!(
+        "devInspect failed: {status_error}; abort={abort_module}::{abort_function} code {abort_code}"
+    )
+}
+
 fn print_devinspect_response_summary(
     response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -850,9 +885,7 @@ fn print_devinspect_response_summary(
     }
 
     if status != "success" {
-        println!("devInspect response:");
-        println!("{}", compact_json_preview(response)?);
-        return Err(io::Error::other("devInspect quote preview failed").into());
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
     }
 
     println!("devInspect quote preview executed");
