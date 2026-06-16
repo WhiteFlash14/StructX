@@ -13,9 +13,9 @@ use deepbook_client::{
 };
 use structx_core::{
     build_quote_plan, build_quote_tx_kind, compile_breakout, guard_quote_preview,
-    select_best_market, CompiledPayoff, DisplayPrice, PredictLeg, PriceScale, QuoteAssetDisplay,
-    QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg,
-    QuoteTxKind, SelectedMarket, Strike,
+    select_best_market, select_candidate_markets, CompiledPayoff, DisplayPrice, PredictLeg,
+    PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan,
+    QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -555,11 +555,19 @@ struct DevinspectQuoteBreakoutArgs {
     slippage_bps: u16,
 }
 
+struct BreakoutQuotePlanPreparation {
+    k1: Strike,
+    k2: Strike,
+    k3: Strike,
+    k4: Strike,
+    compiled: CompiledPayoff,
+    plan: QuotePlan,
+}
+
 fn build_breakout_quote_plan_for_selected_market(
     args: &DevinspectQuoteBreakoutArgs,
     selected: &SelectedMarket<'_>,
-) -> Result<(Strike, Strike, Strike, Strike, CompiledPayoff, QuotePlan), Box<dyn std::error::Error>>
-{
+) -> Result<BreakoutQuotePlanPreparation, Box<dyn std::error::Error>> {
     let strikes = selected.grid.centered_strikes_by_display_step(
         selected.spot_raw,
         args.bucket_step,
@@ -589,18 +597,11 @@ fn build_breakout_quote_plan_for_selected_market(
     let k3 = strikes[center_idx + 1];
     let k4 = strikes[center_idx + 2];
 
-    let compiled = compile_breakout(
-        k1,
-        k2,
-        k3,
-        k4,
-        args.tail_quantity,
-        args.shoulder_quantity,
-    )?;
+    let compiled = compile_breakout(k1, k2, k3, k4, args.tail_quantity, args.shoulder_quantity)?;
 
     let plan = build_quote_plan(selected, &compiled)?;
 
-    Ok((k1, k2, k3, k4, compiled, plan))
+    Ok(BreakoutQuotePlanPreparation { k1, k2, k3, k4, compiled, plan })
 }
 
 async fn devinspect_quote_breakout_command(
@@ -614,20 +615,59 @@ async fn devinspect_quote_breakout_command(
         .into());
     }
 
-    let client = build_client(args.server_url, args.predict_id)?;
+    let client = build_client(args.server_url.clone(), args.predict_id.clone())?;
     let markets = load_markets(&client, args.freshness).await?;
-    let selected = select_best_market(&markets, PriceScale::E9)?;
+    let candidates = select_candidate_markets(&markets, PriceScale::E9);
 
-    print_selected_market(&selected);
+    if candidates.is_empty() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "no quoteable market candidates").into()
+        );
+    }
 
-    let (k1, k2, k3, k4, compiled, plan) =
-        build_breakout_quote_plan_for_selected_market(&args, &selected)?;
+    let max_attempts = args.max_quote_market_attempts.min(candidates.len());
+    let mut failures = Vec::new();
 
-    print_breakout_boundaries(&selected, k1, k2, k3, k4);
-    print_compiled_payoff(&selected, &compiled);
-    print_quote_plan(&selected, &plan);
+    for (attempt_idx, selected) in candidates.into_iter().take(max_attempts).enumerate() {
+        println!(
+            "Quote attempt {}/{} using oracle {} expiring {}",
+            attempt_idx + 1,
+            max_attempts,
+            selected.oracle_id,
+            selected.expiry.to_rfc3339()
+        );
 
-    let rpc = SuiRpcClient::new(args.rpc_url, StdDuration::from_secs(20))?;
+        match devinspect_quote_for_selected_market(&args, &selected).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let message = format!(
+                    "oracle {} expiry {} failed: {}",
+                    selected.oracle_id,
+                    selected.expiry.to_rfc3339(),
+                    err
+                );
+                eprintln!("{message}");
+                failures.push(message);
+            }
+        }
+    }
+
+    Err(io::Error::other(format!("all quote attempts failed:\n{}", failures.join("\n"))).into())
+}
+
+async fn devinspect_quote_for_selected_market(
+    args: &DevinspectQuoteBreakoutArgs,
+    selected: &SelectedMarket<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    print_selected_market(selected);
+
+    let quote = build_breakout_quote_plan_for_selected_market(args, selected)?;
+
+    print_breakout_boundaries(selected, quote.k1, quote.k2, quote.k3, quote.k4);
+    print_compiled_payoff(selected, &quote.compiled);
+    print_quote_plan(selected, &quote.plan);
+
+    let rpc = SuiRpcClient::new(args.rpc_url.clone(), StdDuration::from_secs(20))?;
 
     let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
     let oracle = resolve_sui_object(&rpc, selected.oracle_id).await?;
@@ -636,17 +676,16 @@ async fn devinspect_quote_breakout_command(
     validate_quote_object_refs(&predict, &oracle, &clock)?;
 
     let tx_kind = build_quote_tx_kind(
-        &plan,
+        &quote.plan,
         QuoteObjectRefs { predict: &predict, oracle: &oracle, clock: &clock },
         &args.sender,
     )?;
 
     print_quote_tx_kind(&tx_kind);
-    print_quote_call_execution_plan(&plan);
 
     let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
 
-    let preview = print_devinspect_quote_response(&selected, &plan, &tx_kind, &response)?;
+    let preview = print_devinspect_quote_response(selected, &quote.plan, &tx_kind, &response)?;
 
     if let Some(max_total_mint_cost_raw) = args.max_total_mint_cost_raw {
         let guard = QuoteCostGuard { max_total_mint_cost_raw, slippage_bps: args.slippage_bps };
@@ -665,41 +704,6 @@ async fn devinspect_quote_breakout_command(
     }
 
     Ok(())
-}
-
-fn print_quote_call_execution_plan(plan: &QuotePlan) {
-    let mut table = Table::new();
-    table.load_preset(UTF8_FULL);
-    table.set_header(vec!["#", "function", "leg", "strike/lower", "upper", "quantity"]);
-
-    for (idx, call) in plan.calls.iter().enumerate() {
-        match call {
-            QuoteCall::Binary { function, direction, strike, quantity, .. } => {
-                table.add_row(vec![
-                    Cell::new(idx),
-                    Cell::new(function.to_string()),
-                    Cell::new(format!("{direction:?}_binary")),
-                    Cell::new(strike.raw),
-                    Cell::new("—"),
-                    Cell::new(quantity),
-                ]);
-            }
-            QuoteCall::Range { function, lower, upper, quantity, .. } => {
-                table.add_row(vec![
-                    Cell::new(idx),
-                    Cell::new(function.to_string()),
-                    Cell::new("range"),
-                    Cell::new(lower.raw),
-                    Cell::new(upper.raw),
-                    Cell::new(quantity),
-                ]);
-            }
-        }
-    }
-
-    println!("devInspect quote call execution plan");
-    println!("{table}");
-    println!();
 }
 
 fn print_devinspect_quote_response(
@@ -934,21 +938,6 @@ fn devinspect_status(response: &serde_json::Value) -> &str {
         .and_then(|status| status.get("status"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown")
-}
-
-fn compact_json_preview(response: &serde_json::Value) -> Result<String, serde_json::Error> {
-    let pretty = serde_json::to_string_pretty(response)?;
-
-    const MAX_CHARS: usize = 8_000;
-
-    if pretty.len() <= MAX_CHARS {
-        return Ok(pretty);
-    }
-
-    let mut preview = pretty.chars().take(MAX_CHARS).collect::<String>();
-    preview.push_str("\n... truncated ...");
-
-    Ok(preview)
 }
 
 fn print_quote_tx_kind(tx_kind: &QuoteTxKind) {
