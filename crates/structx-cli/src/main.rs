@@ -147,6 +147,9 @@ enum Command {
         #[arg(long, default_value_t = 400)]
         shoulder_quantity: u64,
 
+        #[arg(long, default_value_t = 5)]
+        max_quote_market_attempts: usize,
+
         #[arg(long)]
         max_total_mint_cost_raw: Option<u64>,
 
@@ -286,6 +289,7 @@ async fn main() -> std::process::ExitCode {
             levels_each_side,
             tail_quantity,
             shoulder_quantity,
+            max_quote_market_attempts,
             max_total_mint_cost_raw,
             slippage_bps,
             sender,
@@ -307,6 +311,7 @@ async fn main() -> std::process::ExitCode {
                 tail_quantity,
                 shoulder_quantity,
                 sender,
+                max_quote_market_attempts,
                 max_total_mint_cost_raw,
                 slippage_bps,
             })
@@ -545,19 +550,16 @@ struct DevinspectQuoteBreakoutArgs {
     tail_quantity: u64,
     shoulder_quantity: u64,
     sender: String,
+    max_quote_market_attempts: usize,
     max_total_mint_cost_raw: Option<u64>,
     slippage_bps: u16,
 }
 
-async fn devinspect_quote_breakout_command(
-    args: DevinspectQuoteBreakoutArgs,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let client = build_client(args.server_url, args.predict_id)?;
-    let markets = load_markets(&client, args.freshness).await?;
-    let selected = select_best_market(&markets, PriceScale::E9)?;
-
-    print_selected_market(&selected);
-
+fn build_breakout_quote_plan_for_selected_market(
+    args: &DevinspectQuoteBreakoutArgs,
+    selected: &SelectedMarket<'_>,
+) -> Result<(Strike, Strike, Strike, Strike, CompiledPayoff, QuotePlan), Box<dyn std::error::Error>>
+{
     let strikes = selected.grid.centered_strikes_by_display_step(
         selected.spot_raw,
         args.bucket_step,
@@ -587,8 +589,39 @@ async fn devinspect_quote_breakout_command(
     let k3 = strikes[center_idx + 1];
     let k4 = strikes[center_idx + 2];
 
-    let compiled = compile_breakout(k1, k2, k3, k4, args.tail_quantity, args.shoulder_quantity)?;
-    let plan = build_quote_plan(&selected, &compiled)?;
+    let compiled = compile_breakout(
+        k1,
+        k2,
+        k3,
+        k4,
+        args.tail_quantity,
+        args.shoulder_quantity,
+    )?;
+
+    let plan = build_quote_plan(selected, &compiled)?;
+
+    Ok((k1, k2, k3, k4, compiled, plan))
+}
+
+async fn devinspect_quote_breakout_command(
+    args: DevinspectQuoteBreakoutArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.max_quote_market_attempts == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--max-quote-market-attempts must be greater than zero",
+        )
+        .into());
+    }
+
+    let client = build_client(args.server_url, args.predict_id)?;
+    let markets = load_markets(&client, args.freshness).await?;
+    let selected = select_best_market(&markets, PriceScale::E9)?;
+
+    print_selected_market(&selected);
+
+    let (k1, k2, k3, k4, compiled, plan) =
+        build_breakout_quote_plan_for_selected_market(&args, &selected)?;
 
     print_breakout_boundaries(&selected, k1, k2, k3, k4);
     print_compiled_payoff(&selected, &compiled);
