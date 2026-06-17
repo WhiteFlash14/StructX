@@ -225,6 +225,129 @@ pub fn build_manager_balance_tx_kind(
     })
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MintObjectRefs<'a> {
+    pub predict: &'a SuiObjectInfo,
+    pub manager: &'a SuiObjectInfo,
+    pub oracle: &'a SuiObjectInfo,
+    pub clock: &'a SuiObjectInfo,
+}
+
+pub fn build_mint_tx_kind(
+    plan: &QuotePlan,
+    refs: MintObjectRefs<'_>,
+    sender: &str,
+) -> Result<QuoteTxKind, QuoteTxBuildError> {
+    let package = parse_address(PREDICT_PACKAGE_ID)?;
+    let sender_address = parse_address(sender)?;
+
+    let predict = shared_object_arg("predict", refs.predict, true)?;
+    let manager = shared_object_arg("manager", refs.manager, true)?;
+    let oracle = shared_object_arg("oracle", refs.oracle, false)?;
+    let clock = shared_object_arg("clock", refs.clock, false)?;
+
+    let oracle_id = parse_address(&plan.oracle_id)?;
+
+    let mut tx = TransactionBuilder::new();
+
+    let predict_arg = tx.object(predict);
+    let manager_arg = tx.object(manager);
+    let oracle_arg = tx.object(oracle);
+    let clock_arg = tx.object(clock);
+
+    let mut mint_command_indices = Vec::with_capacity(plan.calls.len());
+    let mut command_index = 0usize;
+
+    for call in &plan.calls {
+        match call {
+            QuoteCall::Binary { direction, expiry_ms, strike, quantity, .. } => {
+                let key_fn = match direction {
+                    BinaryDirection::Up => "up",
+                    BinaryDirection::Down => "down",
+                };
+
+                let oracle_id_arg = tx.pure(&oracle_id);
+                let expiry_arg = tx.pure(&(*expiry_ms as u64));
+                let strike_arg = tx.pure(&strike.raw);
+
+                let key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("market_key"),
+                        Identifier::from_static(key_fn),
+                    ),
+                    vec![oracle_id_arg, expiry_arg, strike_arg],
+                );
+
+                command_index += 1;
+
+                let quantity_arg = tx.pure(quantity);
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict"),
+                        Identifier::from_static("mint"),
+                    )
+                    .with_type_args(vec![parse_type_tag(DUSDC_COIN_TYPE)?]),
+                    vec![predict_arg, manager_arg, oracle_arg, key, quantity_arg, clock_arg],
+                );
+
+                mint_command_indices.push(command_index);
+                command_index += 1;
+            }
+            QuoteCall::Range { expiry_ms, lower, upper, quantity, .. } => {
+                let oracle_id_arg = tx.pure(&oracle_id);
+                let expiry_arg = tx.pure(&(*expiry_ms as u64));
+                let lower_arg = tx.pure(&lower.raw);
+                let upper_arg = tx.pure(&upper.raw);
+
+                let key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("range_key"),
+                        Identifier::from_static("new"),
+                    ),
+                    vec![oracle_id_arg, expiry_arg, lower_arg, upper_arg],
+                );
+
+                command_index += 1;
+
+                let quantity_arg = tx.pure(quantity);
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict"),
+                        Identifier::from_static("mint_range"),
+                    )
+                    .with_type_args(vec![parse_type_tag(DUSDC_COIN_TYPE)?]),
+                    vec![predict_arg, manager_arg, oracle_arg, key, quantity_arg, clock_arg],
+                );
+
+                mint_command_indices.push(command_index);
+                command_index += 1;
+            }
+        }
+    }
+
+    tx.set_sender(sender_address);
+    tx.set_gas_budget(1_000_000);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(Address::ZERO, 1, Digest::ZERO)]);
+
+    let transaction = tx.try_build().map_err(|err| QuoteTxBuildError::Build(err.to_string()))?;
+
+    let bytes =
+        bcs::to_bytes(&transaction.kind).map_err(|err| QuoteTxBuildError::Bcs(err.to_string()))?;
+
+    Ok(QuoteTxKind {
+        sender: sender.to_string(),
+        tx_kind_b64: BASE64.encode(bytes),
+        quote_result_command_indices: mint_command_indices,
+    })
+}
+
 fn shared_object_arg(
     role: &'static str,
     object: &SuiObjectInfo,
@@ -263,7 +386,10 @@ mod tests {
     use super::*;
     use crate::price::DisplayPrice;
     use crate::strike_grid::StrikeGrid;
-    use crate::{build_quote_plan, compile_breakout, PriceScale, SelectedMarket, Strike};
+    use crate::{
+        build_quote_plan, compile_breakout, BinaryDirection, PriceScale, QuoteCall, QuotePlan,
+        SelectedMarket, Strike,
+    };
 
     fn shared_info(object_id: &str, type_: &str) -> SuiObjectInfo {
         SuiObjectInfo {
