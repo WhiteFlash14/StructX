@@ -8,8 +8,8 @@ use comfy_table::{presets::UTF8_FULL, Cell, Table};
 use deepbook_client::{
     verify_predict_abi, AbiCheckStatus, AbiVerificationReport, DeepBookClient, DeepBookConfig,
     FreshnessConfig, MarketSnapshot, ObjectOwnerKind, StructxMarketStatus, SuiObjectInfo,
-    SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, DUSDC_DECIMALS, PREDICT_OBJECT_ID,
-    PREDICT_PACKAGE_ID, PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
+    SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, DUSDC_DECIMALS, PREDICT_MANAGER_TYPE,
+    PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
 };
 use structx_core::{
     build_quote_plan, build_quote_tx_kind, compile_breakout, guard_quote_preview,
@@ -177,6 +177,10 @@ enum Command {
         strict_freshness: bool,
     },
 
+    ResolveManager {
+        #[arg(long)]
+        manager_id: String,
+    },
     VerifyAbi,
 }
 
@@ -332,6 +336,9 @@ async fn main() -> std::process::ExitCode {
 
             resolve_quote_objects_command(cli.server_url, cli.predict_id, cli.rpc_url, freshness)
                 .await
+        }
+        Command::ResolveManager { manager_id } => {
+            resolve_manager_command(cli.rpc_url, manager_id).await
         }
         Command::VerifyAbi => verify_abi_command(cli.rpc_url).await,
     };
@@ -978,6 +985,93 @@ async fn resolve_sui_object(
 ) -> Result<SuiObjectInfo, Box<dyn std::error::Error>> {
     let value = rpc.get_object(object_id).await?;
     Ok(SuiObjectInfo::from_get_object_result(object_id, value)?)
+}
+
+async fn resolve_manager_command(
+    rpc_url: String,
+    manager_id: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+    let manager = resolve_sui_object(&rpc, &manager_id).await?;
+
+    print_manager_preflight(&manager);
+    validate_predict_manager_object(&manager)?;
+
+    println!("PredictManager preflight: ok");
+
+    Ok(())
+}
+
+fn print_manager_preflight(manager: &SuiObjectInfo) {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "role",
+        "object id",
+        "type",
+        "owner",
+        "version",
+        "digest",
+        "initial shared version",
+    ]);
+
+    table.add_row(vec![
+        Cell::new("manager"),
+        Cell::new(&manager.object_id),
+        Cell::new(manager.object_type.as_deref().unwrap_or("—")),
+        Cell::new(manager.owner_kind.to_string()),
+        Cell::new(
+            manager.version.map(|value| value.to_string()).unwrap_or_else(|| "—".to_string()),
+        ),
+        Cell::new(manager.digest.as_deref().unwrap_or("—")),
+        Cell::new(
+            manager
+                .initial_shared_version
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "—".to_string()),
+        ),
+    ]);
+
+    println!("PredictManager object");
+    println!("{table}");
+    println!();
+}
+
+fn validate_predict_manager_object(
+    manager: &SuiObjectInfo,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if manager.owner_kind != ObjectOwnerKind::Shared {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("PredictManager is not shared: owner={}", manager.owner_kind),
+        )
+        .into());
+    }
+
+    if manager.initial_shared_version.is_none() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "PredictManager is missing initial_shared_version",
+        )
+        .into());
+    }
+
+    let actual_type = manager.object_type.as_deref().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "PredictManager object is missing type")
+    })?;
+
+    if actual_type != PREDICT_MANAGER_TYPE {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "unexpected PredictManager type: expected {}, got {}",
+                PREDICT_MANAGER_TYPE, actual_type
+            ),
+        )
+        .into());
+    }
+
+    Ok(())
 }
 
 fn print_quote_object_refs(predict: &SuiObjectInfo, oracle: &SuiObjectInfo, clock: &SuiObjectInfo) {
