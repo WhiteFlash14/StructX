@@ -181,6 +181,46 @@ pub fn build_create_manager_tx_kind(sender: &str) -> Result<QuoteTxKind, QuoteTx
         quote_result_command_indices: vec![0],
     })
 }
+
+pub fn build_manager_balance_tx_kind(
+    manager: &SuiObjectInfo,
+    sender: &str,
+) -> Result<QuoteTxKind, QuoteTxBuildError> {
+    let package = parse_address(PREDICT_PACKAGE_ID)?;
+    let sender_address = parse_address(sender)?;
+
+    let manager = shared_object_arg("manager", manager, false)?;
+
+    let mut tx = TransactionBuilder::new();
+
+    let manager_arg = tx.object(manager);
+
+    tx.move_call(
+        Function::new(
+            package,
+            Identifier::from_static("predict_manager"),
+            Identifier::from_static("balance"),
+        ),
+        vec![manager_arg],
+    );
+
+    tx.set_sender(sender_address);
+    tx.set_gas_budget(1_000_000);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(Address::ZERO, 1, Digest::ZERO)]);
+
+    let transaction = tx.try_build().map_err(|err| QuoteTxBuildError::Build(err.to_string()))?;
+
+    let bytes =
+        bcs::to_bytes(&transaction.kind).map_err(|err| QuoteTxBuildError::Bcs(err.to_string()))?;
+
+    Ok(QuoteTxKind {
+        sender: sender.to_string(),
+        tx_kind_b64: BASE64.encode(bytes),
+        quote_result_command_indices: vec![0],
+    })
+}
+
 fn shared_object_arg(
     role: &'static str,
     object: &SuiObjectInfo,
@@ -224,6 +264,29 @@ mod tests {
             initial_shared_version: Some(1),
             raw: json!({}),
         }
+    }
+
+    #[test]
+    fn builds_manager_balance_transaction_kind_bytes() {
+        let manager = SuiObjectInfo {
+            object_id: "0x76a4ef6bd2a3418be3effd699f2a869972c39e096e2c85a566c6ea7a7a6146b5"
+                .to_string(),
+            object_type: Some("0xf5ea2b3749c65d6e56507cc35388719aadb28f9cab873696a2f8687f5c785138::predict_manager::PredictManager".to_string()),
+            owner_kind: ObjectOwnerKind::Shared,
+            initial_shared_version: Some(1),
+            version: Some(1),
+            digest: Some("11111111111111111111111111111111".to_string()),
+            raw: serde_json::json!({}),
+        };
+
+        let tx = build_manager_balance_tx_kind(
+            &manager,
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("manager-balance tx kind builds");
+
+        assert!(!tx.tx_kind_b64.is_empty());
+        assert_eq!(tx.quote_result_command_indices, vec![0]);
     }
 
     #[test]
