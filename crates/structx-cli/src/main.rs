@@ -1,5 +1,6 @@
-use std::io;
+use std::path::{Path, PathBuf};
 use std::time::Duration as StdDuration;
+use std::{fs, io};
 
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
@@ -8,8 +9,9 @@ use comfy_table::{presets::UTF8_FULL, Cell, Table};
 use deepbook_client::{
     verify_predict_abi, AbiCheckStatus, AbiVerificationReport, DeepBookClient, DeepBookConfig,
     FreshnessConfig, MarketSnapshot, ObjectOwnerKind, StructxMarketStatus, SuiObjectInfo,
-    SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, DUSDC_DECIMALS, PREDICT_MANAGER_TYPE,
-    PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
+    SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, DUSDC_COIN_TYPE, DUSDC_DECIMALS,
+    PREDICT_MANAGER_TYPE, PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL,
+    SUI_CLOCK_OBJECT_ID,
 };
 use structx_core::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_mint_tx_kind,
@@ -238,6 +240,15 @@ enum Command {
 
         #[arg(long, default_value_t = 5)]
         max_quote_market_attempts: usize,
+
+        #[arg(long, default_value_t = false)]
+        write_execute_script: bool,
+
+        #[arg(long, default_value = "/tmp/structx_execute_mint_breakout.sh")]
+        execute_script_path: PathBuf,
+
+        #[arg(long, default_value = "/tmp/structx_execute_mint_breakout_plan.json")]
+        execute_plan_json_path: PathBuf,
     },
     VerifyAbi,
 }
@@ -418,6 +429,10 @@ async fn main() -> std::process::ExitCode {
             max_total_mint_cost_raw,
             slippage_bps,
             max_quote_market_attempts,
+
+            write_execute_script,
+            execute_script_path,
+            execute_plan_json_path,
         } => {
             let freshness = build_freshness(
                 max_price_age_secs,
@@ -440,6 +455,10 @@ async fn main() -> std::process::ExitCode {
                 max_total_mint_cost_raw,
                 slippage_bps,
                 max_quote_market_attempts,
+
+                write_execute_script,
+                execute_script_path,
+                execute_plan_json_path,
             })
             .await
         }
@@ -1106,37 +1125,180 @@ fn json_str(value: &serde_json::Value, key: &str) -> String {
         .unwrap_or_else(|| "—".to_string())
 }
 
-fn write_successful_mint_preview_artifact(
+fn write_execute_mint_artifacts(
+    args: &DevinspectMintBreakoutArgs,
     selected: &SelectedMarket<'_>,
     plan: &QuotePlan,
     preview: &QuotePreview,
-    sender: &str,
-    manager_id: &str,
-    mint_tx_kind: &QuoteTxKind,
-    mint_response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let artifact_path = "/tmp/structx_mint_preview_success.json";
+    let script = build_execute_mint_script(args, plan)?;
 
-    let artifact = serde_json::json!({
-        "warning": "devInspect only; no positions were persisted. Regenerate immediately before real execution.",
-        "sender": sender,
-        "manager_id": manager_id,
-        "oracle_id": selected.oracle_id,
-        "expiry": selected.expiry.to_rfc3339(),
-        "total_mint_cost_raw": preview.total_mint_cost_raw,
-        "plan_call_count": plan.calls.len(),
-        "tx_kind_b64": mint_tx_kind.tx_kind_b64,
-        "mint_command_indices": mint_tx_kind.quote_result_command_indices,
-        "mint_devinspect": mint_response,
-    });
+    fs::write(&args.execute_script_path, script)?;
 
-    std::fs::write(artifact_path, serde_json::to_string_pretty(&artifact)?)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
 
-    println!("Successful mint preview artifact written:");
-    println!("{artifact_path}");
-    println!("Important: regenerate this artifact immediately before real execution.");
+        let mut perms = fs::metadata(&args.execute_script_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&args.execute_script_path, perms)?;
+    }
+
+    let manifest = build_execute_mint_manifest(args, selected, plan, preview);
+    fs::write(&args.execute_plan_json_path, serde_json::to_string_pretty(&manifest)?)?;
+
+    println!();
+    println!("Fresh executable mint artifacts written");
+    println!("script: {}", display_path(&args.execute_script_path));
+    println!("plan: {}", display_path(&args.execute_plan_json_path));
+    println!();
+    println!("Execute immediately with:");
+    println!(
+        "GAS_BUDGET=500000000 bash {} --json | tee /tmp/structx_execute_mint_breakout.json",
+        display_path(&args.execute_script_path)
+    );
 
     Ok(())
+}
+
+fn display_path(path: &Path) -> String {
+    path.to_string_lossy().to_string()
+}
+
+fn build_execute_mint_manifest(
+    args: &DevinspectMintBreakoutArgs,
+    selected: &SelectedMarket<'_>,
+    plan: &QuotePlan,
+    preview: &QuotePreview,
+) -> serde_json::Value {
+    let legs = plan
+        .calls
+        .iter()
+        .enumerate()
+        .map(|(idx, call)| match call {
+            QuoteCall::Binary { direction, expiry_ms, strike, quantity, .. } => serde_json::json!({
+                "index": idx,
+                "kind": "binary",
+                "direction": direction.to_string(),
+                "oracle_id": plan.oracle_id,
+                "expiry_ms": expiry_ms,
+                "strike_raw": strike.raw,
+                "strike": selected.grid.display(*strike).to_string(),
+                "quantity": quantity,
+            }),
+            QuoteCall::Range { expiry_ms, lower, upper, quantity, .. } => serde_json::json!({
+                "index": idx,
+                "kind": "range",
+                "oracle_id": plan.oracle_id,
+                "expiry_ms": expiry_ms,
+                "lower_raw": lower.raw,
+                "upper_raw": upper.raw,
+                "lower": selected.grid.display(*lower).to_string(),
+                "upper": selected.grid.display(*upper).to_string(),
+                "quantity": quantity,
+            }),
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "sender": args.sender,
+        "manager_id": args.manager_id,
+        "predict_object_id": PREDICT_OBJECT_ID,
+        "predict_package_id": PREDICT_PACKAGE_ID,
+        "oracle_id": plan.oracle_id,
+        "selected_expiry": selected.expiry.to_rfc3339(),
+        "total_mint_cost_raw": preview.total_mint_cost_raw,
+        "total_mint_cost": preview.total_mint_cost_display(),
+        "total_redeem_payout_raw": preview.total_redeem_payout_raw,
+        "total_redeem_payout": preview.total_redeem_payout_display(),
+        "max_total_mint_cost_raw": args.max_total_mint_cost_raw,
+        "slippage_bps": args.slippage_bps,
+        "legs": legs,
+        "warning": "Generated only after successful devInspect. Execute immediately; pricing/risk can change."
+    })
+}
+
+fn build_execute_mint_script(
+    args: &DevinspectMintBreakoutArgs,
+    plan: &QuotePlan,
+) -> Result<String, Box<dyn std::error::Error>> {
+    if plan.calls.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty mint plan").into());
+    }
+
+    let mut out = String::new();
+
+    out.push_str("#!/usr/bin/env bash\n");
+    out.push_str("set -euo pipefail\n\n");
+
+    out.push_str("# Fresh StructX mint script generated only after successful devInspect.\n");
+    out.push_str("# Execute immediately; Predict pricing/risk checks can change between runs.\n\n");
+
+    out.push_str(&format!("export PREDICT_PACKAGE={}\n", PREDICT_PACKAGE_ID));
+    out.push_str(&format!("export PREDICT_OBJECT_ID={}\n", PREDICT_OBJECT_ID));
+    out.push_str(&format!("export DUSDC={}\n", DUSDC_COIN_TYPE));
+    out.push_str(&format!("export MANAGER_ID={}\n", args.manager_id));
+    out.push_str(&format!("export OWNER={}\n", args.sender));
+    out.push_str(&format!("export ORACLE_ID={}\n", plan.oracle_id));
+    out.push_str("export CLOCK_ID=0x6\n");
+    out.push_str("export GAS_BUDGET=${GAS_BUDGET:-500000000}\n\n");
+
+    out.push_str("EXTRA_ARGS=(\"$@\")\n");
+    out.push_str("if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then\n");
+    out.push_str("  EXTRA_ARGS=(--json)\n");
+    out.push_str("fi\n\n");
+
+    out.push_str("sui client ptb \\\n");
+    out.push_str("  --sender \"$OWNER\" \\\n");
+
+    for (idx, call) in plan.calls.iter().enumerate() {
+        let key_name = format!("key{idx}");
+
+        match call {
+            QuoteCall::Binary { direction, expiry_ms, strike, quantity, .. } => {
+                let key_function = match direction.to_string().as_str() {
+                    "up" => "up",
+                    "down" => "down",
+                    other => {
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            format!("unknown binary direction: {other}"),
+                        )
+                        .into());
+                    }
+                };
+
+                out.push_str(&format!(
+                    "  --move-call \"${{PREDICT_PACKAGE}}::market_key::{key_function}\" \"@${{ORACLE_ID}}\" \"{}\" \"{}\" \\\n",
+                    *expiry_ms as u64,
+                    strike.raw,
+                ));
+                out.push_str(&format!("  --assign {key_name} \\\n"));
+                out.push_str(&format!(
+                    "  --move-call \"${{PREDICT_PACKAGE}}::predict::mint\" \"<${{DUSDC}}>\" \"@${{PREDICT_OBJECT_ID}}\" \"@${{MANAGER_ID}}\" \"@${{ORACLE_ID}}\" {key_name} \"{}\" \"@${{CLOCK_ID}}\" \\\n",
+                    quantity,
+                ));
+            }
+            QuoteCall::Range { expiry_ms, lower, upper, quantity, .. } => {
+                out.push_str(&format!(
+                    "  --move-call \"${{PREDICT_PACKAGE}}::range_key::new\" \"@${{ORACLE_ID}}\" \"{}\" \"{}\" \"{}\" \\\n",
+                    *expiry_ms as u64,
+                    lower.raw,
+                    upper.raw,
+                ));
+                out.push_str(&format!("  --assign {key_name} \\\n"));
+                out.push_str(&format!(
+                    "  --move-call \"${{PREDICT_PACKAGE}}::predict::mint_range\" \"<${{DUSDC}}>\" \"@${{PREDICT_OBJECT_ID}}\" \"@${{MANAGER_ID}}\" \"@${{ORACLE_ID}}\" {key_name} \"{}\" \"@${{CLOCK_ID}}\" \\\n",
+                    quantity,
+                ));
+            }
+        }
+    }
+
+    out.push_str("  --gas-budget \"$GAS_BUDGET\" \\\n");
+    out.push_str("  \"${EXTRA_ARGS[@]}\"\n");
+
+    Ok(out)
 }
 
 fn print_devinspect_create_manager_response(
@@ -1314,6 +1476,10 @@ struct DevinspectMintBreakoutArgs {
     max_total_mint_cost_raw: u64,
     slippage_bps: u16,
     max_quote_market_attempts: usize,
+
+    write_execute_script: bool,
+    execute_script_path: PathBuf,
+    execute_plan_json_path: PathBuf,
 }
 
 async fn devinspect_mint_breakout_command(
@@ -1478,15 +1644,9 @@ async fn devinspect_mint_for_selected_market(
 
     print_devinspect_mint_response(&mint_response)?;
 
-    write_successful_mint_preview_artifact(
-        selected,
-        &plan,
-        &preview,
-        &args.sender,
-        &args.manager_id,
-        &mint_tx_kind,
-        &mint_response,
-    )?;
+    if args.write_execute_script {
+        write_execute_mint_artifacts(args, selected, &plan, &preview)?;
+    }
 
     Ok(())
 }
