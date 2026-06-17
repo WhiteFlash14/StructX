@@ -32,6 +32,9 @@ const OBJECT_ID: &str =
 const CLOCK_REF: &str =
     "{\"Reference\":{\"Struct\":{\"address\":\"0x2\",\"module\":\"clock\",\"name\":\"Clock\",\"typeArguments\":[]}}}";
 
+const TX_CONTEXT_MUT_REF: &str =
+    "{\"MutableReference\":{\"Struct\":{\"address\":\"0x2\",\"module\":\"tx_context\",\"name\":\"TxContext\",\"typeArguments\":[]}}}";
+
 pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
     ExpectedAbiFunction {
         module: "predict",
@@ -49,7 +52,16 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
         source_note: "predict.move + official Predict docs",
         source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict.move",
     },
+    
     ExpectedAbiFunction {
+        module: "predict",
+        function: "create_manager",
+        expected_parameters: &[TX_CONTEXT_MUT_REF],
+        expected_returns: &[OBJECT_ID],
+        source_note: "predict.move + official Predict docs",
+        source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict.move",
+    },
+ExpectedAbiFunction {
         module: "market_key",
         function: "up",
         expected_parameters: &[OBJECT_ID, "U64", "U64"],
@@ -359,7 +371,7 @@ mod tests {
         let report = verify_predict_abi(PREDICT_PACKAGE, &modules);
 
         assert!(report.is_pass());
-        assert_eq!(report.checks.len(), 5);
+        assert_eq!(report.checks.len(), 6);
     }
 
     #[test]
