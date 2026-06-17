@@ -12,11 +12,11 @@ use deepbook_client::{
     PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
 };
 use structx_core::{
-    build_create_manager_tx_kind, build_manager_balance_tx_kind, build_quote_plan,
-    build_quote_tx_kind, compile_breakout, guard_quote_preview, select_best_market,
-    select_candidate_markets, CompiledPayoff, DisplayPrice, PredictLeg, PriceScale,
-    QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview,
-    QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
+    build_create_manager_tx_kind, build_manager_balance_tx_kind, build_mint_tx_kind,
+    build_quote_plan, build_quote_tx_kind, compile_breakout, guard_quote_preview,
+    select_best_market, select_candidate_markets, CompiledPayoff, DisplayPrice, MintObjectRefs,
+    PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs,
+    QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -199,6 +199,46 @@ enum Command {
         )]
         sender: String,
     },
+    DevinspectMintBreakout {
+        #[arg(long)]
+        manager_id: String,
+
+        #[arg(long)]
+        sender: String,
+
+        #[arg(long, default_value_t = 60)]
+        max_price_age_secs: i64,
+
+        #[arg(long, default_value_t = 60)]
+        max_svi_age_secs: i64,
+
+        #[arg(long, default_value_t = 300)]
+        min_time_to_expiry_secs: i64,
+
+        #[arg(long, default_value_t = false)]
+        strict_freshness: bool,
+
+        #[arg(long, default_value_t = 250.0)]
+        bucket_step_usd: f64,
+
+        #[arg(long, default_value_t = 4)]
+        levels_each_side: u32,
+
+        #[arg(long, default_value_t = 1000)]
+        tail_quantity: u64,
+
+        #[arg(long, default_value_t = 400)]
+        shoulder_quantity: u64,
+
+        #[arg(long)]
+        max_total_mint_cost_raw: u64,
+
+        #[arg(long, default_value_t = 100)]
+        slippage_bps: u16,
+
+        #[arg(long, default_value_t = 5)]
+        max_quote_market_attempts: usize,
+    },
     VerifyAbi,
 }
 
@@ -363,6 +403,45 @@ async fn main() -> std::process::ExitCode {
         }
         Command::ManagerBalance { manager_id, sender } => {
             manager_balance_command(cli.rpc_url, manager_id, sender).await
+        }
+        Command::DevinspectMintBreakout {
+            manager_id,
+            sender,
+            max_price_age_secs,
+            max_svi_age_secs,
+            min_time_to_expiry_secs,
+            strict_freshness,
+            bucket_step_usd,
+            levels_each_side,
+            tail_quantity,
+            shoulder_quantity,
+            max_total_mint_cost_raw,
+            slippage_bps,
+            max_quote_market_attempts,
+        } => {
+            let freshness = build_freshness(
+                max_price_age_secs,
+                max_svi_age_secs,
+                min_time_to_expiry_secs,
+                strict_freshness,
+            );
+
+            devinspect_mint_breakout_command(DevinspectMintBreakoutArgs {
+                server_url: cli.server_url,
+                predict_id: cli.predict_id,
+                rpc_url: cli.rpc_url,
+                manager_id,
+                sender,
+                freshness,
+                bucket_step: DisplayPrice(bucket_step_usd),
+                levels_each_side,
+                tail_quantity,
+                shoulder_quantity,
+                max_total_mint_cost_raw,
+                slippage_bps,
+                max_quote_market_attempts,
+            })
+            .await
         }
         Command::VerifyAbi => verify_abi_command(cli.rpc_url).await,
     };
@@ -1115,6 +1194,197 @@ async fn resolve_sui_object(
 ) -> Result<SuiObjectInfo, Box<dyn std::error::Error>> {
     let value = rpc.get_object(object_id).await?;
     Ok(SuiObjectInfo::from_get_object_result(object_id, value)?)
+}
+
+struct DevinspectMintBreakoutArgs {
+    server_url: String,
+    predict_id: String,
+    rpc_url: String,
+    manager_id: String,
+    sender: String,
+    freshness: FreshnessConfig,
+    bucket_step: DisplayPrice,
+    levels_each_side: u32,
+    tail_quantity: u64,
+    shoulder_quantity: u64,
+    max_total_mint_cost_raw: u64,
+    slippage_bps: u16,
+    max_quote_market_attempts: usize,
+}
+
+async fn devinspect_mint_breakout_command(
+    args: DevinspectMintBreakoutArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let client = build_client(args.server_url.clone(), args.predict_id.clone())?;
+    let markets = load_markets(&client, args.freshness).await?;
+
+    let candidates = select_candidate_markets(&markets, PriceScale::E9);
+
+    if candidates.is_empty() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "no quoteable market candidates").into()
+        );
+    }
+
+    let max_attempts = args.max_quote_market_attempts.min(candidates.len());
+    let mut failures = Vec::new();
+
+    for (attempt_idx, selected) in candidates.into_iter().take(max_attempts).enumerate() {
+        println!(
+            "Mint attempt {}/{} using oracle {} expiring {}",
+            attempt_idx + 1,
+            max_attempts,
+            selected.oracle_id,
+            selected.expiry.to_rfc3339()
+        );
+
+        match devinspect_mint_for_selected_market(&args, &selected).await {
+            Ok(()) => return Ok(()),
+            Err(err) => {
+                let message = format!(
+                    "oracle {} expiry {} failed: {}",
+                    selected.oracle_id,
+                    selected.expiry.to_rfc3339(),
+                    err
+                );
+                eprintln!("{message}");
+                failures.push(message);
+            }
+        }
+    }
+
+    Err(io::Error::other(format!("all mint attempts failed:\n{}", failures.join("\n"))).into())
+}
+
+async fn devinspect_mint_for_selected_market(
+    args: &DevinspectMintBreakoutArgs,
+    selected: &SelectedMarket<'_>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    print_selected_market(selected);
+
+    let strikes = selected.grid.centered_strikes_by_display_step(
+        selected.spot_raw,
+        args.bucket_step,
+        args.levels_each_side,
+    )?;
+
+    let center = selected
+        .grid
+        .snap_nearest(selected.spot_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
+
+    let center_idx = strikes
+        .iter()
+        .position(|strike| strike.raw == center.raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
+
+    if center_idx < 2 || center_idx + 2 >= strikes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not enough strikes around spot; increase --levels-each-side",
+        )
+        .into());
+    }
+
+    let k1 = strikes[center_idx - 2];
+    let k2 = strikes[center_idx - 1];
+    let k3 = strikes[center_idx + 1];
+    let k4 = strikes[center_idx + 2];
+
+    let compiled = compile_breakout(k1, k2, k3, k4, args.tail_quantity, args.shoulder_quantity)?;
+
+    let plan = build_quote_plan(selected, &compiled)?;
+
+    print_breakout_boundaries(selected, k1, k2, k3, k4);
+    print_compiled_payoff(selected, &compiled);
+    print_quote_plan(selected, &plan);
+
+    let rpc = SuiRpcClient::new(args.rpc_url.clone(), StdDuration::from_secs(20))?;
+
+    let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let manager = resolve_sui_object(&rpc, &args.manager_id).await?;
+    let oracle = resolve_sui_object(&rpc, selected.oracle_id).await?;
+    let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
+
+    validate_predict_manager_object(&manager)?;
+    validate_quote_object_refs(&predict, &oracle, &clock)?;
+
+    let quote_tx_kind = build_quote_tx_kind(
+        &plan,
+        QuoteObjectRefs { predict: &predict, oracle: &oracle, clock: &clock },
+        &args.sender,
+    )?;
+
+    let quote_response =
+        rpc.dev_inspect_transaction_kind(&quote_tx_kind.sender, &quote_tx_kind.tx_kind_b64).await?;
+
+    let preview =
+        print_devinspect_quote_response(selected, &plan, &quote_tx_kind, &quote_response)?;
+
+    let guarded = guard_quote_preview(
+        &preview,
+        QuoteCostGuard {
+            max_total_mint_cost_raw: args.max_total_mint_cost_raw,
+            slippage_bps: args.slippage_bps,
+        },
+    )?;
+
+    println!();
+    println!("Quote guard: accepted");
+    println!("max_allowed_after_slippage_raw: {}", guarded.max_allowed_after_slippage_raw);
+    println!("actual_total_mint_cost_raw: {}", guarded.total_mint_cost_raw);
+
+    let manager_balance_tx = build_manager_balance_tx_kind(&manager, &args.sender)?;
+    let manager_balance_response = rpc
+        .dev_inspect_transaction_kind(&manager_balance_tx.sender, &manager_balance_tx.tx_kind_b64)
+        .await?;
+
+    let manager_balance_raw = read_manager_balance_from_response(&manager_balance_response)?;
+
+    if manager_balance_raw < preview.total_mint_cost_raw {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manager balance {} is below required mint cost {}",
+                manager_balance_raw, preview.total_mint_cost_raw
+            ),
+        )
+        .into());
+    }
+
+    println!("Manager balance check: accepted");
+    println!("manager balance raw: {manager_balance_raw}");
+    println!("required mint cost raw: {}", preview.total_mint_cost_raw);
+
+    let mint_tx_kind = build_mint_tx_kind(
+        &plan,
+        MintObjectRefs { predict: &predict, manager: &manager, oracle: &oracle, clock: &clock },
+        &args.sender,
+    )?;
+
+    println!();
+    println!("Built mint TransactionKind");
+    println!("sender: {}", mint_tx_kind.sender);
+    println!("tx_kind_b64_len: {}", mint_tx_kind.tx_kind_b64.len());
+    println!("mint command indices: {:?}", mint_tx_kind.quote_result_command_indices);
+    println!();
+
+    let mint_response =
+        rpc.dev_inspect_transaction_kind(&mint_tx_kind.sender, &mint_tx_kind.tx_kind_b64).await?;
+
+    print_devinspect_mint_response(&mint_response)?;
+
+    write_successful_mint_preview_artifact(
+        selected,
+        &plan,
+        &preview,
+        &args.sender,
+        &args.manager_id,
+        &mint_tx_kind,
+        &mint_response,
+    )?;
+
+    Ok(())
 }
 
 async fn manager_balance_command(
