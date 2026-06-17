@@ -1,9 +1,9 @@
 use std::str::FromStr;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
-use deepbook_client::{SuiObjectInfo, PREDICT_PACKAGE_ID};
+use deepbook_client::{SuiObjectInfo, DUSDC_COIN_TYPE, PREDICT_PACKAGE_ID};
 use serde::{Deserialize, Serialize};
-use sui_sdk_types::{Address, Digest, Identifier};
+use sui_sdk_types::{Address, Digest, Identifier, TypeTag};
 use sui_transaction_builder::{Function, ObjectInput, TransactionBuilder};
 use thiserror::Error;
 
@@ -12,6 +12,9 @@ use crate::quote_plan::{QuoteCall, QuotePlan};
 
 #[derive(Debug, Clone, Error)]
 pub enum QuoteTxBuildError {
+    #[error("invalid Sui type tag `{value}`: {message}")]
+    InvalidTypeTag { value: String, message: String },
+
     #[error("object `{role}` is missing initial shared version")]
     MissingSharedVersion { role: &'static str },
 
@@ -200,7 +203,8 @@ pub fn build_manager_balance_tx_kind(
             package,
             Identifier::from_static("predict_manager"),
             Identifier::from_static("balance"),
-        ),
+        )
+        .with_type_args(vec![parse_type_tag(DUSDC_COIN_TYPE)?]),
         vec![manager_arg],
     );
 
@@ -235,6 +239,13 @@ fn shared_object_arg(
 
 fn parse_address(value: &str) -> Result<Address, QuoteTxBuildError> {
     Address::from_str(value).map_err(|err| QuoteTxBuildError::InvalidAddress {
+        value: value.to_string(),
+        message: err.to_string(),
+    })
+}
+
+fn parse_type_tag(value: &str) -> Result<TypeTag, QuoteTxBuildError> {
+    value.parse::<TypeTag>().map_err(|err| QuoteTxBuildError::InvalidTypeTag {
         value: value.to_string(),
         message: err.to_string(),
     })
