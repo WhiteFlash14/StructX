@@ -12,10 +12,11 @@ use deepbook_client::{
     PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
 };
 use structx_core::{
-    build_create_manager_tx_kind, build_quote_plan, build_quote_tx_kind, compile_breakout,
-    guard_quote_preview, select_best_market, select_candidate_markets, CompiledPayoff,
-    DisplayPrice, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard,
-    QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
+    build_create_manager_tx_kind, build_manager_balance_tx_kind, build_quote_plan,
+    build_quote_tx_kind, compile_breakout, guard_quote_preview, select_best_market,
+    select_candidate_markets, CompiledPayoff, DisplayPrice, PredictLeg, PriceScale,
+    QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview,
+    QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -188,6 +189,16 @@ enum Command {
         )]
         sender: String,
     },
+    ManagerBalance {
+        #[arg(long)]
+        manager_id: String,
+
+        #[arg(
+            long,
+            default_value = "0x0000000000000000000000000000000000000000000000000000000000000000"
+        )]
+        sender: String,
+    },
     VerifyAbi,
 }
 
@@ -349,6 +360,9 @@ async fn main() -> std::process::ExitCode {
         }
         Command::DevinspectCreateManager { sender } => {
             devinspect_create_manager_command(cli.rpc_url, sender).await
+        }
+        Command::ManagerBalance { manager_id, sender } => {
+            manager_balance_command(cli.rpc_url, manager_id, sender).await
         }
         Command::VerifyAbi => verify_abi_command(cli.rpc_url).await,
     };
@@ -1101,6 +1115,75 @@ async fn resolve_sui_object(
 ) -> Result<SuiObjectInfo, Box<dyn std::error::Error>> {
     let value = rpc.get_object(object_id).await?;
     Ok(SuiObjectInfo::from_get_object_result(object_id, value)?)
+}
+
+async fn manager_balance_command(
+    rpc_url: String,
+    manager_id: String,
+    sender: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+
+    let manager = resolve_sui_object(&rpc, &manager_id).await?;
+    print_manager_preflight(&manager);
+    validate_predict_manager_object(&manager)?;
+
+    let tx_kind = build_manager_balance_tx_kind(&manager, &sender)?;
+
+    println!("Built manager-balance TransactionKind");
+    println!("sender: {}", tx_kind.sender);
+    println!("tx_kind_b64_len: {}", tx_kind.tx_kind_b64.len());
+    println!();
+
+    let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+
+    print_manager_balance_response(&response)?;
+
+    Ok(())
+}
+
+fn print_manager_balance_response(
+    response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = devinspect_status(response);
+
+    println!("devInspect status: {status}");
+
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+
+    let results = response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing devInspect results"))?;
+
+    let first_result = results.first().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing manager balance command result")
+    })?;
+
+    let return_values =
+        first_result.get("returnValues").and_then(serde_json::Value::as_array).ok_or_else(
+            || io::Error::new(io::ErrorKind::InvalidData, "missing manager balance returnValues"),
+        )?;
+
+    if return_values.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected manager balance to return 1 value, got {}", return_values.len()),
+        )
+        .into());
+    }
+
+    let balance_raw = decode_devinspect_u64(&return_values[0])?;
+
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+    println!("Manager balance");
+    println!("balance raw: {balance_raw}");
+    println!("balance: {}", asset.format_amount(balance_raw));
+
+    Ok(())
 }
 
 async fn resolve_manager_command(
