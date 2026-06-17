@@ -1035,6 +1035,110 @@ async fn devinspect_create_manager_command(
     Ok(())
 }
 
+fn print_devinspect_mint_response(
+    response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = devinspect_status(response);
+
+    println!("mint devInspect status: {status}");
+
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+
+    let events =
+        response.get("events").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "event",
+        "oracle_id",
+        "strike/lower",
+        "higher",
+        "quantity",
+        "cost",
+        "ask_price",
+    ]);
+
+    for event in events {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+
+        let parsed = event.get("parsedJson").unwrap_or(&serde_json::Value::Null);
+
+        if event_type.ends_with("::predict::PositionMinted") {
+            table.add_row(vec![
+                Cell::new("PositionMinted"),
+                Cell::new(json_str(parsed, "oracle_id")),
+                Cell::new(json_str(parsed, "strike")),
+                Cell::new("—"),
+                Cell::new(json_str(parsed, "quantity")),
+                Cell::new(json_str(parsed, "cost")),
+                Cell::new(json_str(parsed, "ask_price")),
+            ]);
+        } else if event_type.ends_with("::predict::RangeMinted") {
+            table.add_row(vec![
+                Cell::new("RangeMinted"),
+                Cell::new(json_str(parsed, "oracle_id")),
+                Cell::new(json_str(parsed, "lower_strike")),
+                Cell::new(json_str(parsed, "higher_strike")),
+                Cell::new(json_str(parsed, "quantity")),
+                Cell::new(json_str(parsed, "cost")),
+                Cell::new(json_str(parsed, "ask_price")),
+            ]);
+        }
+    }
+
+    println!("Mint preview events");
+    println!("{table}");
+    println!();
+    println!("Important: this was devInspect only. No positions were persisted.");
+
+    Ok(())
+}
+
+fn json_str(value: &serde_json::Value, key: &str) -> String {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .map(ToString::to_string)
+        .or_else(|| value.get(key).map(ToString::to_string))
+        .unwrap_or_else(|| "—".to_string())
+}
+
+fn write_successful_mint_preview_artifact(
+    selected: &SelectedMarket<'_>,
+    plan: &QuotePlan,
+    preview: &QuotePreview,
+    sender: &str,
+    manager_id: &str,
+    mint_tx_kind: &QuoteTxKind,
+    mint_response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let artifact_path = "/tmp/structx_mint_preview_success.json";
+
+    let artifact = serde_json::json!({
+        "warning": "devInspect only; no positions were persisted. Regenerate immediately before real execution.",
+        "sender": sender,
+        "manager_id": manager_id,
+        "oracle_id": selected.oracle_id,
+        "expiry": selected.expiry.to_rfc3339(),
+        "total_mint_cost_raw": preview.total_mint_cost_raw,
+        "plan_call_count": plan.calls.len(),
+        "tx_kind_b64": mint_tx_kind.tx_kind_b64,
+        "mint_command_indices": mint_tx_kind.quote_result_command_indices,
+        "mint_devinspect": mint_response,
+    });
+
+    std::fs::write(artifact_path, serde_json::to_string_pretty(&artifact)?)?;
+
+    println!("Successful mint preview artifact written:");
+    println!("{artifact_path}");
+    println!("Important: regenerate this artifact immediately before real execution.");
+
+    Ok(())
+}
+
 fn print_devinspect_create_manager_response(
     response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1385,6 +1489,39 @@ async fn devinspect_mint_for_selected_market(
     )?;
 
     Ok(())
+}
+
+fn read_manager_balance_from_response(
+    response: &serde_json::Value,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let status = devinspect_status(response);
+
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+
+    let results =
+        response.get("results").and_then(serde_json::Value::as_array).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing manager balance results")
+        })?;
+
+    let return_values = results
+        .first()
+        .and_then(|result| result.get("returnValues"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing manager balance returnValues")
+        })?;
+
+    if return_values.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected 1 manager balance return, got {}", return_values.len()),
+        )
+        .into());
+    }
+
+    decode_devinspect_u64(&return_values[0])
 }
 
 async fn manager_balance_command(
