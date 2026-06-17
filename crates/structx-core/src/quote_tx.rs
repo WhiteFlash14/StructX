@@ -150,6 +150,37 @@ pub fn build_quote_tx_kind(
     })
 }
 
+pub fn build_create_manager_tx_kind(sender: &str) -> Result<QuoteTxKind, QuoteTxBuildError> {
+    let package = parse_address(PREDICT_PACKAGE_ID)?;
+    let sender_address = parse_address(sender)?;
+
+    let mut tx = TransactionBuilder::new();
+
+    tx.move_call(
+        Function::new(
+            package,
+            Identifier::from_static("predict"),
+            Identifier::from_static("create_manager"),
+        ),
+        vec![],
+    );
+
+    tx.set_sender(sender_address);
+    tx.set_gas_budget(1_000_000);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(Address::ZERO, 1, Digest::ZERO)]);
+
+    let transaction = tx.try_build().map_err(|err| QuoteTxBuildError::Build(err.to_string()))?;
+
+    let bytes =
+        bcs::to_bytes(&transaction.kind).map_err(|err| QuoteTxBuildError::Bcs(err.to_string()))?;
+
+    Ok(QuoteTxKind {
+        sender: sender.to_string(),
+        tx_kind_b64: BASE64.encode(bytes),
+        quote_result_command_indices: vec![0],
+    })
+}
 fn shared_object_arg(
     role: &'static str,
     object: &SuiObjectInfo,
@@ -193,6 +224,17 @@ mod tests {
             initial_shared_version: Some(1),
             raw: json!({}),
         }
+    }
+
+    #[test]
+    fn builds_create_manager_transaction_kind_bytes() {
+        let tx = build_create_manager_tx_kind(
+            "0x0000000000000000000000000000000000000000000000000000000000000000",
+        )
+        .expect("create-manager tx kind builds");
+
+        assert!(!tx.tx_kind_b64.is_empty());
+        assert_eq!(tx.quote_result_command_indices, vec![0]);
     }
 
     #[test]

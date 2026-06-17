@@ -52,7 +52,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
         source_note: "predict.move + official Predict docs",
         source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict.move",
     },
-    
+
     ExpectedAbiFunction {
         module: "predict",
         function: "create_manager",
@@ -321,6 +321,15 @@ mod tests {
                             {"Reference":{"Struct":{"address":"0x2","module":"clock","name":"Clock","typeArguments":[]}}}
                         ],
                         "return": ["U64", "U64"]
+                    },
+                    "create_manager": {
+                        "visibility": "Public",
+                        "parameters": [
+                            {"MutableReference":{"Struct":{"address":"0x2","module":"tx_context","name":"TxContext","typeArguments":[]}}}
+                        ],
+                        "return": [
+                            {"Struct":{"address":"0x2","module":"object","name":"ID","typeArguments":[]}}
+                        ]
                     }
                 }
             },
