@@ -35,6 +35,9 @@ const CLOCK_REF: &str =
 const TX_CONTEXT_MUT_REF: &str =
     "{\"MutableReference\":{\"Struct\":{\"address\":\"0x2\",\"module\":\"tx_context\",\"name\":\"TxContext\",\"typeArguments\":[]}}}";
 
+const PREDICT_MANAGER_REF: &str =
+    "{\"Reference\":{\"Struct\":{\"address\":\"0xf5ea2b3749c65d6e56507cc35388719aadb28f9cab873696a2f8687f5c785138\",\"module\":\"predict_manager\",\"name\":\"PredictManager\",\"typeArguments\":[]}}}";
+
 pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
     ExpectedAbiFunction {
         module: "predict",
@@ -60,6 +63,15 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
         expected_returns: &[OBJECT_ID],
         source_note: "predict.move + official Predict docs",
         source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict.move",
+    },
+
+    ExpectedAbiFunction {
+        module: "predict_manager",
+        function: "balance",
+        expected_parameters: &[PREDICT_MANAGER_REF],
+        expected_returns: &["U64"],
+        source_note: "predict_manager.move + official PredictManager docs",
+        source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict_manager.move",
     },
 ExpectedAbiFunction {
         module: "market_key",
@@ -333,6 +345,17 @@ mod tests {
                     }
                 }
             },
+            "predict_manager": {
+                "exposedFunctions": {
+                    "balance": {
+                        "visibility": "Public",
+                        "parameters": [
+                            {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}}
+                        ],
+                        "return": ["U64"]
+                    }
+                }
+            },
             "market_key": {
                 "exposedFunctions": {
                     "up": {
@@ -380,7 +403,7 @@ mod tests {
         let report = verify_predict_abi(PREDICT_PACKAGE, &modules);
 
         assert!(report.is_pass());
-        assert_eq!(report.checks.len(), 6);
+        assert_eq!(report.checks.len(), 7);
     }
 
     #[test]
