@@ -12,10 +12,10 @@ use deepbook_client::{
     PREDICT_OBJECT_ID, PREDICT_PACKAGE_ID, PREDICT_SERVER_URL, SUI_CLOCK_OBJECT_ID,
 };
 use structx_core::{
-    build_quote_plan, build_quote_tx_kind, compile_breakout, guard_quote_preview,
-    select_best_market, select_candidate_markets, CompiledPayoff, DisplayPrice, PredictLeg,
-    PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan,
-    QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
+    build_create_manager_tx_kind, build_quote_plan, build_quote_tx_kind, compile_breakout,
+    guard_quote_preview, select_best_market, select_candidate_markets, CompiledPayoff,
+    DisplayPrice, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard,
+    QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -181,6 +181,13 @@ enum Command {
         #[arg(long)]
         manager_id: String,
     },
+    DevinspectCreateManager {
+        #[arg(
+            long,
+            default_value = "0x0000000000000000000000000000000000000000000000000000000000000000"
+        )]
+        sender: String,
+    },
     VerifyAbi,
 }
 
@@ -339,6 +346,9 @@ async fn main() -> std::process::ExitCode {
         }
         Command::ResolveManager { manager_id } => {
             resolve_manager_command(cli.rpc_url, manager_id).await
+        }
+        Command::DevinspectCreateManager { sender } => {
+            devinspect_create_manager_command(cli.rpc_url, sender).await
         }
         Command::VerifyAbi => verify_abi_command(cli.rpc_url).await,
     };
@@ -910,6 +920,112 @@ fn devinspect_failure_summary(response: &serde_json::Value) -> String {
     format!(
         "devInspect failed: {status_error}; abort={abort_module}::{abort_function} code {abort_code}"
     )
+}
+
+async fn devinspect_create_manager_command(
+    rpc_url: String,
+    sender: String,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+
+    let tx_kind = build_create_manager_tx_kind(&sender)?;
+
+    println!("Built create-manager TransactionKind");
+    println!("sender: {}", tx_kind.sender);
+    println!("tx_kind_b64_len: {}", tx_kind.tx_kind_b64.len());
+    println!();
+
+    let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+
+    print_devinspect_create_manager_response(&response)?;
+
+    Ok(())
+}
+
+fn print_devinspect_create_manager_response(
+    response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = devinspect_status(response);
+
+    println!("devInspect status: {status}");
+
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+
+    let results = response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing devInspect results"))?;
+
+    let first_result = results.first().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, "missing create_manager command result")
+    })?;
+
+    let return_values =
+        first_result.get("returnValues").and_then(serde_json::Value::as_array).ok_or_else(
+            || io::Error::new(io::ErrorKind::InvalidData, "missing create_manager returnValues"),
+        )?;
+
+    if return_values.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected create_manager to return 1 value, got {}", return_values.len()),
+        )
+        .into());
+    }
+
+    let manager_id = decode_devinspect_object_id(&return_values[0])?;
+
+    println!("create_manager preview returned manager_id:");
+    println!("{manager_id}");
+    println!();
+    println!("Important: this manager_id is from devInspect only. It is not persisted.");
+    println!(
+        "A real manager_id will exist only after sending a signed create_manager transaction."
+    );
+
+    Ok(())
+}
+
+fn decode_devinspect_object_id(
+    value: &serde_json::Value,
+) -> Result<String, Box<dyn std::error::Error>> {
+    let arr = value.as_array().ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("return value is not array: {value}"))
+    })?;
+
+    let bytes_value = arr
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "return value missing bytes"))?;
+
+    let bytes_array = bytes_value.as_array().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("return bytes are not array: {bytes_value}"),
+        )
+    })?;
+
+    if bytes_array.len() != 32 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("object::ID return must have 32 bytes, got {}", bytes_array.len()),
+        )
+        .into());
+    }
+
+    let mut out = String::from("0x");
+
+    for byte_value in bytes_array {
+        let byte = byte_value.as_u64().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid byte value: {byte_value}"))
+        })?;
+
+        let byte = u8::try_from(byte)?;
+        out.push_str(&format!("{byte:02x}"));
+    }
+
+    Ok(out)
 }
 
 fn print_devinspect_response_summary(
