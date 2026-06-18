@@ -366,6 +366,130 @@ pub fn build_mint_tx_kind(
     })
 }
 
+pub fn build_redeem_tx_kind(
+    reads: &[ManagerPositionRead],
+    refs: MintObjectRefs<'_>,
+    sender: &str,
+) -> Result<QuoteTxKind, QuoteTxBuildError> {
+    let package = parse_address(PREDICT_PACKAGE_ID)?;
+    let sender_address = parse_address(sender)?;
+
+    let predict = shared_object_arg("predict", refs.predict, true)?;
+    let manager = shared_object_arg("manager", refs.manager, true)?;
+    let oracle = shared_object_arg("oracle", refs.oracle, false)?;
+    let clock = shared_object_arg("clock", refs.clock, false)?;
+
+    let mut tx = TransactionBuilder::new();
+
+    let predict_arg = tx.object(predict);
+    let manager_arg = tx.object(manager);
+    let oracle_arg = tx.object(oracle);
+    let clock_arg = tx.object(clock);
+
+    let mut redeem_command_indices = Vec::with_capacity(reads.len());
+    let mut command_index = 0usize;
+
+    for read in reads {
+        match read {
+            ManagerPositionRead::Binary {
+                oracle_id,
+                expiry_ms,
+                strike_raw,
+                is_up,
+                expected_quantity,
+            } => {
+                let oracle_id = parse_address(oracle_id)?;
+                let oracle_id_arg = tx.pure(&oracle_id);
+                let expiry_arg = tx.pure(expiry_ms);
+                let strike_arg = tx.pure(strike_raw);
+
+                let key_fn = if *is_up { "up" } else { "down" };
+
+                let key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("market_key"),
+                        Identifier::from_static(key_fn),
+                    ),
+                    vec![oracle_id_arg, expiry_arg, strike_arg],
+                );
+
+                command_index += 1;
+
+                let quantity_arg = tx.pure(expected_quantity);
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict"),
+                        Identifier::from_static("redeem"),
+                    )
+                    .with_type_args(vec![parse_type_tag(DUSDC_COIN_TYPE)?]),
+                    vec![predict_arg, manager_arg, oracle_arg, key, quantity_arg, clock_arg],
+                );
+
+                redeem_command_indices.push(command_index);
+                command_index += 1;
+            }
+            ManagerPositionRead::Range {
+                oracle_id,
+                expiry_ms,
+                lower_raw,
+                upper_raw,
+                expected_quantity,
+            } => {
+                let oracle_id = parse_address(oracle_id)?;
+                let oracle_id_arg = tx.pure(&oracle_id);
+                let expiry_arg = tx.pure(expiry_ms);
+                let lower_arg = tx.pure(lower_raw);
+                let upper_arg = tx.pure(upper_raw);
+
+                let key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("range_key"),
+                        Identifier::from_static("new"),
+                    ),
+                    vec![oracle_id_arg, expiry_arg, lower_arg, upper_arg],
+                );
+
+                command_index += 1;
+
+                let quantity_arg = tx.pure(expected_quantity);
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict"),
+                        Identifier::from_static("redeem_range"),
+                    )
+                    .with_type_args(vec![parse_type_tag(DUSDC_COIN_TYPE)?]),
+                    vec![predict_arg, manager_arg, oracle_arg, key, quantity_arg, clock_arg],
+                );
+
+                redeem_command_indices.push(command_index);
+                command_index += 1;
+            }
+        }
+    }
+
+    tx.set_sender(sender_address);
+    tx.set_gas_budget(1_000_000);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(Address::ZERO, 1, Digest::ZERO)]);
+
+    let transaction = tx.try_build().map_err(|err| QuoteTxBuildError::Build(err.to_string()))?;
+
+    let bytes =
+        bcs::to_bytes(&transaction.kind).map_err(|err| QuoteTxBuildError::Bcs(err.to_string()))?;
+
+    Ok(QuoteTxKind {
+        sender: sender.to_string(),
+        tx_kind_b64: BASE64.encode(bytes),
+        quote_result_command_indices: redeem_command_indices,
+    })
+}
+
 fn shared_object_arg(
     role: &'static str,
     object: &SuiObjectInfo,
