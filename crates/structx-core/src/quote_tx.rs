@@ -225,6 +225,24 @@ pub fn build_manager_balance_tx_kind(
     })
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagerPositionRead {
+    Binary {
+        oracle_id: String,
+        expiry_ms: u64,
+        strike_raw: u64,
+        is_up: bool,
+        expected_quantity: u64,
+    },
+    Range {
+        oracle_id: String,
+        expiry_ms: u64,
+        lower_raw: u64,
+        upper_raw: u64,
+        expected_quantity: u64,
+    },
+}
+
 #[derive(Debug, Clone, Copy)]
 pub struct MintObjectRefs<'a> {
     pub predict: &'a SuiObjectInfo,
@@ -358,6 +376,104 @@ fn shared_object_arg(
         object.initial_shared_version.ok_or(QuoteTxBuildError::MissingSharedVersion { role })?;
 
     Ok(ObjectInput::shared(object_id, initial_shared_version, mutable))
+}
+
+pub fn build_manager_positions_tx_kind(
+    reads: &[ManagerPositionRead],
+    manager: &SuiObjectInfo,
+    sender: &str,
+) -> Result<QuoteTxKind, QuoteTxBuildError> {
+    let package = parse_address(PREDICT_PACKAGE_ID)?;
+    let sender_address = parse_address(sender)?;
+    let manager = shared_object_arg("manager", manager, false)?;
+
+    let mut tx = TransactionBuilder::new();
+    let manager_arg = tx.object(manager);
+
+    let mut result_command_indices = Vec::with_capacity(reads.len());
+    let mut command_index = 0usize;
+
+    for read in reads {
+        match read {
+            ManagerPositionRead::Binary { oracle_id, expiry_ms, strike_raw, is_up, .. } => {
+                let oracle_id = parse_address(oracle_id)?;
+                let oracle_id_arg = tx.pure(&oracle_id);
+                let expiry_arg = tx.pure(expiry_ms);
+                let strike_arg = tx.pure(strike_raw);
+
+                let key_fn = if *is_up { "up" } else { "down" };
+
+                let key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("market_key"),
+                        Identifier::from_static(key_fn),
+                    ),
+                    vec![oracle_id_arg, expiry_arg, strike_arg],
+                );
+
+                command_index += 1;
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict_manager"),
+                        Identifier::from_static("position"),
+                    ),
+                    vec![manager_arg, key],
+                );
+
+                result_command_indices.push(command_index);
+                command_index += 1;
+            }
+            ManagerPositionRead::Range { oracle_id, expiry_ms, lower_raw, upper_raw, .. } => {
+                let oracle_id = parse_address(oracle_id)?;
+                let oracle_id_arg = tx.pure(&oracle_id);
+                let expiry_arg = tx.pure(expiry_ms);
+                let lower_arg = tx.pure(lower_raw);
+                let upper_arg = tx.pure(upper_raw);
+
+                let key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("range_key"),
+                        Identifier::from_static("new"),
+                    ),
+                    vec![oracle_id_arg, expiry_arg, lower_arg, upper_arg],
+                );
+
+                command_index += 1;
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict_manager"),
+                        Identifier::from_static("range_position"),
+                    ),
+                    vec![manager_arg, key],
+                );
+
+                result_command_indices.push(command_index);
+                command_index += 1;
+            }
+        }
+    }
+
+    tx.set_sender(sender_address);
+    tx.set_gas_budget(1_000_000);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(Address::ZERO, 1, Digest::ZERO)]);
+
+    let transaction = tx.try_build().map_err(|err| QuoteTxBuildError::Build(err.to_string()))?;
+
+    let bytes =
+        bcs::to_bytes(&transaction.kind).map_err(|err| QuoteTxBuildError::Bcs(err.to_string()))?;
+
+    Ok(QuoteTxKind {
+        sender: sender.to_string(),
+        tx_kind_b64: BASE64.encode(bytes),
+        quote_result_command_indices: result_command_indices,
+    })
 }
 
 fn parse_address(value: &str) -> Result<Address, QuoteTxBuildError> {
