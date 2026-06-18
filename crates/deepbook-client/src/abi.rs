@@ -114,7 +114,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
         source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict.move",
     },
 
-    
+
     ExpectedAbiFunction {
         module: "predict",
         function: "redeem",
