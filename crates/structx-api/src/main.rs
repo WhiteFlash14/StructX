@@ -51,6 +51,12 @@ struct ParseIntentRequest {
     time_preference: Option<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct CompileFromIntentRequest {
+    owner: String,
+    intent: serde_json::Value,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone)]
 struct ParsedIntent {
     ok: bool,
@@ -194,6 +200,7 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/intent/parse", post(parse_intent))
+        .route("/api/strategies/compile-from-intent", post(compile_from_intent))
         .route("/api/strategies/compile", post(compile_strategy))
         .route("/api/tx/build-open-strategy", post(build_open_strategy))
         .route("/api/tx/audit-open-strategy", post(audit_open_strategy))
@@ -216,6 +223,91 @@ async fn main() {
     axum::serve(tokio::net::TcpListener::bind(addr).await.expect("bind API listener"), app)
         .await
         .expect("serve API");
+}
+
+async fn compile_from_intent(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CompileFromIntentRequest>,
+) -> impl IntoResponse {
+    let Some(strategy) = req.intent.get("recommendedStrategy").and_then(serde_json::Value::as_str)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "intent missing recommendedStrategy"
+            })),
+        );
+    };
+
+    let Some(style) = req.intent.get("recommendedStyle").and_then(serde_json::Value::as_str) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "intent missing recommendedStyle"
+            })),
+        );
+    };
+
+    let Some(budget_dusdc) = req.intent.get("budgetDUSDC").and_then(serde_json::Value::as_str)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "intent missing budgetDUSDC"
+            })),
+        );
+    };
+
+    let args = vec![
+        "compile-strategy-json".to_string(),
+        "--owner".to_string(),
+        req.owner.clone(),
+        "--strategy".to_string(),
+        strategy.to_string(),
+        "--budget-dusdc".to_string(),
+        budget_dusdc.to_string(),
+        "--style".to_string(),
+        style.to_string(),
+        "--expiry-preference".to_string(),
+        "nearest_active".to_string(),
+        "--slippage-bps".to_string(),
+        "100".to_string(),
+    ];
+
+    match run_cli_value(&state, args).await {
+        Ok(mut compiled) => {
+            if let Some(obj) = compiled.as_object_mut() {
+                obj.insert(
+                    "recommendation".to_string(),
+                    serde_json::json!({
+                        "source": "AI_INTENT_PLUS_DETERMINISTIC_COMPILER",
+                        "intent": req.intent,
+                        "reasoningSummary": req.intent
+                            .get("reasoningSummary")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::String(
+                                "Strategy selected from parsed user intent.".to_string()
+                            )),
+                        "confidence": req.intent
+                            .get("confidence")
+                            .cloned()
+                            .unwrap_or(serde_json::Value::from(0.65))
+                    }),
+                );
+            }
+
+            if let Some(id) = compiled.get("compiledStrategyId").and_then(serde_json::Value::as_str)
+            {
+                state.compiled.lock().await.insert(id.to_string(), compiled.clone());
+            }
+
+            (StatusCode::OK, Json(compiled))
+        }
+        Err((status, value)) => (status, Json(value)),
+    }
 }
 
 async fn parse_intent(Json(req): Json<ParseIntentRequest>) -> impl IntoResponse {
