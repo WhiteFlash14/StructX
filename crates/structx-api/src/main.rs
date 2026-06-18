@@ -10,7 +10,6 @@ use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc};
 use tokio::{process::Command, sync::Mutex};
 use tower_http::cors::CorsLayer;
 
-
 const PREDICT_PACKAGE_ID: &str =
     "0xf5ea2b3749c65d6e56507cc35388719aadb28f9cab873696a2f8687f5c785138";
 const PREDICT_OBJECT_ID: &str =
@@ -39,7 +38,6 @@ struct CliResponse {
     stdout: String,
     stderr: String,
 }
-
 
 #[derive(Debug, Deserialize)]
 struct BuildOpenStrategyRequest {
@@ -151,10 +149,7 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("target/debug/structx-cli"));
 
-    let state = Arc::new(AppState {
-        cli_bin,
-        compiled: Arc::new(Mutex::new(HashMap::new())),
-    });
+    let state = Arc::new(AppState { cli_bin, compiled: Arc::new(Mutex::new(HashMap::new())) });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -163,6 +158,7 @@ async fn main() {
         .route("/api/tx/audit-open-strategy", post(audit_open_strategy))
         .route("/api/demo-status", post(demo_status))
         .route("/api/manager-balance", post(manager_balance))
+        .route("/api/manager-balance-json", post(manager_balance_json))
         .route("/api/manager-positions", post(manager_positions))
         .route("/api/audit-execution", post(audit_execution))
         .route("/api/devinspect-mint-breakout", post(devinspect_mint_breakout))
@@ -211,15 +207,8 @@ async fn compile_strategy(
 
     match run_cli_value(&state, args).await {
         Ok(value) => {
-            if let Some(id) = value
-                .get("compiledStrategyId")
-                .and_then(serde_json::Value::as_str)
-            {
-                state
-                    .compiled
-                    .lock()
-                    .await
-                    .insert(id.to_string(), value.clone());
+            if let Some(id) = value.get("compiledStrategyId").and_then(serde_json::Value::as_str) {
+                state.compiled.lock().await.insert(id.to_string(), value.clone());
             }
 
             (StatusCode::OK, Json(value))
@@ -245,6 +234,63 @@ async fn demo_status(
         ],
     )
     .await
+}
+
+async fn manager_balance_json(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<ManagerBalanceRequest>,
+) -> impl IntoResponse {
+    let output = Command::new(&state.cli_bin)
+        .args(["manager-balance", "--manager-id", req.manager_id.as_str()])
+        .output()
+        .await;
+
+    let Ok(output) = output else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "failed to run manager-balance CLI"
+            })),
+        );
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "stdout": stdout,
+                "stderr": stderr
+            })),
+        );
+    }
+
+    let Some(balance_raw) = extract_balance_raw_from_stdout(&stdout) else {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "stdout": stdout,
+                "stderr": "failed to parse balance raw"
+            })),
+        );
+    };
+
+    let display = format_dusdc_raw(balance_raw);
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "balanceRaw": balance_raw.to_string(),
+            "balanceDisplay": display,
+            "stdout": stdout
+        })),
+    )
 }
 
 async fn manager_balance(
@@ -346,7 +392,6 @@ async fn devinspect_redeem_breakout(
     run_cli_json(state, args).await
 }
 
-
 async fn build_open_strategy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<BuildOpenStrategyRequest>,
@@ -386,22 +431,26 @@ async fn build_open_strategy(
         );
     }
 
-    let oracle_id = compiled
-        .get("oracleId")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or_default();
+    let oracle_id =
+        compiled.get("oracleId").and_then(serde_json::Value::as_str).unwrap_or_default();
 
-    let legs = compiled
-        .get("legs")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let raw_legs =
+        compiled.get("legs").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
 
-    let warnings = compiled
-        .get("warnings")
-        .and_then(serde_json::Value::as_array)
-        .cloned()
-        .unwrap_or_default();
+    let legs = legs_with_max_costs(raw_legs, req.slippage_bps);
+
+    let Some(expiry_ms) = compiled_expiry_ms(&req.compiled_strategy_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "compiledStrategyId missing expiry_ms"
+            })),
+        );
+    };
+
+    let warnings =
+        compiled.get("warnings").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
 
     (
         StatusCode::OK,
@@ -410,6 +459,7 @@ async fn build_open_strategy(
             "buildKind": "FRONTEND_TRANSACTION_BUILDER",
             "network": "sui:testnet",
             "compiledStrategyId": req.compiled_strategy_id,
+            "expiryMs": expiry_ms,
             "owner": req.owner,
             "managerId": req.manager_id,
             "predictPackageId": PREDICT_PACKAGE_ID,
@@ -425,6 +475,7 @@ async fn build_open_strategy(
                 "legs": legs
             },
             "warnings": warnings
+        
         })),
     )
 }
@@ -442,10 +493,7 @@ async fn audit_open_strategy(
 
     let path = std::env::temp_dir().join(format!(
         "structx_audit_{}.json",
-        artifact
-            .get("digest")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("unknown")
+        artifact.get("digest").and_then(serde_json::Value::as_str).unwrap_or("unknown")
     ));
 
     if let Err(err) = tokio::fs::write(
@@ -487,11 +535,7 @@ async fn audit_open_strategy(
     match Command::new(&state.cli_bin).args(args).output().await {
         Ok(output) => {
             let ok = output.status.success();
-            let status = if ok {
-                StatusCode::OK
-            } else {
-                StatusCode::BAD_REQUEST
-            };
+            let status = if ok { StatusCode::OK } else { StatusCode::BAD_REQUEST };
 
             (
                 status,
@@ -511,6 +555,65 @@ async fn audit_open_strategy(
                 "error": format!("failed to run audit CLI: {err}")
             })),
         ),
+    }
+}
+
+fn ceil_mul_bps(raw: &str, bps: u16) -> String {
+    let value = raw.parse::<u128>().unwrap_or(0);
+    let multiplier = 10_000u128 + bps as u128;
+
+    let out = value.saturating_mul(multiplier).saturating_add(9_999) / 10_000;
+
+    out.to_string()
+}
+
+fn compiled_expiry_ms(compiled_strategy_id: &str) -> Option<String> {
+    // breakout:{owner}:{oracle}:{expiry_ms}:{premium}:{style}
+    compiled_strategy_id.split(':').nth(3).map(ToOwned::to_owned)
+}
+
+fn legs_with_max_costs(legs: Vec<serde_json::Value>, slippage_bps: u16) -> Vec<serde_json::Value> {
+    legs.into_iter()
+        .map(|mut leg| {
+            if let Some(obj) = leg.as_object_mut() {
+                let premium_raw =
+                    obj.get("premiumRaw").and_then(serde_json::Value::as_str).unwrap_or("0");
+
+                obj.insert(
+                    "maxCostRaw".to_string(),
+                    serde_json::Value::String(ceil_mul_bps(premium_raw, slippage_bps)),
+                );
+            }
+
+            leg
+        })
+        .collect()
+}
+
+fn extract_balance_raw_from_stdout(stdout: &str) -> Option<u64> {
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+
+        if let Some(rest) = trimmed.strip_prefix("balance raw:") {
+            return rest.trim().parse::<u64>().ok();
+        }
+    }
+
+    None
+}
+
+fn format_dusdc_raw(raw: u64) -> String {
+    let whole = raw / 1_000_000;
+    let frac = raw % 1_000_000;
+
+    if frac == 0 {
+        format!("{whole}.00 dUSDC")
+    } else {
+        let mut frac_string = format!("{frac:06}");
+        while frac_string.ends_with('0') {
+            frac_string.pop();
+        }
+        format!("{whole}.{frac_string} dUSDC")
     }
 }
 
