@@ -220,6 +220,19 @@ enum Command {
         expect_exact: bool,
     },
 
+    DemoStatus {
+        #[arg(long)]
+        manager_id: String,
+
+        #[arg(long)]
+        sender: String,
+
+        #[arg(long)]
+        from_execution_json: PathBuf,
+
+        #[arg(long, default_value_t = false)]
+        expect_exact: bool,
+    },
     AuditExecution {
         #[arg(long)]
         from_execution_json: PathBuf,
@@ -237,7 +250,7 @@ enum Command {
 
         #[arg(long)]
         min_total_payout_raw: Option<u64>,
-    
+
         #[arg(long, default_value_t = false)]
         auto_size_down: bool,
 
@@ -255,7 +268,7 @@ enum Command {
 
         #[arg(long, default_value = "/tmp/structx_execute_redeem_breakout_plan.json")]
         execute_plan_json_path: PathBuf,
-},
+    },
     DevinspectMintBreakout {
         #[arg(long)]
         manager_id: String,
@@ -482,6 +495,10 @@ async fn main() -> std::process::ExitCode {
             .await
         }
 
+        Command::DemoStatus { manager_id, sender, from_execution_json, expect_exact } => {
+            demo_status_command(cli.rpc_url, manager_id, sender, from_execution_json, expect_exact)
+                .await
+        }
         Command::AuditExecution { from_execution_json } => {
             audit_execution_command(from_execution_json)
         }
@@ -491,8 +508,8 @@ async fn main() -> std::process::ExitCode {
             sender,
             from_execution_json,
             min_total_payout_raw,
-            auto_size_down,
             redeem_bps,
+            auto_size_down,
             write_execute_script,
             allow_zero_payout_script,
             execute_script_path,
@@ -511,30 +528,6 @@ async fn main() -> std::process::ExitCode {
                 execute_script_path,
                 execute_plan_json_path,
             })
-            .await
-        } => {
-            devinspect_redeem_breakout_command(DevinspectRedeemBreakoutArgs {
-                rpc_url: cli.rpc_url,
-                manager_id,
-                sender,
-                from_execution_json,
-                min_total_payout_raw,
-                auto_size_down,
-                redeem_bps,
-                write_execute_script,
-                allow_zero_payout_script,
-                execute_script_path,
-                execute_plan_json_path,
-            })
-            .await
-        } => {
-            devinspect_redeem_breakout_command(
-                cli.rpc_url,
-                manager_id,
-                sender,
-                from_execution_json,
-                min_total_payout_raw,
-            )
             .await
         }
         Command::DevinspectMintBreakout {
@@ -1604,6 +1597,170 @@ struct DevinspectMintBreakoutArgs {
     execute_plan_json_path: PathBuf,
 }
 
+async fn demo_status_command(
+    rpc_url: String,
+    manager_id: String,
+    sender: String,
+    from_execution_json: PathBuf,
+    expect_exact: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let execution_json: serde_json::Value =
+        serde_json::from_slice(&fs::read(&from_execution_json)?)?;
+
+    let digest =
+        execution_json.get("digest").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+
+    let status = execution_json
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    println!("StructX demo status");
+    println!("execution json: {}", display_path(&from_execution_json));
+    println!("digest: {digest}");
+    println!("execution status: {status}");
+    println!();
+
+    if status != "success" {
+        return Err(io::Error::other("execution JSON status is not success").into());
+    }
+
+    let reads = load_position_reads_from_execution_json(&from_execution_json)?;
+
+    if reads.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no PositionMinted or RangeMinted events found",
+        )
+        .into());
+    }
+
+    print_demo_minted_legs(&execution_json)?;
+
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+    let manager = resolve_sui_object(&rpc, &manager_id).await?;
+
+    println!();
+    print_manager_preflight(&manager);
+    validate_predict_manager_object(&manager)?;
+
+    let balance_tx = build_manager_balance_tx_kind(&manager, &sender)?;
+    let balance_response =
+        rpc.dev_inspect_transaction_kind(&balance_tx.sender, &balance_tx.tx_kind_b64).await?;
+
+    let balance_raw = read_manager_balance_from_response(&balance_response)?;
+
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+    println!("Manager balance");
+    println!("balance raw: {balance_raw}");
+    println!("balance: {}", asset.format_amount(balance_raw));
+    println!();
+
+    let positions_tx = build_manager_positions_tx_kind(&reads, &manager, &sender)?;
+
+    let positions_response =
+        rpc.dev_inspect_transaction_kind(&positions_tx.sender, &positions_tx.tx_kind_b64).await?;
+
+    print_manager_positions_response(&reads, &positions_tx, &positions_response, expect_exact)?;
+
+    println!();
+    println!("Demo proof: ok");
+    println!("quote → guard → mint execution → manager balance → manager position verification");
+
+    Ok(())
+}
+
+fn print_demo_minted_legs(
+    execution_json: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let events = execution_json
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing events array"))?;
+
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+    let mut total_cost_raw = 0u64;
+    let mut minted_count = 0usize;
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "#",
+        "event",
+        "direction",
+        "strike/lower",
+        "upper",
+        "quantity",
+        "cost raw",
+        "cost",
+    ]);
+
+    for event in events {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+
+        let parsed = event.get("parsedJson").unwrap_or(&serde_json::Value::Null);
+
+        if event_type.ends_with("::predict::PositionMinted") {
+            let cost = json_required_u64(parsed, "cost")?;
+            total_cost_raw = total_cost_raw
+                .checked_add(cost)
+                .ok_or_else(|| io::Error::other("total cost overflow"))?;
+
+            let is_up = json_required_bool(parsed, "is_up")?;
+
+            table.add_row(vec![
+                Cell::new(minted_count),
+                Cell::new("PositionMinted"),
+                Cell::new(if is_up { "up" } else { "down" }),
+                Cell::new(format_raw_price_e9(json_required_u64(parsed, "strike")?)),
+                Cell::new("—"),
+                Cell::new(json_required_u64(parsed, "quantity")?),
+                Cell::new(cost),
+                Cell::new(asset.format_amount(cost)),
+            ]);
+
+            minted_count += 1;
+        } else if event_type.ends_with("::predict::RangeMinted") {
+            let cost = json_required_u64(parsed, "cost")?;
+            total_cost_raw = total_cost_raw
+                .checked_add(cost)
+                .ok_or_else(|| io::Error::other("total cost overflow"))?;
+
+            table.add_row(vec![
+                Cell::new(minted_count),
+                Cell::new("RangeMinted"),
+                Cell::new("—"),
+                Cell::new(format_raw_price_e9(json_required_u64(parsed, "lower_strike")?)),
+                Cell::new(format_raw_price_e9(json_required_u64(parsed, "higher_strike")?)),
+                Cell::new(json_required_u64(parsed, "quantity")?),
+                Cell::new(cost),
+                Cell::new(asset.format_amount(cost)),
+            ]);
+
+            minted_count += 1;
+        }
+    }
+
+    if minted_count == 0 {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "no minted events found").into());
+    }
+
+    println!("Minted legs");
+    println!("{table}");
+    println!();
+
+    println!("Mint cost summary");
+    println!("minted legs: {minted_count}");
+    println!("total cost raw: {total_cost_raw}");
+    println!("total cost: {}", asset.format_amount(total_cost_raw));
+
+    Ok(())
+}
+
 fn audit_execution_command(from_execution_json: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let value: serde_json::Value = serde_json::from_slice(&fs::read(&from_execution_json)?)?;
 
@@ -1718,7 +1875,6 @@ fn audit_execution_command(from_execution_json: PathBuf) -> Result<(), Box<dyn s
     Ok(())
 }
 
-
 struct DevinspectRedeemBreakoutArgs {
     rpc_url: String,
     manager_id: String,
@@ -1767,27 +1923,17 @@ async fn devinspect_redeem_breakout_command(
 
     let tx_kind = build_redeem_tx_kind(
         &reads,
-        MintObjectRefs {
-            predict: &predict,
-            manager: &manager,
-            oracle: &oracle,
-            clock: &clock,
-        },
+        MintObjectRefs { predict: &predict, manager: &manager, oracle: &oracle, clock: &clock },
         &args.sender,
     )?;
 
     println!("Built redeem TransactionKind");
     println!("sender: {}", tx_kind.sender);
     println!("tx_kind_b64_len: {}", tx_kind.tx_kind_b64.len());
-    println!(
-        "redeem command indices: {:?}",
-        tx_kind.quote_result_command_indices
-    );
+    println!("redeem command indices: {:?}", tx_kind.quote_result_command_indices);
     println!();
 
-    let response = rpc
-        .dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64)
-        .await?;
+    let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
 
     let total_payout_raw = print_devinspect_redeem_response(&response)?;
 
@@ -1828,7 +1974,6 @@ async fn devinspect_redeem_breakout_command(
     Ok(())
 }
 
-
 fn write_execute_redeem_artifacts(
     args: &DevinspectRedeemBreakoutArgs,
     reads: &[ManagerPositionRead],
@@ -1848,10 +1993,7 @@ fn write_execute_redeem_artifacts(
     }
 
     let manifest = build_execute_redeem_manifest(args, reads, total_payout_raw);
-    fs::write(
-        &args.execute_plan_json_path,
-        serde_json::to_string_pretty(&manifest)?,
-    )?;
+    fs::write(&args.execute_plan_json_path, serde_json::to_string_pretty(&manifest)?)?;
 
     println!();
     println!("Fresh executable redeem artifacts written");
@@ -1872,10 +2014,7 @@ fn build_execute_redeem_manifest(
     reads: &[ManagerPositionRead],
     total_payout_raw: u64,
 ) -> serde_json::Value {
-    let asset = QuoteAssetDisplay {
-        symbol: "dUSDC".to_string(),
-        decimals: DUSDC_DECIMALS,
-    };
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
 
     let legs = reads
         .iter()
@@ -1946,7 +2085,9 @@ fn build_execute_redeem_script(
     out.push_str("set -euo pipefail\n\n");
 
     out.push_str("# Fresh StructX redeem script generated only after successful devInspect.\n");
-    out.push_str("# Execute immediately; Predict pricing/settlement checks can change between runs.\n\n");
+    out.push_str(
+        "# Execute immediately; Predict pricing/settlement checks can change between runs.\n\n",
+    );
 
     out.push_str(&format!("export PREDICT_PACKAGE={}\n", PREDICT_PACKAGE_ID));
     out.push_str(&format!("export PREDICT_OBJECT_ID={}\n", PREDICT_OBJECT_ID));
@@ -1970,11 +2111,7 @@ fn build_execute_redeem_script(
 
         match read {
             ManagerPositionRead::Binary {
-                expiry_ms,
-                strike_raw,
-                is_up,
-                expected_quantity,
-                ..
+                expiry_ms, strike_raw, is_up, expected_quantity, ..
             } => {
                 let key_function = if *is_up { "up" } else { "down" };
 
