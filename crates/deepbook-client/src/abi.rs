@@ -113,6 +113,23 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
         source_note: "predict.move + official Predict docs",
         source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict.move",
     },
+
+    ExpectedAbiFunction {
+        module: "predict_manager",
+        function: "position",
+        expected_parameters: &[PREDICT_MANAGER_REF, MARKET_KEY],
+        expected_returns: &["U64"],
+        source_note: "predict_manager.move + official PredictManager docs",
+        source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict_manager.move",
+    },
+    ExpectedAbiFunction {
+        module: "predict_manager",
+        function: "range_position",
+        expected_parameters: &[PREDICT_MANAGER_REF, RANGE_KEY],
+        expected_returns: &["U64"],
+        source_note: "predict_manager.move + official PredictManager docs",
+        source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict_manager.move",
+    },
 ExpectedAbiFunction {
         module: "market_key",
         function: "up",
@@ -419,6 +436,22 @@ mod tests {
                             {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}}
                         ],
                         "return": ["U64"]
+                    },
+                    "position": {
+                        "visibility": "Public",
+                        "parameters": [
+                            {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}},
+                            {"Struct":{"address":PREDICT_PACKAGE,"module":"market_key","name":"MarketKey","typeArguments":[]}}
+                        ],
+                        "return": ["U64"]
+                    },
+                    "range_position": {
+                        "visibility": "Public",
+                        "parameters": [
+                            {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}},
+                            {"Struct":{"address":PREDICT_PACKAGE,"module":"range_key","name":"RangeKey","typeArguments":[]}}
+                        ],
+                        "return": ["U64"]
                     }
                 }
             },
@@ -469,7 +502,7 @@ mod tests {
         let report = verify_predict_abi(PREDICT_PACKAGE, &modules);
 
         assert!(report.is_pass());
-        assert_eq!(report.checks.len(), 9);
+        assert_eq!(report.checks.len(), 11);
     }
 
     #[test]
