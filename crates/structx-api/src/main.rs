@@ -40,6 +40,46 @@ struct CliResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ParseIntentRequest {
+    owner: String,
+    message: String,
+    #[serde(rename = "budgetDUSDC")]
+    budget_dusdc: Option<String>,
+    #[serde(rename = "riskPreference")]
+    risk_preference: Option<String>,
+    #[serde(rename = "timePreference")]
+    time_preference: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct ParsedIntent {
+    ok: bool,
+    #[serde(rename = "intentId")]
+    intent_id: String,
+    owner: String,
+    #[serde(rename = "rawMessage")]
+    raw_message: String,
+    asset: String,
+    goal: String,
+    #[serde(rename = "budgetDUSDC")]
+    budget_dusdc: String,
+    #[serde(rename = "riskPreference")]
+    risk_preference: String,
+    #[serde(rename = "timePreference")]
+    time_preference: String,
+    #[serde(rename = "recommendedStrategy")]
+    recommended_strategy: String,
+    #[serde(rename = "recommendedStyle")]
+    recommended_style: String,
+    confidence: f64,
+    #[serde(rename = "reasoningSummary")]
+    reasoning_summary: String,
+    #[serde(rename = "missingFields")]
+    missing_fields: Vec<String>,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct BuildOpenStrategyRequest {
     owner: String,
     #[serde(rename = "managerId")]
@@ -153,6 +193,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/api/intent/parse", post(parse_intent))
         .route("/api/strategies/compile", post(compile_strategy))
         .route("/api/tx/build-open-strategy", post(build_open_strategy))
         .route("/api/tx/audit-open-strategy", post(audit_open_strategy))
@@ -175,6 +216,31 @@ async fn main() {
     axum::serve(tokio::net::TcpListener::bind(addr).await.expect("bind API listener"), app)
         .await
         .expect("serve API");
+}
+
+async fn parse_intent(Json(req): Json<ParseIntentRequest>) -> impl IntoResponse {
+    let parsed = match parse_intent_with_openai_or_fallback(&req).await {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let mut fallback = deterministic_parse_intent(&req);
+            fallback.warnings.push(format!("AI parser failed; deterministic fallback used: {err}"));
+            fallback
+        }
+    };
+
+    if !parsed.missing_fields.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "missingFields": parsed.missing_fields,
+                "clarifyingQuestion": build_clarifying_question(&parsed),
+                "fallbackIntent": parsed
+            })),
+        );
+    }
+
+    (StatusCode::OK, Json(serde_json::to_value(parsed).unwrap()))
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
@@ -475,7 +541,7 @@ async fn build_open_strategy(
                 "legs": legs
             },
             "warnings": warnings
-        
+
         })),
     )
 }
@@ -615,6 +681,402 @@ fn format_dusdc_raw(raw: u64) -> String {
         }
         format!("{whole}.{frac_string} dUSDC")
     }
+}
+
+async fn parse_intent_with_openai_or_fallback(
+    req: &ParseIntentRequest,
+) -> Result<ParsedIntent, Box<dyn std::error::Error + Send + Sync>> {
+    let api_key = match std::env::var("OPENAI_API_KEY") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(deterministic_parse_intent(req)),
+    };
+
+    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "asset",
+            "goal",
+            "budgetDUSDC",
+            "riskPreference",
+            "timePreference",
+            "recommendedStrategy",
+            "recommendedStyle",
+            "confidence",
+            "reasoningSummary",
+            "missingFields",
+            "warnings"
+        ],
+        "properties": {
+            "asset": {
+                "type": "string",
+                "enum": ["BTC"]
+            },
+            "goal": {
+                "type": "string",
+                "enum": [
+                    "downside_protection",
+                    "upside_speculation",
+                    "two_sided_breakout",
+                    "range_income",
+                    "unknown"
+                ]
+            },
+            "budgetDUSDC": {
+                "type": "string"
+            },
+            "riskPreference": {
+                "type": "string",
+                "enum": ["conservative", "balanced", "aggressive"]
+            },
+            "timePreference": {
+                "type": "string",
+                "enum": ["nearest_active", "today", "this_week"]
+            },
+            "recommendedStrategy": {
+                "type": "string",
+                "enum": ["BREAKOUT_PROTECTION"]
+            },
+            "recommendedStyle": {
+                "type": "string",
+                "enum": ["tail-heavy", "balanced", "higher-hit-rate"]
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+            },
+            "reasoningSummary": {
+                "type": "string"
+            },
+            "missingFields": {
+                "type": "array",
+                "items": { "type": "string" }
+            },
+            "warnings": {
+                "type": "array",
+                "items": { "type": "string" }
+            }
+        }
+    });
+
+    let input = format!(
+        r#"
+You are the StructX intent parser.
+
+StructX is a non-custodial structured payoff builder on DeepBook Predict testnet.
+You do not give financial advice.
+You only convert user intent into strict JSON for deterministic compiler logic.
+Supported asset: BTC only.
+Supported strategy for this milestone: BREAKOUT_PROTECTION only.
+Supported expiry preference: nearest_active.
+
+Rules:
+- If the user wants protection, crash hedge, dump protection, or downside coverage, goal = downside_protection.
+- If the user wants a big move either direction, volatility, or breakout, goal = two_sided_breakout.
+- If the user wants moonshot/upside/rally exposure, goal = upside_speculation.
+- conservative -> higher-hit-rate unless user explicitly asks for tail.
+- aggressive/max payout -> tail-heavy.
+- balanced/default -> balanced.
+- If budget is missing, include missingFields ["budgetDUSDC"].
+- If budget is provided separately, use that.
+- Never invent unsupported strategies.
+- Always include testnet and not-financial-advice warnings.
+
+Owner: {owner}
+User message: {message}
+Provided budgetDUSDC: {budget}
+Provided riskPreference: {risk}
+Provided timePreference: {time}
+"#,
+        owner = req.owner,
+        message = req.message,
+        budget = req.budget_dusdc.clone().unwrap_or_default(),
+        risk = req.risk_preference.clone().unwrap_or_default(),
+        time = req.time_preference.clone().unwrap_or_default(),
+    );
+
+    let body = serde_json::json!({
+        "model": model,
+        "input": input,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "structx_intent",
+                "strict": true,
+                "schema": schema
+            }
+        }
+    });
+
+    let client = reqwest::Client::new();
+    let response = client
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?;
+
+    let text = extract_openai_text(&response).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "OpenAI response missing structured output text",
+        )
+    })?;
+
+    let value: serde_json::Value = serde_json::from_str(&text)?;
+    let mut parsed = parsed_intent_from_value(req, value)?;
+    validate_and_rewrite_intent(&mut parsed);
+
+    Ok(parsed)
+}
+
+fn extract_openai_text(response: &serde_json::Value) -> Option<String> {
+    let output = response.get("output")?.as_array()?;
+
+    for item in output {
+        let content = item.get("content")?.as_array()?;
+
+        for part in content {
+            if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                return Some(text.to_string());
+            }
+        }
+    }
+
+    None
+}
+
+fn parsed_intent_from_value(
+    req: &ParseIntentRequest,
+    value: serde_json::Value,
+) -> Result<ParsedIntent, Box<dyn std::error::Error + Send + Sync>> {
+    let mut parsed = ParsedIntent {
+        ok: true,
+        intent_id: format!("intent_{}", stable_intent_id(&req.owner, &req.message)),
+        owner: req.owner.clone(),
+        raw_message: req.message.clone(),
+        asset: value.get("asset").and_then(serde_json::Value::as_str).unwrap_or("BTC").to_string(),
+        goal: value
+            .get("goal")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("two_sided_breakout")
+            .to_string(),
+        budget_dusdc: value
+            .get("budgetDUSDC")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        risk_preference: value
+            .get("riskPreference")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("balanced")
+            .to_string(),
+        time_preference: value
+            .get("timePreference")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("nearest_active")
+            .to_string(),
+        recommended_strategy: value
+            .get("recommendedStrategy")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("BREAKOUT_PROTECTION")
+            .to_string(),
+        recommended_style: value
+            .get("recommendedStyle")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("balanced")
+            .to_string(),
+        confidence: value.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.65),
+        reasoning_summary: value
+            .get("reasoningSummary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Strategy selected from parsed user intent.")
+            .to_string(),
+        missing_fields: value
+            .get("missingFields")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items.iter().filter_map(serde_json::Value::as_str).map(ToOwned::to_owned).collect()
+            })
+            .unwrap_or_default(),
+        warnings: value
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items.iter().filter_map(serde_json::Value::as_str).map(ToOwned::to_owned).collect()
+            })
+            .unwrap_or_default(),
+    };
+
+    if parsed.budget_dusdc.is_empty() {
+        if let Some(budget) = &req.budget_dusdc {
+            parsed.budget_dusdc = budget.clone();
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn deterministic_parse_intent(req: &ParseIntentRequest) -> ParsedIntent {
+    let msg = req.message.to_lowercase();
+
+    let goal = if contains_any(
+        &msg,
+        &["protect", "protection", "hedge", "downside", "dump", "crash", "sell-off", "selldown"],
+    ) {
+        "downside_protection"
+    } else if contains_any(&msg, &["moon", "upside", "rally", "pump", "breaks up", "breakout up"]) {
+        "upside_speculation"
+    } else {
+        "two_sided_breakout"
+    };
+
+    let risk =
+        req.risk_preference.clone().unwrap_or_else(|| infer_risk_preference(&msg).to_string());
+
+    let style = style_from_goal_and_risk(goal, &risk).to_string();
+
+    let budget = req.budget_dusdc.clone().unwrap_or_default();
+
+    let mut missing_fields = Vec::new();
+    if budget.trim().is_empty() {
+        missing_fields.push("budgetDUSDC".to_string());
+    }
+
+    ParsedIntent {
+        ok: missing_fields.is_empty(),
+        intent_id: format!("intent_{}", stable_intent_id(&req.owner, &req.message)),
+        owner: req.owner.clone(),
+        raw_message: req.message.clone(),
+        asset: "BTC".to_string(),
+        goal: goal.to_string(),
+        budget_dusdc: budget,
+        risk_preference: normalize_risk(&risk).to_string(),
+        time_preference: req
+            .time_preference
+            .clone()
+            .unwrap_or_else(|| "nearest_active".to_string()),
+        recommended_strategy: "BREAKOUT_PROTECTION".to_string(),
+        recommended_style: style,
+        confidence: 0.62,
+        reasoning_summary: reasoning_for_goal(goal).to_string(),
+        missing_fields,
+        warnings: vec![
+            "AI-assisted strategy discovery is not financial advice.".to_string(),
+            "DeepBook Predict integration is testnet-only.".to_string(),
+            "Final premium, payoff, and transaction are produced by deterministic StructX compiler logic."
+                .to_string(),
+        ],
+    }
+}
+
+fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
+    parsed.asset = "BTC".to_string();
+    parsed.recommended_strategy = "BREAKOUT_PROTECTION".to_string();
+
+    parsed.risk_preference = normalize_risk(&parsed.risk_preference).to_string();
+
+    if !matches!(parsed.time_preference.as_str(), "nearest_active" | "today" | "this_week") {
+        parsed.time_preference = "nearest_active".to_string();
+    }
+
+    if !matches!(parsed.recommended_style.as_str(), "tail-heavy" | "balanced" | "higher-hit-rate") {
+        parsed.recommended_style =
+            style_from_goal_and_risk(&parsed.goal, &parsed.risk_preference).to_string();
+    }
+
+    if parsed.budget_dusdc.trim().is_empty()
+        && !parsed.missing_fields.contains(&"budgetDUSDC".to_string())
+    {
+        parsed.missing_fields.push("budgetDUSDC".to_string());
+    }
+
+    if !parsed
+        .warnings
+        .iter()
+        .any(|warning| warning.to_lowercase().contains("not financial advice"))
+    {
+        parsed.warnings.push("AI-assisted strategy discovery is not financial advice.".to_string());
+    }
+
+    if !parsed.warnings.iter().any(|warning| warning.to_lowercase().contains("testnet")) {
+        parsed.warnings.push("DeepBook Predict integration is testnet-only.".to_string());
+    }
+
+    parsed.ok = parsed.missing_fields.is_empty();
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn infer_risk_preference(message: &str) -> &'static str {
+    if contains_any(message, &["safe", "safer", "conservative", "higher probability", "likely"]) {
+        "conservative"
+    } else if contains_any(message, &["aggressive", "max payout", "lottery", "tail", "cheap"]) {
+        "aggressive"
+    } else {
+        "balanced"
+    }
+}
+
+fn normalize_risk(value: &str) -> &'static str {
+    match value {
+        "conservative" => "conservative",
+        "aggressive" => "aggressive",
+        _ => "balanced",
+    }
+}
+
+fn style_from_goal_and_risk(goal: &str, risk: &str) -> &'static str {
+    match (goal, risk) {
+        (_, "conservative") => "higher-hit-rate",
+        (_, "aggressive") => "tail-heavy",
+        ("downside_protection", _) => "tail-heavy",
+        ("upside_speculation", _) => "tail-heavy",
+        ("two_sided_breakout", _) => "balanced",
+        _ => "balanced",
+    }
+}
+
+fn reasoning_for_goal(goal: &str) -> &'static str {
+    match goal {
+        "downside_protection" => {
+            "Breakout Protection is recommended because it can allocate more exposure to downside tail protection while keeping risk defined by the premium."
+        }
+        "upside_speculation" => {
+            "Breakout Protection is recommended for this milestone because Moonshot Upside execution is not yet live, while the breakout structure can still express upside participation."
+        }
+        "two_sided_breakout" => {
+            "Breakout Protection is recommended because the user is expressing a large-move view without requiring a single direction."
+        }
+        _ => "Breakout Protection is recommended as the currently supported defined-risk strategy.",
+    }
+}
+
+fn build_clarifying_question(parsed: &ParsedIntent) -> String {
+    if parsed.missing_fields.iter().any(|field| field == "budgetDUSDC") {
+        "How much dUSDC do you want to allocate?".to_string()
+    } else {
+        "Can you clarify your budget, goal, and preferred time horizon?".to_string()
+    }
+}
+
+fn stable_intent_id(owner: &str, message: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+
+    for byte in owner.bytes().chain(message.bytes()) {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+
+    format!("{hash:x}")
 }
 
 async fn run_cli_value(
