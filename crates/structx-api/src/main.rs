@@ -31,6 +31,19 @@ struct CliResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct CompileStrategyRequest {
+    owner: String,
+    strategy: String,
+    #[serde(rename = "budgetDUSDC")]
+    budget_dusdc: String,
+    style: String,
+    #[serde(rename = "expiryPreference")]
+    expiry_preference: String,
+    #[serde(rename = "slippageBps")]
+    slippage_bps: u16,
+}
+
+#[derive(Debug, Deserialize)]
 struct DemoStatusRequest {
     manager_id: String,
     sender: String,
@@ -104,6 +117,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/api/strategies/compile", post(compile_strategy))
         .route("/api/demo-status", post(demo_status))
         .route("/api/manager-balance", post(manager_balance))
         .route("/api/manager-positions", post(manager_positions))
@@ -130,6 +144,31 @@ async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
         service: "structx-api",
         cli_bin: state.cli_bin.to_string_lossy().to_string(),
     })
+}
+
+async fn compile_strategy(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CompileStrategyRequest>,
+) -> impl IntoResponse {
+    run_cli_value_json(
+        state,
+        vec![
+            "compile-strategy-json".to_string(),
+            "--owner".to_string(),
+            req.owner,
+            "--strategy".to_string(),
+            req.strategy,
+            "--budget-dusdc".to_string(),
+            req.budget_dusdc,
+            "--style".to_string(),
+            req.style,
+            "--expiry-preference".to_string(),
+            req.expiry_preference,
+            "--slippage-bps".to_string(),
+            req.slippage_bps.to_string(),
+        ],
+    )
+    .await
 }
 
 async fn demo_status(
@@ -248,6 +287,51 @@ async fn devinspect_redeem_breakout(
     }
 
     run_cli_json(state, args).await
+}
+
+async fn run_cli_value_json(state: Arc<AppState>, args: Vec<String>) -> impl IntoResponse {
+    match Command::new(&state.cli_bin).args(&args).output().await {
+        Ok(output) => {
+            let code = output.status.code();
+            let ok = output.status.success();
+            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+            if ok {
+                match serde_json::from_str::<serde_json::Value>(&stdout) {
+                    Ok(value) => (StatusCode::OK, Json(value)),
+                    Err(err) => (
+                        StatusCode::INTERNAL_SERVER_ERROR,
+                        Json(serde_json::json!({
+                            "ok": false,
+                            "code": code,
+                            "stdout": stdout,
+                            "stderr": format!("CLI returned non-JSON stdout: {err}; stderr: {stderr}")
+                        })),
+                    ),
+                }
+            } else {
+                (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "code": code,
+                        "stdout": stdout,
+                        "stderr": stderr
+                    })),
+                )
+            }
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "code": null,
+                "stdout": "",
+                "stderr": format!("failed to run CLI: {err}")
+            })),
+        ),
+    }
 }
 
 async fn run_cli_json(state: Arc<AppState>, args: Vec<String>) -> impl IntoResponse {

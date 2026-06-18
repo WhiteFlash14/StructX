@@ -16,10 +16,11 @@ use deepbook_client::{
 use structx_core::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
     build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
-    compile_breakout, guard_quote_preview, select_best_market, select_candidate_markets,
-    CompiledPayoff, DisplayPrice, ManagerPositionRead, MintObjectRefs, PredictLeg, PriceScale,
-    QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview,
-    QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
+    compile_breakout, guard_quote_preview, optimize_breakout_quantities, select_best_market,
+    select_candidate_markets, BreakoutAskInputs, BreakoutStyle, CompiledPayoff, DisplayPrice,
+    ManagerPositionRead, MintObjectRefs, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall,
+    QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind,
+    SelectedMarket, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -220,6 +221,34 @@ enum Command {
         expect_exact: bool,
     },
 
+    CompileStrategyJson {
+        #[arg(long)]
+        owner: String,
+
+        #[arg(long, default_value = "BREAKOUT_PROTECTION")]
+        strategy: String,
+
+        #[arg(long)]
+        budget_dusdc: String,
+
+        #[arg(long, default_value = "balanced")]
+        style: String,
+
+        #[arg(long, default_value = "nearest_active")]
+        expiry_preference: String,
+
+        #[arg(long, default_value_t = 100)]
+        slippage_bps: u16,
+
+        #[arg(long, default_value_t = 250.0)]
+        bucket_step_usd: f64,
+
+        #[arg(long, default_value_t = 4)]
+        levels_each_side: u32,
+
+        #[arg(long, default_value_t = 5)]
+        max_quote_market_attempts: usize,
+    },
     DemoStatus {
         #[arg(long)]
         manager_id: String,
@@ -495,6 +524,33 @@ async fn main() -> std::process::ExitCode {
             .await
         }
 
+        Command::CompileStrategyJson {
+            owner,
+            strategy,
+            budget_dusdc,
+            style,
+            expiry_preference,
+            slippage_bps,
+            bucket_step_usd,
+            levels_each_side,
+            max_quote_market_attempts,
+        } => {
+            compile_strategy_json_command(CompileStrategyJsonArgs {
+                server_url: cli.server_url,
+                predict_id: cli.predict_id,
+                rpc_url: cli.rpc_url,
+                owner,
+                strategy,
+                budget_dusdc,
+                style,
+                expiry_preference,
+                slippage_bps,
+                bucket_step: DisplayPrice(bucket_step_usd),
+                levels_each_side,
+                max_quote_market_attempts,
+            })
+            .await
+        }
         Command::DemoStatus { manager_id, sender, from_execution_json, expect_exact } => {
             demo_status_command(cli.rpc_url, manager_id, sender, from_execution_json, expect_exact)
                 .await
@@ -784,6 +840,21 @@ async fn plan_quote_breakout_command(
     Ok(())
 }
 
+struct CompileStrategyJsonArgs {
+    server_url: String,
+    predict_id: String,
+    rpc_url: String,
+    owner: String,
+    strategy: String,
+    budget_dusdc: String,
+    style: String,
+    expiry_preference: String,
+    slippage_bps: u16,
+    bucket_step: DisplayPrice,
+    levels_each_side: u32,
+    max_quote_market_attempts: usize,
+}
+
 struct DevinspectQuoteBreakoutArgs {
     server_url: String,
     predict_id: String,
@@ -948,6 +1019,107 @@ async fn devinspect_quote_for_selected_market(
     }
 
     Ok(())
+}
+
+fn quote_costs_from_response(
+    tx_kind: &QuoteTxKind,
+    response: &serde_json::Value,
+) -> Result<Vec<(u64, u64)>, Box<dyn std::error::Error>> {
+    let status = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+
+    let results = response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing devInspect results"))?;
+
+    let mut out = Vec::with_capacity(tx_kind.quote_result_command_indices.len());
+
+    for command_idx in &tx_kind.quote_result_command_indices {
+        let result = results.get(*command_idx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing result for command {command_idx}"),
+            )
+        })?;
+
+        let return_values =
+            result.get("returnValues").and_then(serde_json::Value::as_array).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing returnValues for command {command_idx}"),
+                )
+            })?;
+
+        if return_values.len() != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected 2 quote returns, got {}", return_values.len()),
+            )
+            .into());
+        }
+
+        let mint_cost_raw = decode_devinspect_u64(&return_values[0])?;
+        let redeem_payout_raw = decode_devinspect_u64(&return_values[1])?;
+
+        out.push((mint_cost_raw, redeem_payout_raw));
+    }
+
+    Ok(out)
+}
+
+fn infer_ask_price_raw(cost_raw: u64, quantity: u64) -> u64 {
+    if quantity == 0 {
+        return 0;
+    }
+
+    (((cost_raw as u128) * 1_000_000_000u128) / quantity as u128).max(1).min(u64::MAX as u128)
+        as u64
+}
+
+fn parse_dusdc_to_raw(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
+    let trimmed = value.trim();
+
+    if trimmed.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "empty budget").into());
+    }
+
+    let mut parts = trimmed.split('.');
+    let whole = parts.next().unwrap_or("0");
+    let frac = parts.next().unwrap_or("");
+
+    if parts.next().is_some() {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid decimal budget").into());
+    }
+
+    let whole_raw = whole
+        .parse::<u64>()?
+        .checked_mul(1_000_000)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "budget overflow"))?;
+
+    let mut frac_string = frac.to_string();
+
+    if frac_string.len() > 6 {
+        frac_string.truncate(6);
+    }
+
+    while frac_string.len() < 6 {
+        frac_string.push('0');
+    }
+
+    let frac_raw = if frac_string.is_empty() { 0 } else { frac_string.parse::<u64>()? };
+
+    whole_raw
+        .checked_add(frac_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "budget overflow").into())
 }
 
 fn print_devinspect_quote_response(
@@ -1601,6 +1773,328 @@ struct DevinspectMintBreakoutArgs {
 struct PositionCheckSummary {
     ok: usize,
     bad: usize,
+}
+
+async fn compile_strategy_json_command(
+    args: CompileStrategyJsonArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.strategy != "BREAKOUT_PROTECTION" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only BREAKOUT_PROTECTION is supported in this milestone",
+        )
+        .into());
+    }
+
+    if args.expiry_preference != "nearest_active" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only nearest_active expiry preference is supported in this milestone",
+        )
+        .into());
+    }
+
+    let budget_raw = parse_dusdc_to_raw(&args.budget_dusdc)?;
+    let style = BreakoutStyle::from_api_value(&args.style)?;
+
+    let freshness = build_freshness(60, 60, 300, false);
+    let client = build_client(args.server_url.clone(), args.predict_id.clone())?;
+    let markets = load_markets(&client, freshness).await?;
+    let candidates = select_candidate_markets(&markets, PriceScale::E9);
+
+    if candidates.is_empty() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "no quoteable market candidates").into()
+        );
+    }
+
+    let rpc = SuiRpcClient::new(args.rpc_url.clone(), StdDuration::from_secs(20))?;
+    let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
+
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+    let mut warnings = vec![
+        "DeepBook Predict integration is testnet-only for this milestone.".to_string(),
+        "Quote can change before signing; transaction build must apply slippage guard.".to_string(),
+        "Known issue: binary event-derived MarketKeys can read 0 while range positions verify correctly.".to_string(),
+    ];
+
+    let max_attempts = args.max_quote_market_attempts.min(candidates.len());
+    let probe_quantity = 1_000_000u64;
+
+    for selected in candidates.into_iter().take(max_attempts) {
+        let oracle = resolve_sui_object(&rpc, selected.oracle_id).await?;
+
+        if let Err(err) = validate_quote_object_refs(&predict, &oracle, &clock) {
+            warnings.push(format!("skipped oracle {}: {err}", selected.oracle_id));
+            continue;
+        }
+
+        let strikes = selected.grid.centered_strikes_by_display_step(
+            selected.spot_raw,
+            args.bucket_step,
+            args.levels_each_side,
+        )?;
+
+        let center = selected
+            .grid
+            .snap_nearest(selected.spot_raw)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
+
+        let center_idx = strikes
+            .iter()
+            .position(|strike| strike.raw == center.raw)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
+
+        if center_idx < 2 || center_idx + 2 >= strikes.len() {
+            warnings.push(format!(
+                "skipped oracle {}: not enough strikes around spot",
+                selected.oracle_id
+            ));
+            continue;
+        }
+
+        let k1 = strikes[center_idx - 2];
+        let k2 = strikes[center_idx - 1];
+        let k3 = strikes[center_idx + 1];
+        let k4 = strikes[center_idx + 2];
+
+        let probe_compiled = compile_breakout(k1, k2, k3, k4, probe_quantity, probe_quantity)?;
+
+        let probe_plan = build_quote_plan(&selected, &probe_compiled)?;
+
+        let probe_tx_kind = build_quote_tx_kind(
+            &probe_plan,
+            QuoteObjectRefs { predict: &predict, oracle: &oracle, clock: &clock },
+            &args.owner,
+        )?;
+
+        let probe_response = rpc
+            .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
+            .await?;
+
+        let probe_costs = match quote_costs_from_response(&probe_tx_kind, &probe_response) {
+            Ok(costs) if costs.len() == 4 => costs,
+            Ok(costs) => {
+                warnings.push(format!(
+                    "skipped oracle {}: expected 4 quote legs, got {}",
+                    selected.oracle_id,
+                    costs.len()
+                ));
+                continue;
+            }
+            Err(err) => {
+                warnings.push(format!("skipped oracle {}: {err}", selected.oracle_id));
+                continue;
+            }
+        };
+
+        let ask_inputs = BreakoutAskInputs {
+            down_tail_ask_raw: infer_ask_price_raw(probe_costs[0].0, probe_quantity),
+            downside_range_ask_raw: infer_ask_price_raw(probe_costs[1].0, probe_quantity),
+            upside_range_ask_raw: infer_ask_price_raw(probe_costs[2].0, probe_quantity),
+            up_tail_ask_raw: infer_ask_price_raw(probe_costs[3].0, probe_quantity),
+        };
+
+        let optimized = optimize_breakout_quantities(budget_raw, ask_inputs, style)?;
+
+        let final_compiled = compile_breakout(
+            k1,
+            k2,
+            k3,
+            k4,
+            optimized.down_tail_quantity,
+            optimized.downside_range_quantity,
+        )?;
+
+        let final_plan = build_quote_plan(&selected, &final_compiled)?;
+
+        let final_tx_kind = build_quote_tx_kind(
+            &final_plan,
+            QuoteObjectRefs { predict: &predict, oracle: &oracle, clock: &clock },
+            &args.owner,
+        )?;
+
+        let final_response = rpc
+            .dev_inspect_transaction_kind(&final_tx_kind.sender, &final_tx_kind.tx_kind_b64)
+            .await?;
+
+        let final_costs = quote_costs_from_response(&final_tx_kind, &final_response)?;
+
+        if final_costs.len() != 4 {
+            warnings.push(format!(
+                "skipped oracle {}: final quote returned {} legs",
+                selected.oracle_id,
+                final_costs.len()
+            ));
+            continue;
+        }
+
+        let total_cost_raw = final_costs
+            .iter()
+            .try_fold(0u64, |acc, (cost, _)| acc.checked_add(*cost))
+            .ok_or_else(|| io::Error::other("total cost overflow"))?;
+
+        let max_gross_payout_raw =
+            optimized.down_tail_quantity.max(optimized.downside_range_quantity);
+        let max_loss_raw = total_cost_raw;
+        let max_net_payout_raw = max_gross_payout_raw.saturating_sub(total_cost_raw);
+
+        let compiled_strategy_id = format!(
+            "breakout:{}:{}:{}:{}:{}",
+            args.owner,
+            selected.oracle_id,
+            selected.expiry.timestamp_millis(),
+            total_cost_raw,
+            style.api_value()
+        );
+
+        let output = serde_json::json!({
+            "ok": true,
+            "compiledStrategyId": compiled_strategy_id,
+            "strategy": "BREAKOUT_PROTECTION",
+            "network": "sui:testnet",
+            "owner": args.owner,
+            "oracleId": selected.oracle_id,
+            "expiry": selected.expiry.to_rfc3339(),
+            "spot": format_raw_price_e9(selected.spot_raw),
+            "style": style.api_value(),
+            "styleRatioBps": optimized.style_ratio_bps,
+            "budgetRaw": budget_raw.to_string(),
+            "budgetDisplay": asset.format_amount(budget_raw),
+            "premiumRequiredRaw": total_cost_raw.to_string(),
+            "premiumRequiredDisplay": asset.format_amount(total_cost_raw),
+            "maxLossRaw": max_loss_raw.to_string(),
+            "maxLossDisplay": asset.format_amount(max_loss_raw),
+            "maxGrossPayoutRaw": max_gross_payout_raw.to_string(),
+            "maxGrossPayoutDisplay": asset.format_amount(max_gross_payout_raw),
+            "maxNetPayoutRaw": max_net_payout_raw.to_string(),
+            "maxNetPayoutDisplay": asset.format_amount(max_net_payout_raw),
+            "strikes": {
+                "k1": format_raw_price_e9(k1.raw),
+                "k2": format_raw_price_e9(k2.raw),
+                "k3": format_raw_price_e9(k3.raw),
+                "k4": format_raw_price_e9(k4.raw),
+                "k1Raw": k1.raw.to_string(),
+                "k2Raw": k2.raw.to_string(),
+                "k3Raw": k3.raw.to_string(),
+                "k4Raw": k4.raw.to_string()
+            },
+            "legs": [
+                compile_json_leg_down(k1.raw, optimized.down_tail_quantity, final_costs[0].0, ask_inputs.down_tail_ask_raw, &asset),
+                compile_json_leg_range("moderate_downside", k1.raw, k2.raw, optimized.downside_range_quantity, final_costs[1].0, ask_inputs.downside_range_ask_raw, &asset),
+                compile_json_leg_range("moderate_upside", k3.raw, k4.raw, optimized.upside_range_quantity, final_costs[2].0, ask_inputs.upside_range_ask_raw, &asset),
+                compile_json_leg_up(k4.raw, optimized.up_tail_quantity, final_costs[3].0, ask_inputs.up_tail_ask_raw, &asset)
+            ],
+            "payoffTable": [
+                payoff_json("BTC settles <= K1", max_gross_payout_raw, total_cost_raw, &asset),
+                payoff_json("K1 < BTC settles <= K2", optimized.downside_range_quantity, total_cost_raw, &asset),
+                payoff_json("K2 < BTC settles < K3", 0, total_cost_raw, &asset),
+                payoff_json("K3 <= BTC settles < K4", optimized.upside_range_quantity, total_cost_raw, &asset),
+                payoff_json("BTC settles >= K4", max_gross_payout_raw, total_cost_raw, &asset)
+            ],
+            "warnings": warnings
+        });
+
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    Err(io::Error::new(
+        io::ErrorKind::InvalidData,
+        format!("failed to compile strategy after {max_attempts} market attempts"),
+    )
+    .into())
+}
+
+fn compile_json_leg_down(
+    strike_raw: u64,
+    quantity: u64,
+    premium_raw: u64,
+    ask_price_raw: u64,
+    asset: &QuoteAssetDisplay,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "DOWN",
+        "role": "extreme_downside",
+        "strike": format_raw_price_e9(strike_raw),
+        "strikeRaw": strike_raw.to_string(),
+        "quantityRaw": quantity.to_string(),
+        "quantityDisplay": asset.format_amount(quantity),
+        "askPriceRaw": ask_price_raw.to_string(),
+        "premiumRaw": premium_raw.to_string(),
+        "premiumDisplay": asset.format_amount(premium_raw)
+    })
+}
+
+fn compile_json_leg_up(
+    strike_raw: u64,
+    quantity: u64,
+    premium_raw: u64,
+    ask_price_raw: u64,
+    asset: &QuoteAssetDisplay,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "UP",
+        "role": "extreme_upside",
+        "strike": format_raw_price_e9(strike_raw),
+        "strikeRaw": strike_raw.to_string(),
+        "quantityRaw": quantity.to_string(),
+        "quantityDisplay": asset.format_amount(quantity),
+        "askPriceRaw": ask_price_raw.to_string(),
+        "premiumRaw": premium_raw.to_string(),
+        "premiumDisplay": asset.format_amount(premium_raw)
+    })
+}
+
+fn compile_json_leg_range(
+    role: &str,
+    lower_raw: u64,
+    upper_raw: u64,
+    quantity: u64,
+    premium_raw: u64,
+    ask_price_raw: u64,
+    asset: &QuoteAssetDisplay,
+) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "RANGE",
+        "role": role,
+        "lower": format_raw_price_e9(lower_raw),
+        "upper": format_raw_price_e9(upper_raw),
+        "lowerRaw": lower_raw.to_string(),
+        "upperRaw": upper_raw.to_string(),
+        "quantityRaw": quantity.to_string(),
+        "quantityDisplay": asset.format_amount(quantity),
+        "askPriceRaw": ask_price_raw.to_string(),
+        "premiumRaw": premium_raw.to_string(),
+        "premiumDisplay": asset.format_amount(premium_raw)
+    })
+}
+
+fn payoff_json(
+    condition: &str,
+    gross_payout_raw: u64,
+    premium_raw: u64,
+    asset: &QuoteAssetDisplay,
+) -> serde_json::Value {
+    let net_pnl_raw = gross_payout_raw as i128 - premium_raw as i128;
+
+    serde_json::json!({
+        "condition": condition,
+        "grossPayoutRaw": gross_payout_raw.to_string(),
+        "grossPayoutDisplay": asset.format_amount(gross_payout_raw),
+        "netPnlRaw": net_pnl_raw.to_string(),
+        "netPnlDisplay": format_signed_asset_amount(net_pnl_raw, asset)
+    })
+}
+
+fn format_signed_asset_amount(value: i128, asset: &QuoteAssetDisplay) -> String {
+    if value < 0 {
+        format!("-{}", asset.format_amount((-value) as u64))
+    } else {
+        asset.format_amount(value as u64)
+    }
 }
 
 async fn demo_status_command(
