@@ -1,12 +1,19 @@
 use axum::{
-    extract::State,
+    extract::{Path, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
 };
 use serde::{Deserialize, Serialize};
-use std::{collections::HashMap, env, net::SocketAddr, path::PathBuf, sync::Arc};
+use std::{
+    collections::HashMap,
+    env, fs,
+    net::SocketAddr,
+    path::{Path as StdPath, PathBuf},
+    sync::Arc,
+    time::{SystemTime, UNIX_EPOCH},
+};
 use tokio::{process::Command, sync::Mutex};
 use tower_http::cors::CorsLayer;
 
@@ -22,6 +29,8 @@ const DUSDC_COIN_TYPE: &str =
 struct AppState {
     cli_bin: PathBuf,
     compiled: Arc<Mutex<HashMap<String, serde_json::Value>>>,
+    audits_dir: PathBuf,
+    audit_lock: Arc<Mutex<()>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -195,7 +204,18 @@ async fn main() {
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("target/debug/structx-cli"));
 
-    let state = Arc::new(AppState { cli_bin, compiled: Arc::new(Mutex::new(HashMap::new())) });
+    let audits_dir = env::var("STRUCTX_AUDITS_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("artifacts/audits"));
+
+    fs::create_dir_all(&audits_dir).expect("create audits dir");
+
+    let state = Arc::new(AppState {
+        cli_bin,
+        compiled: Arc::new(Mutex::new(HashMap::new())),
+        audits_dir,
+        audit_lock: Arc::new(Mutex::new(())),
+    });
 
     let app = Router::new()
         .route("/health", get(health))
@@ -204,6 +224,8 @@ async fn main() {
         .route("/api/strategies/compile", post(compile_strategy))
         .route("/api/tx/build-open-strategy", post(build_open_strategy))
         .route("/api/tx/audit-open-strategy", post(audit_open_strategy))
+        .route("/api/audits", get(list_audits))
+        .route("/api/audits/{digest}", get(get_audit))
         .route("/api/demo-status", post(demo_status))
         .route("/api/manager-balance", post(manager_balance))
         .route("/api/manager-balance-json", post(manager_balance_json))
@@ -642,6 +664,10 @@ async fn audit_open_strategy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AuditOpenStrategyRequest>,
 ) -> impl IntoResponse {
+    let _guard = state.audit_lock.lock().await;
+
+    let digest = sanitize_digest(&req.digest);
+
     let artifact = serde_json::json!({
         "digest": req.digest,
         "effects": req.effects,
@@ -649,28 +675,22 @@ async fn audit_open_strategy(
         "objectChanges": req.object_changes
     });
 
-    let path = std::env::temp_dir().join(format!(
-        "structx_audit_{}.json",
-        artifact.get("digest").and_then(serde_json::Value::as_str).unwrap_or("unknown")
-    ));
+    let artifact_path = audit_artifact_path(&state.audits_dir, &digest);
 
-    if let Err(err) = tokio::fs::write(
-        &path,
-        match serde_json::to_vec_pretty(&artifact) {
-            Ok(bytes) => bytes,
-            Err(err) => {
-                return (
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    Json(serde_json::json!({
-                        "ok": false,
-                        "error": format!("failed to serialize audit artifact: {err}")
-                    })),
-                );
-            }
-        },
-    )
-    .await
-    {
+    let bytes = match serde_json::to_vec_pretty(&artifact) {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to serialize audit artifact: {err}")
+                })),
+            );
+        }
+    };
+
+    if let Err(err) = tokio::fs::write(&artifact_path, bytes).await {
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -683,37 +703,204 @@ async fn audit_open_strategy(
     let args = vec![
         "demo-status".to_string(),
         "--manager-id".to_string(),
-        req.manager_id,
+        req.manager_id.clone(),
         "--sender".to_string(),
-        req.owner,
+        req.owner.clone(),
         "--from-execution-json".to_string(),
-        path.to_string_lossy().to_string(),
+        artifact_path.to_string_lossy().to_string(),
     ];
 
-    match Command::new(&state.cli_bin).args(args).output().await {
-        Ok(output) => {
-            let ok = output.status.success();
-            let status = if ok { StatusCode::OK } else { StatusCode::BAD_REQUEST };
-
-            (
-                status,
+    let audit_output = match Command::new(&state.cli_bin).args(args).output().await {
+        Ok(output) => output,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
                 Json(serde_json::json!({
-                    "ok": ok,
-                    "compiledStrategyId": req.compiled_strategy_id,
-                    "artifactPath": path.to_string_lossy(),
-                    "stdout": String::from_utf8_lossy(&output.stdout).to_string(),
-                    "stderr": String::from_utf8_lossy(&output.stderr).to_string()
+                    "ok": false,
+                    "error": format!("failed to run audit CLI: {err}")
                 })),
-            )
+            );
         }
-        Err(err) => (
+    };
+
+    let ok = audit_output.status.success();
+    let stdout = String::from_utf8_lossy(&audit_output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&audit_output.stderr).to_string();
+
+    let record = serde_json::json!({
+        "ok": ok,
+        "digest": req.digest,
+        "compiledStrategyId": req.compiled_strategy_id,
+        "owner": req.owner,
+        "managerId": req.manager_id,
+        "createdAtUnix": unix_now_secs(),
+        "artifactPath": artifact_path.to_string_lossy(),
+        "stdout": stdout,
+        "stderr": stderr,
+        "summary": extract_audit_summary(&stdout)
+    });
+
+    let record_path = audit_record_path(&state.audits_dir, &digest);
+
+    if let Err(err) =
+        tokio::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap_or_default()).await
+    {
+        return (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
                 "ok": false,
-                "error": format!("failed to run audit CLI: {err}")
+                "error": format!("failed to write audit record: {err}")
             })),
-        ),
+        );
     }
+
+    let status = if ok { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+
+    (status, Json(record))
+}
+
+async fn list_audits(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let mut records = Vec::new();
+
+    let read_dir = match fs::read_dir(&state.audits_dir) {
+        Ok(read_dir) => read_dir,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to read audits dir: {err}")
+                })),
+            );
+        }
+    };
+
+    for entry in read_dir.flatten() {
+        let path = entry.path();
+
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.ends_with(".record.json"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+
+        let Ok(bytes) = fs::read(&path) else {
+            continue;
+        };
+
+        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
+            continue;
+        };
+
+        records.push(value);
+    }
+
+    records.sort_by(|a, b| {
+        let a_time = a.get("createdAtUnix").and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let b_time = b.get("createdAtUnix").and_then(serde_json::Value::as_u64).unwrap_or(0);
+
+        b_time.cmp(&a_time)
+    });
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "count": records.len(),
+            "audits": records
+        })),
+    )
+}
+
+async fn get_audit(
+    State(state): State<Arc<AppState>>,
+    Path(digest): Path<String>,
+) -> impl IntoResponse {
+    let digest = sanitize_digest(&digest);
+    let path = audit_record_path(&state.audits_dir, &digest);
+
+    let bytes = match fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(_) => {
+            return (
+                StatusCode::NOT_FOUND,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "audit not found"
+                })),
+            );
+        }
+    };
+
+    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to parse audit record: {err}")
+                })),
+            );
+        }
+    };
+
+    (StatusCode::OK, Json(value))
+}
+
+fn sanitize_digest(value: &str) -> String {
+    value
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
+        .collect::<String>()
+}
+
+fn audit_artifact_path(audits_dir: &StdPath, digest: &str) -> PathBuf {
+    audits_dir.join(format!("structx_audit_{digest}.json"))
+}
+
+fn audit_record_path(audits_dir: &StdPath, digest: &str) -> PathBuf {
+    audits_dir.join(format!("structx_audit_{digest}.record.json"))
+}
+
+fn unix_now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default()
+}
+
+fn extract_audit_summary(stdout: &str) -> serde_json::Value {
+    serde_json::json!({
+        "executionStatus": find_stdout_value(stdout, "execution status:"),
+        "totalCost": find_stdout_value(stdout, "total cost:"),
+        "managerBalance": find_stdout_value(stdout, "balance:"),
+        "positionVerification": if stdout.contains("Position verification: ok") {
+            "ok"
+        } else if stdout.contains("Position verification: partial") {
+            "partial"
+        } else if stdout.contains("Position verification") {
+            "failed"
+        } else {
+            "unknown"
+        },
+        "mintedLegCount": stdout.matches("PositionMinted").count() + stdout.matches("RangeMinted").count()
+    })
+}
+
+fn find_stdout_value(stdout: &str, prefix: &str) -> Option<String> {
+    stdout.lines().find_map(|line| {
+        let trimmed = line.trim();
+
+        if trimmed.to_lowercase().starts_with(prefix) {
+            Some(trimmed[(trimmed.find(':')? + 1)..].trim().to_string())
+        } else {
+            None
+        }
+    })
 }
 
 fn ceil_mul_bps(raw: &str, bps: u16) -> String {
