@@ -2,7 +2,7 @@
 members = [
     "crates/deepbook-client",
     "crates/structx-core",
-    "crates/structx-cli",
+    "crates/structx-cli", "crates/structx-api",
 ]
 resolver = "2"
 
