@@ -237,7 +237,25 @@ enum Command {
 
         #[arg(long)]
         min_total_payout_raw: Option<u64>,
-    },
+    
+        #[arg(long, default_value_t = false)]
+        auto_size_down: bool,
+
+        #[arg(long, default_value_t = 10000)]
+        redeem_bps: u16,
+
+        #[arg(long, default_value_t = false)]
+        write_execute_script: bool,
+
+        #[arg(long, default_value_t = false)]
+        allow_zero_payout_script: bool,
+
+        #[arg(long, default_value = "/tmp/structx_execute_redeem_breakout.sh")]
+        execute_script_path: PathBuf,
+
+        #[arg(long, default_value = "/tmp/structx_execute_redeem_breakout_plan.json")]
+        execute_plan_json_path: PathBuf,
+},
     DevinspectMintBreakout {
         #[arg(long)]
         manager_id: String,
@@ -473,6 +491,42 @@ async fn main() -> std::process::ExitCode {
             sender,
             from_execution_json,
             min_total_payout_raw,
+            auto_size_down,
+            redeem_bps,
+            write_execute_script,
+            allow_zero_payout_script,
+            execute_script_path,
+            execute_plan_json_path,
+        } => {
+            devinspect_redeem_breakout_command(DevinspectRedeemBreakoutArgs {
+                rpc_url: cli.rpc_url,
+                manager_id,
+                sender,
+                from_execution_json,
+                min_total_payout_raw,
+                auto_size_down,
+                redeem_bps,
+                write_execute_script,
+                allow_zero_payout_script,
+                execute_script_path,
+                execute_plan_json_path,
+            })
+            .await
+        } => {
+            devinspect_redeem_breakout_command(DevinspectRedeemBreakoutArgs {
+                rpc_url: cli.rpc_url,
+                manager_id,
+                sender,
+                from_execution_json,
+                min_total_payout_raw,
+                auto_size_down,
+                redeem_bps,
+                write_execute_script,
+                allow_zero_payout_script,
+                execute_script_path,
+                execute_plan_json_path,
+            })
+            .await
         } => {
             devinspect_redeem_breakout_command(
                 cli.rpc_url,
@@ -1664,14 +1718,25 @@ fn audit_execution_command(from_execution_json: PathBuf) -> Result<(), Box<dyn s
     Ok(())
 }
 
-async fn devinspect_redeem_breakout_command(
+
+struct DevinspectRedeemBreakoutArgs {
     rpc_url: String,
     manager_id: String,
     sender: String,
     from_execution_json: PathBuf,
     min_total_payout_raw: Option<u64>,
+    auto_size_down: bool,
+    redeem_bps: u16,
+    write_execute_script: bool,
+    allow_zero_payout_script: bool,
+    execute_script_path: PathBuf,
+    execute_plan_json_path: PathBuf,
+}
+
+async fn devinspect_redeem_breakout_command(
+    args: DevinspectRedeemBreakoutArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let reads = load_position_reads_from_execution_json(&from_execution_json)?;
+    let reads = load_position_reads_from_execution_json(&args.from_execution_json)?;
 
     if reads.is_empty() {
         return Err(io::Error::new(
@@ -1683,10 +1748,10 @@ async fn devinspect_redeem_breakout_command(
 
     let oracle_id = first_oracle_id(&reads)?;
 
-    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+    let rpc = SuiRpcClient::new(args.rpc_url.clone(), StdDuration::from_secs(20))?;
 
     let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
-    let manager = resolve_sui_object(&rpc, &manager_id).await?;
+    let manager = resolve_sui_object(&rpc, &args.manager_id).await?;
     let oracle = resolve_sui_object(&rpc, &oracle_id).await?;
     let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
 
@@ -1694,29 +1759,39 @@ async fn devinspect_redeem_breakout_command(
     validate_quote_object_refs(&predict, &oracle, &clock)?;
 
     println!("Redeem source");
-    println!("execution json: {}", display_path(&from_execution_json));
-    println!("manager_id: {manager_id}");
+    println!("execution json: {}", display_path(&args.from_execution_json));
+    println!("manager_id: {}", args.manager_id);
     println!("oracle_id: {oracle_id}");
     println!("legs: {}", reads.len());
     println!();
 
     let tx_kind = build_redeem_tx_kind(
         &reads,
-        MintObjectRefs { predict: &predict, manager: &manager, oracle: &oracle, clock: &clock },
-        &sender,
+        MintObjectRefs {
+            predict: &predict,
+            manager: &manager,
+            oracle: &oracle,
+            clock: &clock,
+        },
+        &args.sender,
     )?;
 
     println!("Built redeem TransactionKind");
     println!("sender: {}", tx_kind.sender);
     println!("tx_kind_b64_len: {}", tx_kind.tx_kind_b64.len());
-    println!("redeem command indices: {:?}", tx_kind.quote_result_command_indices);
+    println!(
+        "redeem command indices: {:?}",
+        tx_kind.quote_result_command_indices
+    );
     println!();
 
-    let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+    let response = rpc
+        .dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64)
+        .await?;
 
     let total_payout_raw = print_devinspect_redeem_response(&response)?;
 
-    if let Some(min_total_payout_raw) = min_total_payout_raw {
+    if let Some(min_total_payout_raw) = args.min_total_payout_raw {
         if total_payout_raw < min_total_payout_raw {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1735,10 +1810,211 @@ async fn devinspect_redeem_breakout_command(
         println!("Redeem payout guard: skipped; pass --min-total-payout-raw to enforce a floor");
     }
 
+    if args.write_execute_script {
+        if total_payout_raw == 0 && !args.allow_zero_payout_script {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "refusing to write redeem execution script with zero payout; pass --allow-zero-payout-script only if you intentionally want to burn/close losing positions",
+            )
+            .into());
+        }
+
+        write_execute_redeem_artifacts(&args, &reads, total_payout_raw)?;
+    }
+
     println!();
     println!("Important: this was devInspect only. No positions were redeemed.");
 
     Ok(())
+}
+
+
+fn write_execute_redeem_artifacts(
+    args: &DevinspectRedeemBreakoutArgs,
+    reads: &[ManagerPositionRead],
+    total_payout_raw: u64,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let script = build_execute_redeem_script(args, reads)?;
+
+    fs::write(&args.execute_script_path, script)?;
+
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut perms = fs::metadata(&args.execute_script_path)?.permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&args.execute_script_path, perms)?;
+    }
+
+    let manifest = build_execute_redeem_manifest(args, reads, total_payout_raw);
+    fs::write(
+        &args.execute_plan_json_path,
+        serde_json::to_string_pretty(&manifest)?,
+    )?;
+
+    println!();
+    println!("Fresh executable redeem artifacts written");
+    println!("script: {}", display_path(&args.execute_script_path));
+    println!("plan: {}", display_path(&args.execute_plan_json_path));
+    println!();
+    println!("Execute immediately with:");
+    println!(
+        "GAS_BUDGET=500000000 bash {} --json | tee artifacts/structx_execute_redeem_breakout.json",
+        display_path(&args.execute_script_path)
+    );
+
+    Ok(())
+}
+
+fn build_execute_redeem_manifest(
+    args: &DevinspectRedeemBreakoutArgs,
+    reads: &[ManagerPositionRead],
+    total_payout_raw: u64,
+) -> serde_json::Value {
+    let asset = QuoteAssetDisplay {
+        symbol: "dUSDC".to_string(),
+        decimals: DUSDC_DECIMALS,
+    };
+
+    let legs = reads
+        .iter()
+        .enumerate()
+        .map(|(idx, read)| match read {
+            ManagerPositionRead::Binary {
+                oracle_id,
+                expiry_ms,
+                strike_raw,
+                is_up,
+                expected_quantity,
+            } => serde_json::json!({
+                "index": idx,
+                "kind": "binary",
+                "direction": if *is_up { "up" } else { "down" },
+                "oracle_id": oracle_id,
+                "expiry_ms": expiry_ms,
+                "strike_raw": strike_raw,
+                "strike": format_raw_price_e9(*strike_raw),
+                "redeem_quantity": expected_quantity,
+            }),
+            ManagerPositionRead::Range {
+                oracle_id,
+                expiry_ms,
+                lower_raw,
+                upper_raw,
+                expected_quantity,
+            } => serde_json::json!({
+                "index": idx,
+                "kind": "range",
+                "oracle_id": oracle_id,
+                "expiry_ms": expiry_ms,
+                "lower_raw": lower_raw,
+                "upper_raw": upper_raw,
+                "lower": format_raw_price_e9(*lower_raw),
+                "upper": format_raw_price_e9(*upper_raw),
+                "redeem_quantity": expected_quantity,
+            }),
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "sender": args.sender,
+        "manager_id": args.manager_id,
+        "predict_object_id": PREDICT_OBJECT_ID,
+        "predict_package_id": PREDICT_PACKAGE_ID,
+        "total_payout_raw": total_payout_raw,
+        "total_payout": asset.format_amount(total_payout_raw),
+        "allow_zero_payout_script": args.allow_zero_payout_script,
+        "legs": legs,
+        "warning": "Generated only after successful redeem devInspect. Execute immediately; pricing/settlement state can change."
+    })
+}
+
+fn build_execute_redeem_script(
+    args: &DevinspectRedeemBreakoutArgs,
+    reads: &[ManagerPositionRead],
+) -> Result<String, Box<dyn std::error::Error>> {
+    if reads.is_empty() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "empty redeem plan").into());
+    }
+
+    let oracle_id = first_oracle_id(reads)?;
+
+    let mut out = String::new();
+
+    out.push_str("#!/usr/bin/env bash\n");
+    out.push_str("set -euo pipefail\n\n");
+
+    out.push_str("# Fresh StructX redeem script generated only after successful devInspect.\n");
+    out.push_str("# Execute immediately; Predict pricing/settlement checks can change between runs.\n\n");
+
+    out.push_str(&format!("export PREDICT_PACKAGE={}\n", PREDICT_PACKAGE_ID));
+    out.push_str(&format!("export PREDICT_OBJECT_ID={}\n", PREDICT_OBJECT_ID));
+    out.push_str(&format!("export DUSDC={}\n", DUSDC_COIN_TYPE));
+    out.push_str(&format!("export MANAGER_ID={}\n", args.manager_id));
+    out.push_str(&format!("export OWNER={}\n", args.sender));
+    out.push_str(&format!("export ORACLE_ID={}\n", oracle_id));
+    out.push_str("export CLOCK_ID=0x6\n");
+    out.push_str("export GAS_BUDGET=${GAS_BUDGET:-500000000}\n\n");
+
+    out.push_str("EXTRA_ARGS=(\"$@\")\n");
+    out.push_str("if [ ${#EXTRA_ARGS[@]} -eq 0 ]; then\n");
+    out.push_str("  EXTRA_ARGS=(--json)\n");
+    out.push_str("fi\n\n");
+
+    out.push_str("sui client ptb \\\n");
+    out.push_str("  --sender \"$OWNER\" \\\n");
+
+    for (idx, read) in reads.iter().enumerate() {
+        let key_name = format!("key{idx}");
+
+        match read {
+            ManagerPositionRead::Binary {
+                expiry_ms,
+                strike_raw,
+                is_up,
+                expected_quantity,
+                ..
+            } => {
+                let key_function = if *is_up { "up" } else { "down" };
+
+                out.push_str(&format!(
+                    "  --move-call \"${{PREDICT_PACKAGE}}::market_key::{key_function}\" \"@${{ORACLE_ID}}\" \"{}\" \"{}\" \\\n",
+                    expiry_ms,
+                    strike_raw,
+                ));
+                out.push_str(&format!("  --assign {key_name} \\\n"));
+                out.push_str(&format!(
+                    "  --move-call \"${{PREDICT_PACKAGE}}::predict::redeem\" \"<${{DUSDC}}>\" \"@${{PREDICT_OBJECT_ID}}\" \"@${{MANAGER_ID}}\" \"@${{ORACLE_ID}}\" {key_name} \"{}\" \"@${{CLOCK_ID}}\" \\\n",
+                    expected_quantity,
+                ));
+            }
+            ManagerPositionRead::Range {
+                expiry_ms,
+                lower_raw,
+                upper_raw,
+                expected_quantity,
+                ..
+            } => {
+                out.push_str(&format!(
+                    "  --move-call \"${{PREDICT_PACKAGE}}::range_key::new\" \"@${{ORACLE_ID}}\" \"{}\" \"{}\" \"{}\" \\\n",
+                    expiry_ms,
+                    lower_raw,
+                    upper_raw,
+                ));
+                out.push_str(&format!("  --assign {key_name} \\\n"));
+                out.push_str(&format!(
+                    "  --move-call \"${{PREDICT_PACKAGE}}::predict::redeem_range\" \"<${{DUSDC}}>\" \"@${{PREDICT_OBJECT_ID}}\" \"@${{MANAGER_ID}}\" \"@${{ORACLE_ID}}\" {key_name} \"{}\" \"@${{CLOCK_ID}}\" \\\n",
+                    expected_quantity,
+                ));
+            }
+        }
+    }
+
+    out.push_str("  --gas-budget \"$GAS_BUDGET\" \\\n");
+    out.push_str("  \"${EXTRA_ARGS[@]}\"\n");
+
+    Ok(out)
 }
 
 fn first_oracle_id(reads: &[ManagerPositionRead]) -> Result<String, Box<dyn std::error::Error>> {
