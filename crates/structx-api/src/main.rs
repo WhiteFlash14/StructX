@@ -1,5 +1,5 @@
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Query, State},
     http::StatusCode,
     response::IntoResponse,
     routing::{get, post},
@@ -16,6 +16,8 @@ use std::{
 };
 use tokio::{process::Command, sync::Mutex};
 use tower_http::cors::CorsLayer;
+
+const DEFAULT_PREDICT_SERVER_URL: &str = "https://predict-server.testnet.mystenlabs.com";
 
 const PREDICT_PACKAGE_ID: &str =
     "0xf5ea2b3749c65d6e56507cc35388719aadb28f9cab873696a2f8687f5c785138";
@@ -46,6 +48,33 @@ struct CliResponse {
     code: Option<i32>,
     stdout: String,
     stderr: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct LivePriceQuery {
+    #[serde(default = "default_live_asset")]
+    asset: String,
+
+    #[serde(rename = "oracleId")]
+    oracle_id: Option<String>,
+}
+
+fn default_live_asset() -> String {
+    "BTC".to_string()
+}
+
+#[derive(Debug, Serialize)]
+struct LivePriceResponse {
+    ok: bool,
+    asset: String,
+    source: String,
+    price_raw: Option<String>,
+    price: Option<String>,
+    updated_at_ms: Option<u64>,
+    stale: bool,
+    oracle_id: Option<String>,
+    raw: serde_json::Value,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -219,6 +248,7 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/api/market/live-price", get(live_price))
         .route("/api/intent/parse", post(parse_intent))
         .route("/api/strategies/compile-from-intent", post(compile_from_intent))
         .route("/api/strategies/compile", post(compile_strategy))
@@ -355,6 +385,94 @@ async fn parse_intent(Json(req): Json<ParseIntentRequest>) -> impl IntoResponse 
     }
 
     (StatusCode::OK, Json(serde_json::to_value(parsed).unwrap()))
+}
+
+async fn live_price(Query(query): Query<LivePriceQuery>) -> impl IntoResponse {
+    let server_url = std::env::var("PREDICT_SERVER_URL")
+        .unwrap_or_else(|_| DEFAULT_PREDICT_SERVER_URL.to_string());
+
+    let client = reqwest::Client::new();
+
+    let mut warnings = Vec::new();
+    let mut raw_payload = serde_json::Value::Null;
+    let mut source = "prices/latest".to_string();
+
+    let latest_url = format!("{}/prices/latest", server_url.trim_end_matches('/'));
+
+    let latest_result =
+        client.get(&latest_url).send().await.and_then(|response| response.error_for_status());
+
+    match latest_result {
+        Ok(response) => match response.json::<serde_json::Value>().await {
+            Ok(value) => {
+                raw_payload = value;
+            }
+            Err(err) => {
+                warnings.push(format!("failed to parse /prices/latest JSON: {err}"));
+            }
+        },
+        Err(err) => {
+            warnings.push(format!("failed to fetch /prices/latest: {err}"));
+        }
+    }
+
+    if raw_payload.is_null() {
+        if let Some(oracle_id) = &query.oracle_id {
+            let oracle_url =
+                format!("{}/oracles/{}/state", server_url.trim_end_matches('/'), oracle_id);
+
+            match client.get(&oracle_url).send().await {
+                Ok(response) => match response.error_for_status() {
+                    Ok(response) => match response.json::<serde_json::Value>().await {
+                        Ok(value) => {
+                            source = "oracles/:oracle_id/state".to_string();
+                            raw_payload = value;
+                        }
+                        Err(err) => {
+                            warnings.push(format!("failed to parse oracle state JSON: {err}"));
+                        }
+                    },
+                    Err(err) => warnings.push(format!("oracle state HTTP error: {err}")),
+                },
+                Err(err) => warnings.push(format!("failed to fetch oracle state: {err}")),
+            }
+        }
+    }
+
+    let asset = query.asset.to_uppercase();
+
+    let price_raw = extract_price_raw_for_asset(&raw_payload, &asset)
+        .or_else(|| extract_first_price_like_raw(&raw_payload));
+
+    let updated_at_ms = extract_timestamp_ms(&raw_payload);
+
+    let stale = updated_at_ms
+        .map(|ts| {
+            let now_ms = unix_now_secs().saturating_mul(1000);
+            now_ms.saturating_sub(ts) > 60_000
+        })
+        .unwrap_or(true);
+
+    if price_raw.is_none() {
+        warnings.push("could not find a BTC price in DeepBook Predict payload".to_string());
+    }
+
+    let response = LivePriceResponse {
+        ok: price_raw.is_some(),
+        asset,
+        source,
+        price_raw: price_raw.map(|value| value.to_string()),
+        price: price_raw.map(format_price_e9),
+        updated_at_ms,
+        stale,
+        oracle_id: query.oracle_id,
+        raw: raw_payload,
+        warnings,
+    };
+
+    let status = if response.ok { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+
+    (status, Json(response))
 }
 
 async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
@@ -632,6 +750,16 @@ async fn build_open_strategy(
     let warnings =
         compiled.get("warnings").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
 
+    let mut response_warnings = warnings;
+    if !response_warnings
+        .iter()
+        .any(|warning| warning.as_str() == Some("Live oracle pricing can change between preview and wallet signing; dry-run immediately before opening."))
+    {
+        response_warnings.push(serde_json::Value::String(
+            "Live oracle pricing can change between preview and wallet signing; dry-run immediately before opening.".to_string(),
+        ));
+    }
+
     (
         StatusCode::OK,
         Json(serde_json::json!({
@@ -654,7 +782,7 @@ async fn build_open_strategy(
                 "premiumRequiredDisplay": compiled.get("premiumRequiredDisplay").cloned().unwrap_or(serde_json::Value::Null),
                 "legs": legs
             },
-            "warnings": warnings
+            "warnings": response_warnings
 
         })),
     )
@@ -849,6 +977,170 @@ async fn get_audit(
     };
 
     (StatusCode::OK, Json(value))
+}
+
+fn extract_price_raw_for_asset(value: &serde_json::Value, asset: &str) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for (key, child) in map {
+                let key_upper = key.to_uppercase();
+
+                if key_upper == asset
+                    || key_upper == format!("{asset}/USD")
+                    || key_upper == format!("{asset}-USD")
+                    || key_upper.contains(asset)
+                {
+                    if let Some(price) = extract_first_price_like_raw(child) {
+                        return Some(price);
+                    }
+                }
+            }
+
+            for child in map.values() {
+                if let Some(price) = extract_price_raw_for_asset(child, asset) {
+                    return Some(price);
+                }
+            }
+
+            None
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(price) = extract_price_raw_for_asset(item, asset) {
+                    return Some(price);
+                }
+            }
+
+            None
+        }
+        _ => None,
+    }
+}
+
+fn extract_first_price_like_raw(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in [
+                "price_raw",
+                "priceRaw",
+                "raw_price",
+                "rawPrice",
+                "oracle_price",
+                "oraclePrice",
+                "latest_price",
+                "latestPrice",
+                "price",
+                "value",
+            ] {
+                if let Some(raw) = map.get(key).and_then(json_number_or_string_u64) {
+                    return normalize_price_to_e9(raw);
+                }
+            }
+
+            for child in map.values() {
+                if let Some(price) = extract_first_price_like_raw(child) {
+                    return Some(price);
+                }
+            }
+
+            None
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(price) = extract_first_price_like_raw(item) {
+                    return Some(price);
+                }
+            }
+
+            None
+        }
+        _ => json_number_or_string_u64(value).and_then(normalize_price_to_e9),
+    }
+}
+
+fn extract_timestamp_ms(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Object(map) => {
+            for key in [
+                "updated_at_ms",
+                "updatedAtMs",
+                "timestamp_ms",
+                "timestampMs",
+                "price_timestamp_ms",
+                "priceTimestampMs",
+                "last_updated_ms",
+                "lastUpdatedMs",
+            ] {
+                if let Some(ts) = map.get(key).and_then(json_number_or_string_u64) {
+                    return Some(ts);
+                }
+            }
+
+            for key in ["updated_at", "updatedAt", "timestamp", "lastUpdated"] {
+                if let Some(ts) = map.get(key).and_then(json_number_or_string_u64) {
+                    if ts < 10_000_000_000 {
+                        return Some(ts.saturating_mul(1000));
+                    }
+
+                    return Some(ts);
+                }
+            }
+
+            for child in map.values() {
+                if let Some(ts) = extract_timestamp_ms(child) {
+                    return Some(ts);
+                }
+            }
+
+            None
+        }
+        serde_json::Value::Array(items) => {
+            for item in items {
+                if let Some(ts) = extract_timestamp_ms(item) {
+                    return Some(ts);
+                }
+            }
+
+            None
+        }
+        _ => None,
+    }
+}
+
+fn json_number_or_string_u64(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(value) => {
+            if let Ok(raw) = value.parse::<u64>() {
+                Some(raw)
+            } else if let Ok(float) = value.parse::<f64>() {
+                Some((float * 1_000_000_000.0) as u64)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
+fn normalize_price_to_e9(raw: u64) -> Option<u64> {
+    if raw == 0 {
+        return None;
+    }
+
+    if raw < 1_000_000 {
+        return raw.checked_mul(1_000_000_000);
+    }
+
+    Some(raw)
+}
+
+fn format_price_e9(raw: u64) -> String {
+    let whole = raw / 1_000_000_000;
+    let frac = raw % 1_000_000_000;
+    let cents = frac / 10_000_000;
+
+    format!("${whole}.{cents:02}")
 }
 
 fn sanitize_digest(value: &str) -> String {
