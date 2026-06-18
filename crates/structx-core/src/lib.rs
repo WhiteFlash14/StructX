@@ -1,3 +1,8 @@
+pub use breakout_optimizer::{
+    estimate_breakout_premium_raw, optimize_breakout_quantities, BreakoutAskInputs,
+    BreakoutOptimizerError, BreakoutStyle, OptimizedBreakoutQuantities,
+};
+pub mod breakout_optimizer;
 pub mod payoff;
 pub mod price;
 pub mod quote_guard;
