@@ -114,7 +114,40 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
         source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict.move",
     },
 
+    
     ExpectedAbiFunction {
+        module: "predict",
+        function: "redeem",
+        expected_parameters: &[
+            PREDICT_MUT_REF,
+            PREDICT_MANAGER_MUT_REF,
+            ORACLE_SVI_REF,
+            MARKET_KEY,
+            "U64",
+            CLOCK_REF,
+            TX_CONTEXT_MUT_REF,
+        ],
+        expected_returns: &[],
+        source_note: "predict.move + official Predict docs",
+        source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict.move",
+    },
+    ExpectedAbiFunction {
+        module: "predict",
+        function: "redeem_range",
+        expected_parameters: &[
+            PREDICT_MUT_REF,
+            PREDICT_MANAGER_MUT_REF,
+            ORACLE_SVI_REF,
+            RANGE_KEY,
+            "U64",
+            CLOCK_REF,
+            TX_CONTEXT_MUT_REF,
+        ],
+        expected_returns: &[],
+        source_note: "predict.move + official Predict docs",
+        source_url: "https://raw.githubusercontent.com/MystenLabs/deepbookv3/predict-testnet-4-16/packages/predict/sources/predict.move",
+    },
+ExpectedAbiFunction {
         module: "predict_manager",
         function: "position",
         expected_parameters: &[PREDICT_MANAGER_REF, MARKET_KEY],
@@ -425,6 +458,32 @@ mod tests {
                             {"MutableReference":{"Struct":{"address":"0x2","module":"tx_context","name":"TxContext","typeArguments":[]}}}
                         ],
                         "return": []
+                    },
+                    "redeem": {
+                        "visibility": "Public",
+                        "parameters": [
+                            {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict","name":"Predict","typeArguments":[]}}},
+                            {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}},
+                            {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"oracle","name":"OracleSVI","typeArguments":[]}}},
+                            {"Struct":{"address":PREDICT_PACKAGE,"module":"market_key","name":"MarketKey","typeArguments":[]}},
+                            "U64",
+                            {"Reference":{"Struct":{"address":"0x2","module":"clock","name":"Clock","typeArguments":[]}}},
+                            {"MutableReference":{"Struct":{"address":"0x2","module":"tx_context","name":"TxContext","typeArguments":[]}}}
+                        ],
+                        "return": []
+                    },
+                    "redeem_range": {
+                        "visibility": "Public",
+                        "parameters": [
+                            {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict","name":"Predict","typeArguments":[]}}},
+                            {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}},
+                            {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"oracle","name":"OracleSVI","typeArguments":[]}}},
+                            {"Struct":{"address":PREDICT_PACKAGE,"module":"range_key","name":"RangeKey","typeArguments":[]}},
+                            "U64",
+                            {"Reference":{"Struct":{"address":"0x2","module":"clock","name":"Clock","typeArguments":[]}}},
+                            {"MutableReference":{"Struct":{"address":"0x2","module":"tx_context","name":"TxContext","typeArguments":[]}}}
+                        ],
+                        "return": []
                     }
                 }
             },
@@ -502,7 +561,7 @@ mod tests {
         let report = verify_predict_abi(PREDICT_PACKAGE, &modules);
 
         assert!(report.is_pass());
-        assert_eq!(report.checks.len(), 11);
+        assert_eq!(report.checks.len(), 13);
     }
 
     #[test]
