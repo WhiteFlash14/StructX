@@ -219,6 +219,11 @@ enum Command {
         #[arg(long, default_value_t = false)]
         expect_exact: bool,
     },
+
+    AuditExecution {
+        #[arg(long)]
+        from_execution_json: PathBuf,
+    },
     DevinspectMintBreakout {
         #[arg(long)]
         manager_id: String,
@@ -443,6 +448,10 @@ async fn main() -> std::process::ExitCode {
                 expect_exact,
             )
             .await
+        }
+
+        Command::AuditExecution { from_execution_json } => {
+            audit_execution_command(from_execution_json)
         }
         Command::DevinspectMintBreakout {
             manager_id,
@@ -1509,6 +1518,120 @@ struct DevinspectMintBreakoutArgs {
     write_execute_script: bool,
     execute_script_path: PathBuf,
     execute_plan_json_path: PathBuf,
+}
+
+fn audit_execution_command(from_execution_json: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(&from_execution_json)?)?;
+
+    let status = value
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    let digest = value.get("digest").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+
+    println!("StructX execution audit");
+    println!("source: {}", display_path(&from_execution_json));
+    println!("digest: {digest}");
+    println!("status: {status}");
+    println!();
+
+    if status != "success" {
+        return Err(io::Error::other("execution was not successful").into());
+    }
+
+    let events = value
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing events array"))?;
+
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+    let mut total_cost_raw = 0u64;
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "#",
+        "event",
+        "direction",
+        "strike/lower",
+        "upper",
+        "quantity",
+        "cost raw",
+        "cost",
+        "ask price",
+    ]);
+
+    let mut minted_count = 0usize;
+
+    for event in events {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+
+        let parsed = event.get("parsedJson").unwrap_or(&serde_json::Value::Null);
+
+        if event_type.ends_with("::predict::PositionMinted") {
+            let cost = json_required_u64(parsed, "cost")?;
+            total_cost_raw = total_cost_raw
+                .checked_add(cost)
+                .ok_or_else(|| io::Error::other("total cost overflow"))?;
+
+            let is_up = json_required_bool(parsed, "is_up")?;
+
+            table.add_row(vec![
+                Cell::new(minted_count),
+                Cell::new("PositionMinted"),
+                Cell::new(if is_up { "up" } else { "down" }),
+                Cell::new(format_raw_price_e9(json_required_u64(parsed, "strike")?)),
+                Cell::new("—"),
+                Cell::new(json_required_u64(parsed, "quantity")?),
+                Cell::new(cost),
+                Cell::new(asset.format_amount(cost)),
+                Cell::new(json_required_string(parsed, "ask_price")?),
+            ]);
+
+            minted_count += 1;
+        } else if event_type.ends_with("::predict::RangeMinted") {
+            let cost = json_required_u64(parsed, "cost")?;
+            total_cost_raw = total_cost_raw
+                .checked_add(cost)
+                .ok_or_else(|| io::Error::other("total cost overflow"))?;
+
+            table.add_row(vec![
+                Cell::new(minted_count),
+                Cell::new("RangeMinted"),
+                Cell::new("—"),
+                Cell::new(format_raw_price_e9(json_required_u64(parsed, "lower_strike")?)),
+                Cell::new(format_raw_price_e9(json_required_u64(parsed, "higher_strike")?)),
+                Cell::new(json_required_u64(parsed, "quantity")?),
+                Cell::new(cost),
+                Cell::new(asset.format_amount(cost)),
+                Cell::new(json_required_string(parsed, "ask_price")?),
+            ]);
+
+            minted_count += 1;
+        }
+    }
+
+    if minted_count == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no PositionMinted or RangeMinted events found",
+        )
+        .into());
+    }
+
+    println!("Minted legs");
+    println!("{table}");
+    println!();
+
+    println!("Execution cost summary");
+    println!("minted legs: {minted_count}");
+    println!("total cost raw: {total_cost_raw}");
+    println!("total cost: {}", asset.format_amount(total_cost_raw));
+
+    Ok(())
 }
 
 async fn manager_positions_command(
