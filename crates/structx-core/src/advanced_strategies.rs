@@ -1,0 +1,678 @@
+use thiserror::Error;
+
+pub const PRICE_SCALE_E9: u128 = 1_000_000_000;
+pub const DUSDC_SCALE: u128 = 1_000_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvancedStrategyKind {
+    PortfolioCrashShield,
+    ConvexTailLadder,
+    ExpiryMoveNote,
+}
+
+impl AdvancedStrategyKind {
+    pub fn from_api_value(value: &str) -> Result<Self, AdvancedStrategyError> {
+        match value {
+            "PORTFOLIO_CRASH_SHIELD" | "portfolio_crash_shield" => Ok(Self::PortfolioCrashShield),
+            "CONVEX_TAIL_LADDER" | "convex_tail_ladder" => Ok(Self::ConvexTailLadder),
+            "EXPIRY_MOVE_NOTE" | "expiry_move_note" => Ok(Self::ExpiryMoveNote),
+            other => Err(AdvancedStrategyError::UnknownStrategy(other.to_string())),
+        }
+    }
+
+    pub fn api_value(self) -> &'static str {
+        match self {
+            Self::PortfolioCrashShield => "PORTFOLIO_CRASH_SHIELD",
+            Self::ConvexTailLadder => "CONVEX_TAIL_LADDER",
+            Self::ExpiryMoveNote => "EXPIRY_MOVE_NOTE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdvancedLegKind {
+    Down,
+    Range,
+    Up,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvancedLegInput {
+    pub kind: AdvancedLegKind,
+    pub role: &'static str,
+    pub strike_raw: Option<u64>,
+    pub lower_raw: Option<u64>,
+    pub upper_raw: Option<u64>,
+    pub midpoint_raw: u64,
+    pub ask_price_raw: u64,
+    pub base_weight_e6: u64,
+    pub max_quantity: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvancedCompiledLeg {
+    pub kind: AdvancedLegKind,
+    pub role: &'static str,
+    pub strike_raw: Option<u64>,
+    pub lower_raw: Option<u64>,
+    pub upper_raw: Option<u64>,
+    pub midpoint_raw: u64,
+    pub ask_price_raw: u64,
+    pub weight_e6: u64,
+    pub quantity: u64,
+    pub premium_raw: u64,
+    pub max_quantity: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdvancedCompileResult {
+    pub strategy: AdvancedStrategyKind,
+    pub requested_budget_raw: u64,
+    pub used_budget_raw: u64,
+    pub unused_budget_raw: u64,
+    pub legs: Vec<AdvancedCompiledLeg>,
+    pub warnings: Vec<String>,
+}
+
+#[derive(Debug, Error)]
+pub enum AdvancedStrategyError {
+    #[error("unknown strategy `{0}`")]
+    UnknownStrategy(String),
+
+    #[error("budget must be greater than zero")]
+    ZeroBudget,
+
+    #[error("ask price must be greater than zero")]
+    ZeroAsk,
+
+    #[error("no positive-weight legs")]
+    NoPositiveWeights,
+
+    #[error("budget too small for nonzero allocation")]
+    BudgetTooSmall,
+
+    #[error("arithmetic overflow")]
+    Overflow,
+
+    #[error("invalid input: {0}")]
+    InvalidInput(String),
+}
+
+pub fn allocate_weighted_budget(
+    strategy: AdvancedStrategyKind,
+    budget_raw: u64,
+    legs: Vec<AdvancedLegInput>,
+) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
+    if budget_raw == 0 {
+        return Err(AdvancedStrategyError::ZeroBudget);
+    }
+
+    let mut active: Vec<AdvancedLegInput> =
+        legs.into_iter().filter(|leg| leg.base_weight_e6 > 0).collect();
+
+    if active.is_empty() {
+        return Err(AdvancedStrategyError::NoPositiveWeights);
+    }
+
+    if active.iter().any(|leg| leg.ask_price_raw == 0) {
+        return Err(AdvancedStrategyError::ZeroAsk);
+    }
+
+    let mut remaining_budget = budget_raw as u128;
+    let mut compiled = Vec::<AdvancedCompiledLeg>::new();
+    let mut warnings = Vec::<String>::new();
+
+    while !active.is_empty() && remaining_budget > 0 {
+        let denom = active.iter().try_fold(0u128, |acc, leg| {
+            let term = (leg.ask_price_raw as u128)
+                .checked_mul(leg.base_weight_e6 as u128)
+                .ok_or(AdvancedStrategyError::Overflow)?;
+            acc.checked_add(term).ok_or(AdvancedStrategyError::Overflow)
+        })?;
+
+        if denom == 0 {
+            break;
+        }
+
+        let lambda_num =
+            remaining_budget.checked_mul(PRICE_SCALE_E9).ok_or(AdvancedStrategyError::Overflow)?;
+
+        let mut next_active = Vec::<AdvancedLegInput>::new();
+        let mut any_finalized = false;
+
+        for leg in active {
+            let raw_qty = lambda_num
+                .checked_mul(leg.base_weight_e6 as u128)
+                .ok_or(AdvancedStrategyError::Overflow)?
+                / denom;
+
+            if raw_qty == 0 {
+                continue;
+            }
+
+            let capped_qty = match leg.max_quantity {
+                Some(max_qty) if raw_qty > max_qty as u128 => max_qty as u128,
+                _ => raw_qty,
+            };
+
+            if capped_qty == 0 {
+                continue;
+            }
+
+            let premium = ceil_div(
+                (leg.ask_price_raw as u128)
+                    .checked_mul(capped_qty)
+                    .ok_or(AdvancedStrategyError::Overflow)?,
+                PRICE_SCALE_E9,
+            )?;
+
+            if premium == 0 {
+                continue;
+            }
+
+            if premium > remaining_budget {
+                let affordable_qty = remaining_budget
+                    .checked_mul(PRICE_SCALE_E9)
+                    .ok_or(AdvancedStrategyError::Overflow)?
+                    / leg.ask_price_raw as u128;
+
+                if affordable_qty == 0 {
+                    continue;
+                }
+
+                let affordable_premium = ceil_div(
+                    (leg.ask_price_raw as u128)
+                        .checked_mul(affordable_qty)
+                        .ok_or(AdvancedStrategyError::Overflow)?,
+                    PRICE_SCALE_E9,
+                )?;
+
+                compiled.push(AdvancedCompiledLeg {
+                    kind: leg.kind,
+                    role: leg.role,
+                    strike_raw: leg.strike_raw,
+                    lower_raw: leg.lower_raw,
+                    upper_raw: leg.upper_raw,
+                    midpoint_raw: leg.midpoint_raw,
+                    ask_price_raw: leg.ask_price_raw,
+                    weight_e6: leg.base_weight_e6,
+                    quantity: u64_checked(affordable_qty)?,
+                    premium_raw: u64_checked(affordable_premium)?,
+                    max_quantity: leg.max_quantity,
+                });
+
+                remaining_budget = remaining_budget.saturating_sub(affordable_premium);
+                any_finalized = true;
+                continue;
+            }
+
+            compiled.push(AdvancedCompiledLeg {
+                kind: leg.kind,
+                role: leg.role,
+                strike_raw: leg.strike_raw,
+                lower_raw: leg.lower_raw,
+                upper_raw: leg.upper_raw,
+                midpoint_raw: leg.midpoint_raw,
+                ask_price_raw: leg.ask_price_raw,
+                weight_e6: leg.base_weight_e6,
+                quantity: u64_checked(capped_qty)?,
+                premium_raw: u64_checked(premium)?,
+                max_quantity: leg.max_quantity,
+            });
+
+            remaining_budget = remaining_budget.saturating_sub(premium);
+            any_finalized = true;
+
+            if leg.max_quantity.is_none() {
+                // Uncapped legs are done in this MVP allocator. We do not re-enter
+                // them because one pass gives the exact weight allocation.
+            } else if raw_qty <= capped_qty {
+                // Capped leg did not bind, so it is done.
+            } else {
+                // Capped leg bound, do not re-add it.
+            }
+        }
+
+        if !any_finalized {
+            break;
+        }
+
+        active = std::mem::take(&mut next_active);
+    }
+
+    if compiled.is_empty() {
+        return Err(AdvancedStrategyError::BudgetTooSmall);
+    }
+
+    let used_budget = compiled.iter().try_fold(0u64, |acc, leg| {
+        acc.checked_add(leg.premium_raw).ok_or(AdvancedStrategyError::Overflow)
+    })?;
+
+    if used_budget < budget_raw {
+        warnings.push(format!(
+            "Strategy used {} raw dUSDC and left {} raw unused because caps or available buckets constrained allocation.",
+            used_budget,
+            budget_raw - used_budget
+        ));
+    }
+
+    Ok(AdvancedCompileResult {
+        strategy,
+        requested_budget_raw: budget_raw,
+        used_budget_raw: used_budget,
+        unused_budget_raw: budget_raw.saturating_sub(used_budget),
+        legs: compiled,
+        warnings,
+    })
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct PortfolioCrashShieldInput {
+    pub spot_raw: u64,
+    pub exposure_raw: u64,
+    pub budget_raw: u64,
+    pub over_hedge_cap_bps: u16,
+    pub gamma_bps: u16,
+    pub down_tail_strike_raw: u64,
+    pub lower_range_upper_raw: u64,
+    pub mild_range_upper_raw: Option<u64>,
+    pub down_tail_ask_raw: u64,
+    pub lower_range_ask_raw: u64,
+    pub mild_range_ask_raw: Option<u64>,
+}
+
+pub fn compile_portfolio_crash_shield(
+    input: PortfolioCrashShieldInput,
+) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
+    if input.spot_raw == 0 {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "spot_raw must be greater than zero".to_string(),
+        ));
+    }
+
+    if input.exposure_raw == 0 {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "portfolio exposure must be greater than zero".to_string(),
+        ));
+    }
+
+    let mut legs = Vec::new();
+
+    let severe_midpoint = input
+        .down_tail_strike_raw
+        .saturating_mul(9)
+        .checked_div(10)
+        .unwrap_or(input.down_tail_strike_raw);
+
+    let severe = crash_bucket_leg(
+        AdvancedLegKind::Down,
+        "severe_downside",
+        Some(input.down_tail_strike_raw),
+        None,
+        None,
+        severe_midpoint,
+        input.down_tail_ask_raw,
+        input.spot_raw,
+        input.exposure_raw,
+        input.over_hedge_cap_bps,
+        input.gamma_bps,
+    )?;
+
+    legs.push(severe);
+
+    let lower_midpoint = midpoint(input.down_tail_strike_raw, input.lower_range_upper_raw)?;
+
+    let lower = crash_bucket_leg(
+        AdvancedLegKind::Range,
+        "moderate_downside",
+        None,
+        Some(input.down_tail_strike_raw),
+        Some(input.lower_range_upper_raw),
+        lower_midpoint,
+        input.lower_range_ask_raw,
+        input.spot_raw,
+        input.exposure_raw,
+        input.over_hedge_cap_bps,
+        input.gamma_bps,
+    )?;
+
+    legs.push(lower);
+
+    if let (Some(mild_upper), Some(mild_ask)) =
+        (input.mild_range_upper_raw, input.mild_range_ask_raw)
+    {
+        let mild_midpoint = midpoint(input.lower_range_upper_raw, mild_upper)?;
+
+        let mild = crash_bucket_leg(
+            AdvancedLegKind::Range,
+            "mild_downside",
+            None,
+            Some(input.lower_range_upper_raw),
+            Some(mild_upper),
+            mild_midpoint,
+            mild_ask,
+            input.spot_raw,
+            input.exposure_raw,
+            input.over_hedge_cap_bps,
+            input.gamma_bps,
+        )?;
+
+        legs.push(mild);
+    }
+
+    let mut result = allocate_weighted_budget(
+        AdvancedStrategyKind::PortfolioCrashShield,
+        input.budget_raw,
+        legs,
+    )?;
+
+    result.warnings.push(
+        "Portfolio-Aware Crash Shield only estimates BTC-equivalent exposure; it is not a guarantee against portfolio losses."
+            .to_string(),
+    );
+
+    Ok(result)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ConvexTailLadderInput {
+    pub spot_raw: u64,
+    pub budget_raw: u64,
+    pub dead_zone_bps: u16,
+    pub gamma_bps: u16,
+    pub k1_raw: u64,
+    pub k2_raw: u64,
+    pub k3_raw: u64,
+    pub k4_raw: u64,
+    pub down_tail_ask_raw: u64,
+    pub lower_range_ask_raw: u64,
+    pub upper_range_ask_raw: u64,
+    pub up_tail_ask_raw: u64,
+}
+
+pub fn compile_convex_tail_ladder(
+    input: ConvexTailLadderInput,
+) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
+    if input.spot_raw == 0 {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "spot_raw must be greater than zero".to_string(),
+        ));
+    }
+
+    let severe_down_mid = input.k1_raw.saturating_mul(99).checked_div(100).unwrap_or(input.k1_raw);
+
+    let down_range_mid = midpoint(input.k1_raw, input.k2_raw)?;
+    let up_range_mid = midpoint(input.k3_raw, input.k4_raw)?;
+
+    let severe_up_mid = input.k4_raw.saturating_mul(101).checked_div(100).unwrap_or(input.k4_raw);
+
+    let legs = vec![
+        tail_ladder_leg(
+            AdvancedLegKind::Down,
+            "extreme_downside",
+            Some(input.k1_raw),
+            None,
+            None,
+            severe_down_mid,
+            input.down_tail_ask_raw,
+            input.spot_raw,
+            input.dead_zone_bps,
+            input.gamma_bps,
+        )?,
+        tail_ladder_leg(
+            AdvancedLegKind::Range,
+            "moderate_downside",
+            None,
+            Some(input.k1_raw),
+            Some(input.k2_raw),
+            down_range_mid,
+            input.lower_range_ask_raw,
+            input.spot_raw,
+            input.dead_zone_bps,
+            input.gamma_bps,
+        )?,
+        tail_ladder_leg(
+            AdvancedLegKind::Range,
+            "moderate_upside",
+            None,
+            Some(input.k3_raw),
+            Some(input.k4_raw),
+            up_range_mid,
+            input.upper_range_ask_raw,
+            input.spot_raw,
+            input.dead_zone_bps,
+            input.gamma_bps,
+        )?,
+        tail_ladder_leg(
+            AdvancedLegKind::Up,
+            "extreme_upside",
+            Some(input.k4_raw),
+            None,
+            None,
+            severe_up_mid,
+            input.up_tail_ask_raw,
+            input.spot_raw,
+            input.dead_zone_bps,
+            input.gamma_bps,
+        )?,
+    ];
+
+    let mut result =
+        allocate_weighted_budget(AdvancedStrategyKind::ConvexTailLadder, input.budget_raw, legs)?;
+
+    result.warnings.push(
+        "Convex Tail Ladder is a terminal-expiry payoff. It does not pay for realized intraperiod volatility or touches before expiry."
+            .to_string(),
+    );
+
+    Ok(result)
+}
+
+fn crash_bucket_leg(
+    kind: AdvancedLegKind,
+    role: &'static str,
+    strike_raw: Option<u64>,
+    lower_raw: Option<u64>,
+    upper_raw: Option<u64>,
+    midpoint_raw: u64,
+    ask_price_raw: u64,
+    spot_raw: u64,
+    exposure_raw: u64,
+    over_hedge_cap_bps: u16,
+    gamma_bps: u16,
+) -> Result<AdvancedLegInput, AdvancedStrategyError> {
+    let portfolio_loss = portfolio_loss_raw(exposure_raw, spot_raw, midpoint_raw)?;
+
+    let weight_e6 = power_weight_e6(portfolio_loss, gamma_bps)?;
+
+    let max_quantity = if portfolio_loss == 0 {
+        Some(0)
+    } else {
+        let capped = (portfolio_loss as u128)
+            .checked_mul(over_hedge_cap_bps as u128)
+            .ok_or(AdvancedStrategyError::Overflow)?
+            / 10_000;
+        Some(u64_checked(capped)?)
+    };
+
+    Ok(AdvancedLegInput {
+        kind,
+        role,
+        strike_raw,
+        lower_raw,
+        upper_raw,
+        midpoint_raw,
+        ask_price_raw,
+        base_weight_e6: weight_e6,
+        max_quantity,
+    })
+}
+
+fn tail_ladder_leg(
+    kind: AdvancedLegKind,
+    role: &'static str,
+    strike_raw: Option<u64>,
+    lower_raw: Option<u64>,
+    upper_raw: Option<u64>,
+    midpoint_raw: u64,
+    ask_price_raw: u64,
+    spot_raw: u64,
+    dead_zone_bps: u16,
+    gamma_bps: u16,
+) -> Result<AdvancedLegInput, AdvancedStrategyError> {
+    let move_bps = abs_return_bps(midpoint_raw, spot_raw)?;
+    let excess_bps = move_bps.saturating_sub(dead_zone_bps as u64);
+
+    let weight_e6 = power_weight_e6(excess_bps, gamma_bps)?;
+
+    Ok(AdvancedLegInput {
+        kind,
+        role,
+        strike_raw,
+        lower_raw,
+        upper_raw,
+        midpoint_raw,
+        ask_price_raw,
+        base_weight_e6: weight_e6,
+        max_quantity: None,
+    })
+}
+
+fn portfolio_loss_raw(
+    exposure_raw: u64,
+    spot_raw: u64,
+    midpoint_raw: u64,
+) -> Result<u64, AdvancedStrategyError> {
+    if midpoint_raw >= spot_raw {
+        return Ok(0);
+    }
+
+    let price_drop = spot_raw - midpoint_raw;
+
+    let loss = (exposure_raw as u128)
+        .checked_mul(price_drop as u128)
+        .ok_or(AdvancedStrategyError::Overflow)?
+        / spot_raw as u128;
+
+    u64_checked(loss)
+}
+
+fn abs_return_bps(midpoint_raw: u64, spot_raw: u64) -> Result<u64, AdvancedStrategyError> {
+    if spot_raw == 0 {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "spot_raw must be greater than zero".to_string(),
+        ));
+    }
+
+    let diff = midpoint_raw.abs_diff(spot_raw);
+
+    let bps = (diff as u128).checked_mul(10_000).ok_or(AdvancedStrategyError::Overflow)?
+        / spot_raw as u128;
+
+    u64_checked(bps)
+}
+
+fn power_weight_e6(value: u64, gamma_bps: u16) -> Result<u64, AdvancedStrategyError> {
+    if value == 0 {
+        return Ok(0);
+    }
+
+    // Integer-friendly MVP:
+    // gamma <= 1.0  -> linear
+    // gamma > 1.0   -> convex but bounded: value * value / scale
+    // This avoids floating point in core deterministic allocation.
+    let weight = if gamma_bps <= 10_000 {
+        (value as u128).checked_mul(1_000_000).ok_or(AdvancedStrategyError::Overflow)?
+    } else {
+        (value as u128)
+            .checked_mul(value as u128)
+            .ok_or(AdvancedStrategyError::Overflow)?
+            .checked_mul(1_000_000)
+            .ok_or(AdvancedStrategyError::Overflow)?
+            / 10_000u128.max(value as u128)
+    };
+
+    let bounded = weight.min(u64::MAX as u128);
+
+    Ok(bounded as u64)
+}
+
+fn midpoint(a: u64, b: u64) -> Result<u64, AdvancedStrategyError> {
+    let sum = (a as u128).checked_add(b as u128).ok_or(AdvancedStrategyError::Overflow)?;
+    u64_checked(sum / 2)
+}
+
+fn ceil_div(numerator: u128, denominator: u128) -> Result<u128, AdvancedStrategyError> {
+    if denominator == 0 {
+        return Err(AdvancedStrategyError::Overflow);
+    }
+
+    Ok(numerator.checked_add(denominator - 1).ok_or(AdvancedStrategyError::Overflow)? / denominator)
+}
+
+fn u64_checked(value: u128) -> Result<u64, AdvancedStrategyError> {
+    u64::try_from(value).map_err(|_| AdvancedStrategyError::Overflow)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn crash_shield_caps_overhedge_and_may_leave_budget_unused() {
+        let input = PortfolioCrashShieldInput {
+            spot_raw: 100_000_000_000_000,
+            exposure_raw: 5_000_000_000,
+            budget_raw: 200_000_000,
+            over_hedge_cap_bps: 12_000,
+            gamma_bps: 10_000,
+            down_tail_strike_raw: 90_000_000_000_000,
+            lower_range_upper_raw: 95_000_000_000_000,
+            mild_range_upper_raw: Some(98_000_000_000_000),
+            down_tail_ask_raw: 45_000_000,
+            lower_range_ask_raw: 95_000_000,
+            mild_range_ask_raw: Some(120_000_000),
+        };
+
+        let result = compile_portfolio_crash_shield(input).unwrap();
+
+        assert_eq!(result.strategy, AdvancedStrategyKind::PortfolioCrashShield);
+        assert_eq!(result.legs.len(), 3);
+        assert!(result.used_budget_raw <= input.budget_raw);
+        assert!(result.unused_budget_raw > 0);
+        assert!(result.legs[0].quantity <= result.legs[0].max_quantity.unwrap());
+    }
+
+    #[test]
+    fn convex_tail_ladder_allocates_four_legs() {
+        let input = ConvexTailLadderInput {
+            spot_raw: 100_000_000_000_000,
+            budget_raw: 100_000_000,
+            dead_zone_bps: 200,
+            gamma_bps: 15_000,
+            k1_raw: 95_000_000_000_000,
+            k2_raw: 98_000_000_000_000,
+            k3_raw: 102_000_000_000_000,
+            k4_raw: 105_000_000_000_000,
+            down_tail_ask_raw: 80_000_000,
+            lower_range_ask_raw: 130_000_000,
+            upper_range_ask_raw: 120_000_000,
+            up_tail_ask_raw: 70_000_000,
+        };
+
+        let result = compile_convex_tail_ladder(input).unwrap();
+
+        assert_eq!(result.strategy, AdvancedStrategyKind::ConvexTailLadder);
+        assert_eq!(result.legs.len(), 4);
+        assert!(result.used_budget_raw <= input.budget_raw);
+        assert!(result.legs.iter().all(|leg| leg.quantity > 0));
+    }
+
+    #[test]
+    fn weighted_allocator_rejects_zero_budget() {
+        let err = allocate_weighted_budget(AdvancedStrategyKind::ConvexTailLadder, 0, vec![])
+            .unwrap_err();
+
+        assert!(matches!(err, AdvancedStrategyError::ZeroBudget));
+    }
+}

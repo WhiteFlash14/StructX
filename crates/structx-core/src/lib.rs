@@ -1,3 +1,9 @@
+pub use advanced_strategies::{
+    allocate_weighted_budget, compile_convex_tail_ladder, compile_portfolio_crash_shield,
+    AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegInput, AdvancedLegKind,
+    AdvancedStrategyError, AdvancedStrategyKind, ConvexTailLadderInput, PortfolioCrashShieldInput,
+};
+pub mod advanced_strategies;
 pub use breakout_optimizer::{
     estimate_breakout_premium_raw, optimize_breakout_quantities, BreakoutAskInputs,
     BreakoutOptimizerError, BreakoutStyle, OptimizedBreakoutQuantities,
