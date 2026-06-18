@@ -14,11 +14,12 @@ use deepbook_client::{
     SUI_CLOCK_OBJECT_ID,
 };
 use structx_core::{
-    build_create_manager_tx_kind, build_manager_balance_tx_kind, build_mint_tx_kind,
-    build_quote_plan, build_quote_tx_kind, compile_breakout, guard_quote_preview,
-    select_best_market, select_candidate_markets, CompiledPayoff, DisplayPrice, MintObjectRefs,
-    PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs,
-    QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
+    build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
+    build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, compile_breakout,
+    guard_quote_preview, select_best_market, select_candidate_markets, CompiledPayoff,
+    DisplayPrice, ManagerPositionRead, MintObjectRefs, PredictLeg, PriceScale, QuoteAssetDisplay,
+    QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg,
+    QuoteTxKind, SelectedMarket, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -200,6 +201,23 @@ enum Command {
             default_value = "0x0000000000000000000000000000000000000000000000000000000000000000"
         )]
         sender: String,
+    },
+
+    ManagerPositions {
+        #[arg(long)]
+        manager_id: String,
+
+        #[arg(long)]
+        from_execution_json: PathBuf,
+
+        #[arg(
+            long,
+            default_value = "0x0000000000000000000000000000000000000000000000000000000000000000"
+        )]
+        sender: String,
+
+        #[arg(long, default_value_t = false)]
+        expect_exact: bool,
     },
     DevinspectMintBreakout {
         #[arg(long)]
@@ -414,6 +432,17 @@ async fn main() -> std::process::ExitCode {
         }
         Command::ManagerBalance { manager_id, sender } => {
             manager_balance_command(cli.rpc_url, manager_id, sender).await
+        }
+
+        Command::ManagerPositions { manager_id, from_execution_json, sender, expect_exact } => {
+            manager_positions_command(
+                cli.rpc_url,
+                manager_id,
+                from_execution_json,
+                sender,
+                expect_exact,
+            )
+            .await
         }
         Command::DevinspectMintBreakout {
             manager_id,
@@ -1480,6 +1509,268 @@ struct DevinspectMintBreakoutArgs {
     write_execute_script: bool,
     execute_script_path: PathBuf,
     execute_plan_json_path: PathBuf,
+}
+
+async fn manager_positions_command(
+    rpc_url: String,
+    manager_id: String,
+    from_execution_json: PathBuf,
+    sender: String,
+    expect_exact: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let reads = load_position_reads_from_execution_json(&from_execution_json)?;
+
+    if reads.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no PositionMinted or RangeMinted events found",
+        )
+        .into());
+    }
+
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+
+    let manager = resolve_sui_object(&rpc, &manager_id).await?;
+    print_manager_preflight(&manager);
+    validate_predict_manager_object(&manager)?;
+
+    let tx_kind = build_manager_positions_tx_kind(&reads, &manager, &sender)?;
+
+    println!("Built manager-positions TransactionKind");
+    println!("sender: {}", tx_kind.sender);
+    println!("tx_kind_b64_len: {}", tx_kind.tx_kind_b64.len());
+    println!("position result command indices: {:?}", tx_kind.quote_result_command_indices);
+    println!();
+
+    let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+
+    print_manager_positions_response(&reads, &tx_kind, &response, expect_exact)?;
+
+    Ok(())
+}
+
+fn load_position_reads_from_execution_json(
+    path: &Path,
+) -> Result<Vec<ManagerPositionRead>, Box<dyn std::error::Error>> {
+    let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+
+    let events = value
+        .get("events")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing events array"))?;
+
+    let mut reads = Vec::new();
+
+    for event in events {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+
+        let parsed = event.get("parsedJson").unwrap_or(&serde_json::Value::Null);
+
+        if event_type.ends_with("::predict::PositionMinted") {
+            reads.push(ManagerPositionRead::Binary {
+                oracle_id: json_required_string(parsed, "oracle_id")?,
+                expiry_ms: json_required_u64(parsed, "expiry")?,
+                strike_raw: json_required_u64(parsed, "strike")?,
+                is_up: json_required_bool(parsed, "is_up")?,
+                expected_quantity: json_required_u64(parsed, "quantity")?,
+            });
+        } else if event_type.ends_with("::predict::RangeMinted") {
+            reads.push(ManagerPositionRead::Range {
+                oracle_id: json_required_string(parsed, "oracle_id")?,
+                expiry_ms: json_required_u64(parsed, "expiry")?,
+                lower_raw: json_required_u64(parsed, "lower_strike")?,
+                upper_raw: json_required_u64(parsed, "higher_strike")?,
+                expected_quantity: json_required_u64(parsed, "quantity")?,
+            });
+        }
+    }
+
+    Ok(reads)
+}
+
+fn print_manager_positions_response(
+    reads: &[ManagerPositionRead],
+    tx_kind: &QuoteTxKind,
+    response: &serde_json::Value,
+    expect_exact: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    println!("devInspect status: {status}");
+
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+
+    let results = response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing devInspect results"))?;
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "#",
+        "kind",
+        "direction",
+        "strike/lower",
+        "upper",
+        "minted qty",
+        "manager qty",
+        "check",
+    ]);
+
+    for (idx, read) in reads.iter().enumerate() {
+        let command_idx = tx_kind
+            .quote_result_command_indices
+            .get(idx)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing command index"))?;
+
+        let result = results.get(*command_idx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing result for command {command_idx}"),
+            )
+        })?;
+
+        let return_values =
+            result.get("returnValues").and_then(serde_json::Value::as_array).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing returnValues for command {command_idx}"),
+                )
+            })?;
+
+        if return_values.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected 1 position return, got {}", return_values.len()),
+            )
+            .into());
+        }
+
+        let actual_quantity = decode_devinspect_u64(&return_values[0])?;
+        let expected_quantity = position_expected_quantity(read);
+
+        let accepted = if expect_exact {
+            actual_quantity == expected_quantity
+        } else {
+            actual_quantity >= expected_quantity
+        };
+
+        let check = if accepted { "ok" } else { "bad" };
+
+        match read {
+            ManagerPositionRead::Binary { strike_raw, is_up, .. } => {
+                table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new("binary"),
+                    Cell::new(if *is_up { "up" } else { "down" }),
+                    Cell::new(format_raw_price_e9(*strike_raw)),
+                    Cell::new("—"),
+                    Cell::new(expected_quantity),
+                    Cell::new(actual_quantity),
+                    Cell::new(check),
+                ]);
+            }
+            ManagerPositionRead::Range { lower_raw, upper_raw, .. } => {
+                table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new("range"),
+                    Cell::new("—"),
+                    Cell::new(format_raw_price_e9(*lower_raw)),
+                    Cell::new(format_raw_price_e9(*upper_raw)),
+                    Cell::new(expected_quantity),
+                    Cell::new(actual_quantity),
+                    Cell::new(check),
+                ]);
+            }
+        }
+
+        if !accepted {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "position check failed at index {idx}: expected {}, actual {}",
+                    expected_quantity, actual_quantity
+                ),
+            )
+            .into());
+        }
+    }
+
+    println!("Manager position verification");
+    println!("{table}");
+    println!();
+    println!("Manager positions: ok ({})", if expect_exact { "exact" } else { "actual >= minted" });
+
+    Ok(())
+}
+
+fn position_expected_quantity(read: &ManagerPositionRead) -> u64 {
+    match read {
+        ManagerPositionRead::Binary { expected_quantity, .. }
+        | ManagerPositionRead::Range { expected_quantity, .. } => *expected_quantity,
+    }
+}
+
+fn json_required_string(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<String, Box<dyn std::error::Error>> {
+    value.get(key).and_then(serde_json::Value::as_str).map(ToString::to_string).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("missing string field `{key}`")).into()
+    })
+}
+
+fn json_required_u64(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let item = value.get(key).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("missing u64 field `{key}`"))
+    })?;
+
+    match item {
+        serde_json::Value::String(s) => Ok(s.parse::<u64>()?),
+        serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("invalid u64 field `{key}`")).into()
+        }),
+        _ => {
+            Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid u64 field `{key}`"))
+                .into())
+        }
+    }
+}
+
+fn json_required_bool(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let item = value.get(key).ok_or_else(|| {
+        io::Error::new(io::ErrorKind::InvalidData, format!("missing bool field `{key}`"))
+    })?;
+
+    match item {
+        serde_json::Value::Bool(value) => Ok(*value),
+        serde_json::Value::String(s) if s == "true" => Ok(true),
+        serde_json::Value::String(s) if s == "false" => Ok(false),
+        _ => Err(io::Error::new(io::ErrorKind::InvalidData, format!("invalid bool field `{key}`"))
+            .into()),
+    }
+}
+
+fn format_raw_price_e9(raw: u64) -> String {
+    let cents = (raw + 5_000_000) / 10_000_000;
+    let whole = cents / 100;
+    let frac = cents % 100;
+
+    format!("{whole}.{frac:02}")
 }
 
 async fn devinspect_mint_breakout_command(
