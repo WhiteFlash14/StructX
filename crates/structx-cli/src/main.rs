@@ -15,11 +15,11 @@ use deepbook_client::{
 };
 use structx_core::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
-    build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, compile_breakout,
-    guard_quote_preview, select_best_market, select_candidate_markets, CompiledPayoff,
-    DisplayPrice, ManagerPositionRead, MintObjectRefs, PredictLeg, PriceScale, QuoteAssetDisplay,
-    QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg,
-    QuoteTxKind, SelectedMarket, Strike,
+    build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
+    compile_breakout, guard_quote_preview, select_best_market, select_candidate_markets,
+    CompiledPayoff, DisplayPrice, ManagerPositionRead, MintObjectRefs, PredictLeg, PriceScale,
+    QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview,
+    QuotePreviewLeg, QuoteTxKind, SelectedMarket, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -223,6 +223,20 @@ enum Command {
     AuditExecution {
         #[arg(long)]
         from_execution_json: PathBuf,
+    },
+
+    DevinspectRedeemBreakout {
+        #[arg(long)]
+        manager_id: String,
+
+        #[arg(long)]
+        sender: String,
+
+        #[arg(long)]
+        from_execution_json: PathBuf,
+
+        #[arg(long)]
+        min_total_payout_raw: Option<u64>,
     },
     DevinspectMintBreakout {
         #[arg(long)]
@@ -452,6 +466,22 @@ async fn main() -> std::process::ExitCode {
 
         Command::AuditExecution { from_execution_json } => {
             audit_execution_command(from_execution_json)
+        }
+
+        Command::DevinspectRedeemBreakout {
+            manager_id,
+            sender,
+            from_execution_json,
+            min_total_payout_raw,
+        } => {
+            devinspect_redeem_breakout_command(
+                cli.rpc_url,
+                manager_id,
+                sender,
+                from_execution_json,
+                min_total_payout_raw,
+            )
+            .await
         }
         Command::DevinspectMintBreakout {
             manager_id,
@@ -1632,6 +1662,203 @@ fn audit_execution_command(from_execution_json: PathBuf) -> Result<(), Box<dyn s
     println!("total cost: {}", asset.format_amount(total_cost_raw));
 
     Ok(())
+}
+
+async fn devinspect_redeem_breakout_command(
+    rpc_url: String,
+    manager_id: String,
+    sender: String,
+    from_execution_json: PathBuf,
+    min_total_payout_raw: Option<u64>,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let reads = load_position_reads_from_execution_json(&from_execution_json)?;
+
+    if reads.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no PositionMinted or RangeMinted events found",
+        )
+        .into());
+    }
+
+    let oracle_id = first_oracle_id(&reads)?;
+
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+
+    let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let manager = resolve_sui_object(&rpc, &manager_id).await?;
+    let oracle = resolve_sui_object(&rpc, &oracle_id).await?;
+    let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
+
+    validate_predict_manager_object(&manager)?;
+    validate_quote_object_refs(&predict, &oracle, &clock)?;
+
+    println!("Redeem source");
+    println!("execution json: {}", display_path(&from_execution_json));
+    println!("manager_id: {manager_id}");
+    println!("oracle_id: {oracle_id}");
+    println!("legs: {}", reads.len());
+    println!();
+
+    let tx_kind = build_redeem_tx_kind(
+        &reads,
+        MintObjectRefs { predict: &predict, manager: &manager, oracle: &oracle, clock: &clock },
+        &sender,
+    )?;
+
+    println!("Built redeem TransactionKind");
+    println!("sender: {}", tx_kind.sender);
+    println!("tx_kind_b64_len: {}", tx_kind.tx_kind_b64.len());
+    println!("redeem command indices: {:?}", tx_kind.quote_result_command_indices);
+    println!();
+
+    let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+
+    let total_payout_raw = print_devinspect_redeem_response(&response)?;
+
+    if let Some(min_total_payout_raw) = min_total_payout_raw {
+        if total_payout_raw < min_total_payout_raw {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "redeem payout {} is below minimum {}",
+                    total_payout_raw, min_total_payout_raw
+                ),
+            )
+            .into());
+        }
+
+        println!("Redeem payout guard: accepted");
+        println!("min_total_payout_raw: {min_total_payout_raw}");
+        println!("actual_total_payout_raw: {total_payout_raw}");
+    } else {
+        println!("Redeem payout guard: skipped; pass --min-total-payout-raw to enforce a floor");
+    }
+
+    println!();
+    println!("Important: this was devInspect only. No positions were redeemed.");
+
+    Ok(())
+}
+
+fn first_oracle_id(reads: &[ManagerPositionRead]) -> Result<String, Box<dyn std::error::Error>> {
+    let first = reads
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty position reads"))?;
+
+    let oracle_id = match first {
+        ManagerPositionRead::Binary { oracle_id, .. }
+        | ManagerPositionRead::Range { oracle_id, .. } => oracle_id,
+    };
+
+    for read in reads {
+        let current = match read {
+            ManagerPositionRead::Binary { oracle_id, .. }
+            | ManagerPositionRead::Range { oracle_id, .. } => oracle_id,
+        };
+
+        if current != oracle_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution JSON contains multiple oracle IDs; split redemption per oracle",
+            )
+            .into());
+        }
+    }
+
+    Ok(oracle_id.clone())
+}
+
+fn print_devinspect_redeem_response(
+    response: &serde_json::Value,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let status = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    println!("redeem devInspect status: {status}");
+
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+
+    let events =
+        response.get("events").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+    let mut total_payout_raw = 0u64;
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "event",
+        "direction",
+        "strike/lower",
+        "upper",
+        "quantity",
+        "payout raw",
+        "payout",
+        "bid price",
+        "settled",
+    ]);
+
+    for event in events {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+
+        let parsed = event.get("parsedJson").unwrap_or(&serde_json::Value::Null);
+
+        if event_type.ends_with("::predict::PositionRedeemed") {
+            let payout = json_required_u64(parsed, "payout")?;
+            total_payout_raw = total_payout_raw
+                .checked_add(payout)
+                .ok_or_else(|| io::Error::other("total payout overflow"))?;
+
+            let is_up = json_required_bool(parsed, "is_up")?;
+
+            table.add_row(vec![
+                Cell::new("PositionRedeemed"),
+                Cell::new(if is_up { "up" } else { "down" }),
+                Cell::new(format_raw_price_e9(json_required_u64(parsed, "strike")?)),
+                Cell::new("—"),
+                Cell::new(json_required_u64(parsed, "quantity")?),
+                Cell::new(payout),
+                Cell::new(asset.format_amount(payout)),
+                Cell::new(json_required_string(parsed, "bid_price")?),
+                Cell::new(json_required_bool(parsed, "is_settled")?),
+            ]);
+        } else if event_type.ends_with("::predict::RangeRedeemed") {
+            let payout = json_required_u64(parsed, "payout")?;
+            total_payout_raw = total_payout_raw
+                .checked_add(payout)
+                .ok_or_else(|| io::Error::other("total payout overflow"))?;
+
+            table.add_row(vec![
+                Cell::new("RangeRedeemed"),
+                Cell::new("—"),
+                Cell::new(format_raw_price_e9(json_required_u64(parsed, "lower_strike")?)),
+                Cell::new(format_raw_price_e9(json_required_u64(parsed, "higher_strike")?)),
+                Cell::new(json_required_u64(parsed, "quantity")?),
+                Cell::new(payout),
+                Cell::new(asset.format_amount(payout)),
+                Cell::new(json_required_string(parsed, "bid_price")?),
+                Cell::new(json_required_bool(parsed, "is_settled")?),
+            ]);
+        }
+    }
+
+    println!("Redeem preview events");
+    println!("{table}");
+    println!();
+
+    println!("Redeem payout summary");
+    println!("total payout raw: {total_payout_raw}");
+    println!("total payout: {}", asset.format_amount(total_payout_raw));
+
+    Ok(total_payout_raw)
 }
 
 async fn manager_positions_command(
