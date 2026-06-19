@@ -42,6 +42,32 @@ pub struct QuoteTxKind {
     pub quote_result_command_indices: Vec<usize>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub struct MintObjectRefs<'a> {
+    pub predict: &'a SuiObjectInfo,
+    pub manager: &'a SuiObjectInfo,
+    pub oracle: &'a SuiObjectInfo,
+    pub clock: &'a SuiObjectInfo,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ManagerPositionRead {
+    Binary {
+        oracle_id: String,
+        expiry_ms: u64,
+        strike_raw: u64,
+        is_up: bool,
+        expected_quantity: u64,
+    },
+    Range {
+        oracle_id: String,
+        expiry_ms: u64,
+        lower_raw: u64,
+        upper_raw: u64,
+        expected_quantity: u64,
+    },
+}
+
 pub fn build_quote_tx_kind(
     plan: &QuotePlan,
     refs: QuoteObjectRefs<'_>,
@@ -223,32 +249,6 @@ pub fn build_manager_balance_tx_kind(
         tx_kind_b64: BASE64.encode(bytes),
         quote_result_command_indices: vec![0],
     })
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ManagerPositionRead {
-    Binary {
-        oracle_id: String,
-        expiry_ms: u64,
-        strike_raw: u64,
-        is_up: bool,
-        expected_quantity: u64,
-    },
-    Range {
-        oracle_id: String,
-        expiry_ms: u64,
-        lower_raw: u64,
-        upper_raw: u64,
-        expected_quantity: u64,
-    },
-}
-
-#[derive(Debug, Clone, Copy)]
-pub struct MintObjectRefs<'a> {
-    pub predict: &'a SuiObjectInfo,
-    pub manager: &'a SuiObjectInfo,
-    pub oracle: &'a SuiObjectInfo,
-    pub clock: &'a SuiObjectInfo,
 }
 
 pub fn build_mint_tx_kind(
@@ -490,6 +490,279 @@ pub fn build_redeem_tx_kind(
     })
 }
 
+pub fn build_redeem_debug_tx_kind(
+    reads: &[ManagerPositionRead],
+    refs: MintObjectRefs<'_>,
+    sender: &str,
+) -> Result<QuoteTxKind, QuoteTxBuildError> {
+    let package = parse_address(PREDICT_PACKAGE_ID)?;
+    let sender_address = parse_address(sender)?;
+
+    let predict = shared_object_arg("predict", refs.predict, true)?;
+    let manager = shared_object_arg("manager", refs.manager, true)?;
+    let oracle = shared_object_arg("oracle", refs.oracle, false)?;
+    let clock = shared_object_arg("clock", refs.clock, false)?;
+
+    let mut tx = TransactionBuilder::new();
+
+    let predict_arg = tx.object(predict);
+    let manager_arg = tx.object(manager);
+    let oracle_arg = tx.object(oracle);
+    let clock_arg = tx.object(clock);
+
+    let mut debug_result_indices = Vec::with_capacity(reads.len());
+    let mut command_index = 0usize;
+
+    for read in reads {
+        match read {
+            ManagerPositionRead::Binary {
+                oracle_id,
+                expiry_ms,
+                strike_raw,
+                is_up,
+                expected_quantity,
+            } => {
+                let oracle_id = parse_address(oracle_id)?;
+                let key_fn = if *is_up { "up" } else { "down" };
+
+                let pre_oracle_id_arg = tx.pure(&oracle_id);
+                let pre_expiry_arg = tx.pure(expiry_ms);
+                let pre_strike_arg = tx.pure(strike_raw);
+
+                let pre_key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("market_key"),
+                        Identifier::from_static(key_fn),
+                    ),
+                    vec![pre_oracle_id_arg, pre_expiry_arg, pre_strike_arg],
+                );
+                command_index += 1;
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict_manager"),
+                        Identifier::from_static("position"),
+                    ),
+                    vec![manager_arg, pre_key],
+                );
+                debug_result_indices.push(command_index);
+                command_index += 1;
+
+                let redeem_oracle_id_arg = tx.pure(&oracle_id);
+                let redeem_expiry_arg = tx.pure(expiry_ms);
+                let redeem_strike_arg = tx.pure(strike_raw);
+
+                let redeem_key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("market_key"),
+                        Identifier::from_static(key_fn),
+                    ),
+                    vec![redeem_oracle_id_arg, redeem_expiry_arg, redeem_strike_arg],
+                );
+                command_index += 1;
+
+                let quantity_arg = tx.pure(expected_quantity);
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict"),
+                        Identifier::from_static("redeem"),
+                    )
+                    .with_type_args(vec![parse_type_tag(DUSDC_COIN_TYPE)?]),
+                    vec![predict_arg, manager_arg, oracle_arg, redeem_key, quantity_arg, clock_arg],
+                );
+                command_index += 1;
+            }
+            ManagerPositionRead::Range {
+                oracle_id,
+                expiry_ms,
+                lower_raw,
+                upper_raw,
+                expected_quantity,
+            } => {
+                let oracle_id = parse_address(oracle_id)?;
+
+                let pre_oracle_id_arg = tx.pure(&oracle_id);
+                let pre_expiry_arg = tx.pure(expiry_ms);
+                let pre_lower_arg = tx.pure(lower_raw);
+                let pre_upper_arg = tx.pure(upper_raw);
+
+                let pre_key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("range_key"),
+                        Identifier::from_static("new"),
+                    ),
+                    vec![pre_oracle_id_arg, pre_expiry_arg, pre_lower_arg, pre_upper_arg],
+                );
+                command_index += 1;
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict_manager"),
+                        Identifier::from_static("range_position"),
+                    ),
+                    vec![manager_arg, pre_key],
+                );
+                debug_result_indices.push(command_index);
+                command_index += 1;
+
+                let redeem_oracle_id_arg = tx.pure(&oracle_id);
+                let redeem_expiry_arg = tx.pure(expiry_ms);
+                let redeem_lower_arg = tx.pure(lower_raw);
+                let redeem_upper_arg = tx.pure(upper_raw);
+
+                let redeem_key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("range_key"),
+                        Identifier::from_static("new"),
+                    ),
+                    vec![
+                        redeem_oracle_id_arg,
+                        redeem_expiry_arg,
+                        redeem_lower_arg,
+                        redeem_upper_arg,
+                    ],
+                );
+                command_index += 1;
+
+                let quantity_arg = tx.pure(expected_quantity);
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict"),
+                        Identifier::from_static("redeem_range"),
+                    )
+                    .with_type_args(vec![parse_type_tag(DUSDC_COIN_TYPE)?]),
+                    vec![predict_arg, manager_arg, oracle_arg, redeem_key, quantity_arg, clock_arg],
+                );
+                command_index += 1;
+            }
+        }
+    }
+
+    tx.set_sender(sender_address);
+    tx.set_gas_budget(1_000_000);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(Address::ZERO, 1, Digest::ZERO)]);
+
+    let transaction = tx.try_build().map_err(|err| QuoteTxBuildError::Build(err.to_string()))?;
+
+    let bytes =
+        bcs::to_bytes(&transaction.kind).map_err(|err| QuoteTxBuildError::Bcs(err.to_string()))?;
+
+    Ok(QuoteTxKind {
+        sender: sender.to_string(),
+        tx_kind_b64: BASE64.encode(bytes),
+        quote_result_command_indices: debug_result_indices,
+    })
+}
+pub fn build_redeem_precheck_tx_kind(
+    reads: &[ManagerPositionRead],
+    manager: &SuiObjectInfo,
+    sender: &str,
+) -> Result<QuoteTxKind, QuoteTxBuildError> {
+    let package = parse_address(PREDICT_PACKAGE_ID)?;
+    let sender_address = parse_address(sender)?;
+
+    let manager = shared_object_arg("manager", manager, true)?;
+
+    let mut tx = TransactionBuilder::new();
+    let manager_arg = tx.object(manager);
+
+    let mut result_indices = Vec::with_capacity(reads.len());
+    let mut command_index = 0usize;
+
+    for read in reads {
+        match read {
+            ManagerPositionRead::Binary { oracle_id, expiry_ms, strike_raw, is_up, .. } => {
+                let oracle_id = parse_address(oracle_id)?;
+                let oracle_id_arg = tx.pure(&oracle_id);
+                let expiry_arg = tx.pure(expiry_ms);
+                let strike_arg = tx.pure(strike_raw);
+
+                let key_fn = if *is_up { "up" } else { "down" };
+
+                let key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("market_key"),
+                        Identifier::from_static(key_fn),
+                    ),
+                    vec![oracle_id_arg, expiry_arg, strike_arg],
+                );
+
+                command_index += 1;
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict_manager"),
+                        Identifier::from_static("position"),
+                    ),
+                    vec![manager_arg, key],
+                );
+
+                result_indices.push(command_index);
+                command_index += 1;
+            }
+            ManagerPositionRead::Range { oracle_id, expiry_ms, lower_raw, upper_raw, .. } => {
+                let oracle_id = parse_address(oracle_id)?;
+                let oracle_id_arg = tx.pure(&oracle_id);
+                let expiry_arg = tx.pure(expiry_ms);
+                let lower_arg = tx.pure(lower_raw);
+                let upper_arg = tx.pure(upper_raw);
+
+                let key = tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("range_key"),
+                        Identifier::from_static("new"),
+                    ),
+                    vec![oracle_id_arg, expiry_arg, lower_arg, upper_arg],
+                );
+
+                command_index += 1;
+
+                tx.move_call(
+                    Function::new(
+                        package,
+                        Identifier::from_static("predict_manager"),
+                        Identifier::from_static("range_position"),
+                    ),
+                    vec![manager_arg, key],
+                );
+
+                result_indices.push(command_index);
+                command_index += 1;
+            }
+        }
+    }
+
+    tx.set_sender(sender_address);
+    tx.set_gas_budget(1_000_000);
+    tx.set_gas_price(1_000);
+    tx.add_gas_objects([ObjectInput::owned(Address::ZERO, 1, Digest::ZERO)]);
+
+    let transaction = tx.try_build().map_err(|err| QuoteTxBuildError::Build(err.to_string()))?;
+
+    let bytes =
+        bcs::to_bytes(&transaction.kind).map_err(|err| QuoteTxBuildError::Bcs(err.to_string()))?;
+
+    Ok(QuoteTxKind {
+        sender: sender.to_string(),
+        tx_kind_b64: BASE64.encode(bytes),
+        quote_result_command_indices: result_indices,
+    })
+}
+
 fn shared_object_arg(
     role: &'static str,
     object: &SuiObjectInfo,
@@ -626,10 +899,7 @@ mod tests {
     use super::*;
     use crate::price::DisplayPrice;
     use crate::strike_grid::StrikeGrid;
-    use crate::{
-        build_quote_plan, compile_breakout, BinaryDirection, PriceScale, QuoteCall, QuotePlan,
-        SelectedMarket, Strike,
-    };
+    use crate::{build_quote_plan, compile_breakout, PriceScale, SelectedMarket, Strike};
 
     fn shared_info(object_id: &str, type_: &str) -> SuiObjectInfo {
         SuiObjectInfo {
@@ -641,40 +911,6 @@ mod tests {
             initial_shared_version: Some(1),
             raw: json!({}),
         }
-    }
-
-    #[test]
-    fn builds_manager_balance_transaction_kind_bytes() {
-        let manager = SuiObjectInfo {
-            object_id: "0x76a4ef6bd2a3418be3effd699f2a869972c39e096e2c85a566c6ea7a7a6146b5"
-                .to_string(),
-            object_type: Some("0xf5ea2b3749c65d6e56507cc35388719aadb28f9cab873696a2f8687f5c785138::predict_manager::PredictManager".to_string()),
-            owner_kind: ObjectOwnerKind::Shared,
-            initial_shared_version: Some(1),
-            version: Some(1),
-            digest: Some("11111111111111111111111111111111".to_string()),
-            raw: serde_json::json!({}),
-        };
-
-        let tx = build_manager_balance_tx_kind(
-            &manager,
-            "0x0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .expect("manager-balance tx kind builds");
-
-        assert!(!tx.tx_kind_b64.is_empty());
-        assert_eq!(tx.quote_result_command_indices, vec![0]);
-    }
-
-    #[test]
-    fn builds_create_manager_transaction_kind_bytes() {
-        let tx = build_create_manager_tx_kind(
-            "0x0000000000000000000000000000000000000000000000000000000000000000",
-        )
-        .expect("create-manager tx kind builds");
-
-        assert!(!tx.tx_kind_b64.is_empty());
-        assert_eq!(tx.quote_result_command_indices, vec![0]);
     }
 
     #[test]

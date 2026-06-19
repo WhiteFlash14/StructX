@@ -180,6 +180,18 @@ mod tests {
     }
 
     #[test]
+    fn prefers_farther_expiry_within_same_status_bucket() {
+        let markets = vec![
+            market("0xnear", Duration::hours(2), StructxMarketStatus::UsableWithWarnings(vec![])),
+            market("0xfar", Duration::hours(8), StructxMarketStatus::UsableWithWarnings(vec![])),
+        ];
+
+        let selected = select_best_market(&markets, PriceScale::E9).expect("market selected");
+
+        assert_eq!(selected.oracle_id, "0xfar");
+    }
+
+    #[test]
     fn builds_selected_market_grid_and_spot() {
         let markets = vec![market("0xabc", Duration::hours(1), StructxMarketStatus::Usable)];
 

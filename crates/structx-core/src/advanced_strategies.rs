@@ -79,6 +79,23 @@ impl BarrierSide {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmartBudgetStyle {
+    TailHeavy,
+    Balanced,
+    HigherHitRate,
+}
+
+impl SmartBudgetStyle {
+    pub fn from_api_value(value: &str) -> Self {
+        match value {
+            "tail-heavy" | "TAIL_HEAVY" => Self::TailHeavy,
+            "higher-hit-rate" | "HIGHER_HIT_RATE" => Self::HigherHitRate,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdvancedLegKind {
     Down,
     Range,
@@ -145,23 +162,6 @@ pub enum AdvancedStrategyError {
 
     #[error("invalid input: {0}")]
     InvalidInput(String),
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SmartBudgetStyle {
-    TailHeavy,
-    Balanced,
-    HigherHitRate,
-}
-
-impl SmartBudgetStyle {
-    pub fn from_api_value(value: &str) -> Self {
-        match value {
-            "tail-heavy" | "TAIL_HEAVY" => Self::TailHeavy,
-            "higher-hit-rate" | "HIGHER_HIT_RATE" => Self::HigherHitRate,
-            _ => Self::Balanced,
-        }
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -326,10 +326,10 @@ pub fn allocate_weighted_budget(
         let lambda_num =
             remaining_budget.checked_mul(PRICE_SCALE_E9).ok_or(AdvancedStrategyError::Overflow)?;
 
-        let mut next_active = Vec::<AdvancedLegInput>::new();
+        let current_active = std::mem::take(&mut active);
         let mut any_finalized = false;
 
-        for leg in active {
+        for leg in current_active {
             let raw_qty = lambda_num
                 .checked_mul(leg.base_weight_e6 as u128)
                 .ok_or(AdvancedStrategyError::Overflow)?
@@ -411,22 +411,10 @@ pub fn allocate_weighted_budget(
 
             remaining_budget = remaining_budget.saturating_sub(premium);
             any_finalized = true;
-
-            if leg.max_quantity.is_none() {
-                // Uncapped legs are done in this MVP allocator. We do not re-enter
-                // them because one pass gives the exact weight allocation.
-            } else if raw_qty <= capped_qty {
-                // Capped leg did not bind, so it is done.
-            } else {
-                // Capped leg bound, do not re-add it.
-            }
         }
-
         if !any_finalized {
             break;
         }
-
-        active = std::mem::take(&mut next_active);
     }
 
     if compiled.is_empty() {
@@ -1382,6 +1370,7 @@ pub fn compile_near_barrier_proxy(
     Ok(result)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn expiry_move_leg(
     kind: AdvancedLegKind,
     role: &'static str,

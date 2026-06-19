@@ -66,7 +66,7 @@ impl StrikeGrid {
             }
         }
 
-        (raw - self.min_raw) % self.tick_size_raw == 0
+        (raw - self.min_raw).is_multiple_of(self.tick_size_raw)
     }
 
     #[must_use]

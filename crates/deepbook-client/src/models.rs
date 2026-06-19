@@ -39,12 +39,7 @@ pub struct QuoteAsset {
 impl QuoteAsset {
     #[must_use]
     pub fn from_coin_type(coin_type: String) -> Self {
-        Self {
-            coin_type: Some(coin_type),
-            symbol: None,
-            decimals: None,
-            extra: Map::new(),
-        }
+        Self { coin_type: Some(coin_type), symbol: None, decimals: None, extra: Map::new() }
     }
 }
 
