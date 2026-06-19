@@ -10,6 +10,7 @@ pub enum AdvancedStrategyKind {
     ExpiryMoveNote,
     MoonshotUpside,
     DownsideConvexity,
+    UpsideStepLadder,
     RangeConviction,
     SmartBudgetSelector,
 }
@@ -22,6 +23,7 @@ impl AdvancedStrategyKind {
             "EXPIRY_MOVE_NOTE" | "expiry_move_note" => Ok(Self::ExpiryMoveNote),
             "MOONSHOT_UPSIDE" | "moonshot_upside" => Ok(Self::MoonshotUpside),
             "DOWNSIDE_CONVEXITY" | "downside_convexity" => Ok(Self::DownsideConvexity),
+            "UPSIDE_STEP_LADDER" | "upside_step_ladder" => Ok(Self::UpsideStepLadder),
             "RANGE_CONVICTION" | "range_conviction" => Ok(Self::RangeConviction),
             "SMART_BUDGET_SELECTOR" | "smart_budget_selector" => Ok(Self::SmartBudgetSelector),
             other => Err(AdvancedStrategyError::UnknownStrategy(other.to_string())),
@@ -35,6 +37,7 @@ impl AdvancedStrategyKind {
             Self::ExpiryMoveNote => "EXPIRY_MOVE_NOTE",
             Self::MoonshotUpside => "MOONSHOT_UPSIDE",
             Self::DownsideConvexity => "DOWNSIDE_CONVEXITY",
+            Self::UpsideStepLadder => "UPSIDE_STEP_LADDER",
             Self::RangeConviction => "RANGE_CONVICTION",
             Self::SmartBudgetSelector => "SMART_BUDGET_SELECTOR",
         }
@@ -565,6 +568,21 @@ pub struct DownsideConvexityInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct UpsideStepLadderInput {
+    pub spot_raw: u64,
+    pub budget_raw: u64,
+    pub center_raw: u64,
+    pub k3_raw: u64,
+    pub k4_raw: u64,
+    pub near_up_range_ask_raw: u64,
+    pub upper_range_ask_raw: u64,
+    pub up_tail_ask_raw: u64,
+    pub near_range_weight_bps: u16,
+    pub upper_range_weight_bps: u16,
+    pub tail_gamma_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeConvictionInput {
     pub budget_raw: u64,
     pub lower_raw: u64,
@@ -911,6 +929,96 @@ pub fn compile_downside_convexity(
     result
         .warnings
         .push("Downside Convexity is terminal-expiry exposure, not a touch option.".to_string());
+
+    Ok(result)
+}
+
+pub fn compile_upside_step_ladder(
+    input: UpsideStepLadderInput,
+) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
+    if input.spot_raw == 0 {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "spot_raw must be greater than zero".to_string(),
+        ));
+    }
+
+    if !(input.center_raw < input.k3_raw && input.k3_raw < input.k4_raw) {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "upside step ladder requires center < k3 < k4".to_string(),
+        ));
+    }
+
+    let near_weight_bps = input.near_range_weight_bps.min(10_000);
+    let upper_weight_bps = input
+        .upper_range_weight_bps
+        .min(10_000u16.saturating_sub(near_weight_bps));
+    let tail_weight_bps = 10_000u16
+        .saturating_sub(near_weight_bps)
+        .saturating_sub(upper_weight_bps);
+
+    let near_mid = midpoint(input.center_raw, input.k3_raw)?;
+    let upper_mid = midpoint(input.k3_raw, input.k4_raw)?;
+    let tail_mid = input
+        .k4_raw
+        .saturating_mul(101)
+        .checked_div(100)
+        .unwrap_or(input.k4_raw);
+
+    let mut near_range = tail_ladder_leg(
+        AdvancedLegKind::Range,
+        "near_upside_step",
+        None,
+        Some(input.center_raw),
+        Some(input.k3_raw),
+        near_mid,
+        input.near_up_range_ask_raw,
+        input.spot_raw,
+        0,
+        10_000,
+    )?;
+    near_range.base_weight_e6 = scale_weight_bps(near_range.base_weight_e6, near_weight_bps)?;
+
+    let mut upper_range = tail_ladder_leg(
+        AdvancedLegKind::Range,
+        "upper_upside_step",
+        None,
+        Some(input.k3_raw),
+        Some(input.k4_raw),
+        upper_mid,
+        input.upper_range_ask_raw,
+        input.spot_raw,
+        0,
+        12_000,
+    )?;
+    upper_range.base_weight_e6 = scale_weight_bps(upper_range.base_weight_e6, upper_weight_bps)?;
+
+    let mut up_tail = tail_ladder_leg(
+        AdvancedLegKind::Up,
+        "upside_continuation_tail",
+        Some(input.k4_raw),
+        None,
+        None,
+        tail_mid,
+        input.up_tail_ask_raw,
+        input.spot_raw,
+        0,
+        input.tail_gamma_bps,
+    )?;
+    up_tail.base_weight_e6 = scale_weight_bps(up_tail.base_weight_e6, tail_weight_bps)?;
+
+    let mut result = allocate_weighted_budget(
+        AdvancedStrategyKind::UpsideStepLadder,
+        input.budget_raw,
+        vec![near_range, upper_range, up_tail],
+    )?;
+
+    result.warnings.push(
+        "Upside Step Ladder is upside-biased. It can expire worthless if BTC settles below the first upside step."
+            .to_string(),
+    );
+    result
+        .warnings
+        .push("Upside Step Ladder is terminal-expiry exposure, not a touch option.".to_string());
 
     Ok(result)
 }
@@ -1307,4 +1415,37 @@ mod tests {
 
         assert!(result.legs.iter().any(|leg| leg.role == "crash_tail"));
     }
+    
+    #[test]
+fn upside_step_ladder_allocates_three_upside_steps() {
+    let input = UpsideStepLadderInput {
+        spot_raw: 100_000_000_000_000,
+        budget_raw: 100_000_000,
+        center_raw: 100_000_000_000_000,
+        k3_raw: 102_000_000_000_000,
+        k4_raw: 105_000_000_000_000,
+        near_up_range_ask_raw: 180_000_000,
+        upper_range_ask_raw: 120_000_000,
+        up_tail_ask_raw: 70_000_000,
+        near_range_weight_bps: 4_000,
+        upper_range_weight_bps: 3_500,
+        tail_gamma_bps: 15_000,
+    };
+
+    let result = compile_upside_step_ladder(input).unwrap();
+
+    assert_eq!(result.strategy, AdvancedStrategyKind::UpsideStepLadder);
+    assert_eq!(result.legs.len(), 3);
+    assert!(result.used_budget_raw <= input.budget_raw);
+    assert!(result.legs.iter().any(|leg| leg.role == "near_upside_step"));
+    assert!(result
+        .legs
+        .iter()
+        .any(|leg| leg.role == "upper_upside_step"));
+    assert!(result
+        .legs
+        .iter()
+        .any(|leg| leg.role == "upside_continuation_tail"));
+}
+
 }

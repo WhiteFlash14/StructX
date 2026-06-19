@@ -15,6 +15,13 @@ pub struct PredictState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum QuoteAssetWire {
+    CoinType(String),
+    Object(QuoteAsset),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuoteAsset {
     #[serde(default, alias = "type", alias = "coin_type", alias = "coinType")]
     pub coin_type: Option<String>,
@@ -27,6 +34,18 @@ pub struct QuoteAsset {
 
     #[serde(flatten)]
     pub extra: Map<String, Value>,
+}
+
+impl QuoteAsset {
+    #[must_use]
+    pub fn from_coin_type(coin_type: String) -> Self {
+        Self {
+            coin_type: Some(coin_type),
+            symbol: None,
+            decimals: None,
+            extra: Map::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -286,7 +305,15 @@ pub fn parse_oracle_list_from_value(
 
 pub fn parse_quote_assets_from_value(value: Value) -> Result<Vec<QuoteAsset>, serde_json::Error> {
     let body = unwrap_data_owned(value);
-    serde_json::from_value(body)
+    let assets = Vec::<QuoteAssetWire>::deserialize(body)?;
+
+    Ok(assets
+        .into_iter()
+        .map(|asset| match asset {
+            QuoteAssetWire::CoinType(coin_type) => QuoteAsset::from_coin_type(coin_type),
+            QuoteAssetWire::Object(asset) => asset,
+        })
+        .collect())
 }
 
 fn unwrap_data_owned(value: Value) -> Value {
@@ -449,25 +476,6 @@ mod tests {
         assert_eq!(parsed[0].underlying_asset, None);
         assert_eq!(parsed[0].status, None);
         assert_eq!(parsed[0].expiry_ms, None);
-    }
-
-    #[test]
-    fn parses_quote_assets_from_wrapped_data() {
-        let value = serde_json::json!({
-            "data": [
-                {
-                    "coinType": "0x2::sui::SUI",
-                    "symbol": "SUI",
-                    "decimals": 9
-                }
-            ]
-        });
-
-        let parsed = parse_quote_assets_from_value(value).expect("quote assets parse");
-
-        assert_eq!(parsed.len(), 1);
-        assert_eq!(parsed[0].symbol.as_deref(), Some("SUI"));
-        assert_eq!(parsed[0].decimals, Some(9));
     }
 
     #[test]

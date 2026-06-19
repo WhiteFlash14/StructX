@@ -18,15 +18,15 @@ use structx_core::{
     build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
     compile_breakout, compile_bucket_payoff, compile_convex_tail_ladder,
     compile_downside_convexity, compile_expiry_move_note, compile_moonshot_upside,
-    compile_portfolio_crash_shield, compile_range_conviction, guard_quote_preview,
-    optimize_breakout_quantities, score_smart_candidate, select_best_market,
+    compile_portfolio_crash_shield, compile_range_conviction, compile_upside_step_ladder,
+    guard_quote_preview, optimize_breakout_quantities, score_smart_candidate, select_best_market,
     select_candidate_markets, AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegKind,
     AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle, CompiledPayoff, ConvexTailLadderInput,
     DisplayPrice, DownsideConvexityInput, ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs,
     MoonshotUpsideInput, PayoffBucket, PortfolioCrashShieldInput, PredictLeg, PriceScale,
     QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview,
     QuotePreviewLeg, QuoteTxKind, RangeConvictionInput, SelectedMarket, SmartBudgetStyle,
-    SmartCandidateMetrics, SmartCandidateScore, Strike,
+    SmartCandidateMetrics, SmartCandidateScore, Strike, UpsideStepLadderInput,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -278,6 +278,15 @@ enum Command {
 
         #[arg(long, default_value_t = 15_000)]
         downside_tail_gamma_bps: u16,
+
+        #[arg(long, default_value_t = 4_000)]
+        upside_near_range_weight_bps: u16,
+
+        #[arg(long, default_value_t = 3_500)]
+        upside_upper_range_weight_bps: u16,
+
+        #[arg(long, default_value_t = 15_000)]
+        upside_tail_gamma_bps: u16,
     },
     DemoStatus {
         #[arg(long)]
@@ -570,6 +579,9 @@ async fn main() -> std::process::ExitCode {
             dead_zone_bps,
             moonshot_range_weight_bps,
             moonshot_tail_gamma_bps,
+            upside_near_range_weight_bps,
+            upside_upper_range_weight_bps,
+            upside_tail_gamma_bps,
             downside_range_weight_bps,
             downside_tail_gamma_bps,
         } => {
@@ -590,12 +602,13 @@ async fn main() -> std::process::ExitCode {
                 over_hedge_cap_bps,
                 convex_gamma_bps,
                 dead_zone_bps,
-
                 moonshot_range_weight_bps,
                 moonshot_tail_gamma_bps,
-
                 downside_range_weight_bps,
                 downside_tail_gamma_bps,
+                upside_near_range_weight_bps,
+                upside_upper_range_weight_bps,
+                upside_tail_gamma_bps,
             })
             .await
         }
@@ -888,31 +901,31 @@ async fn plan_quote_breakout_command(
     Ok(())
 }
 
-struct CompileStrategyJsonArgs {
-    server_url: String,
-    predict_id: String,
-    rpc_url: String,
-    owner: String,
-    strategy: String,
-    budget_dusdc: String,
-    style: String,
-    expiry_preference: String,
-    slippage_bps: u16,
-    bucket_step: DisplayPrice,
-    levels_each_side: u32,
-    max_quote_market_attempts: usize,
-    portfolio_exposure_dusdc: f64,
-    over_hedge_cap_bps: u16,
-    convex_gamma_bps: u16,
-    dead_zone_bps: u16,
-
-    moonshot_range_weight_bps: u16,
-    moonshot_tail_gamma_bps: u16,
-
-    downside_range_weight_bps: u16,
-    downside_tail_gamma_bps: u16,
+pub struct CompileStrategyJsonArgs {
+    pub server_url: String,
+    pub predict_id: String,
+    pub rpc_url: String,
+    pub owner: String,
+    pub strategy: String,
+    pub budget_dusdc: String,
+    pub style: String,
+    pub expiry_preference: String,
+    pub slippage_bps: u16,
+    pub bucket_step: DisplayPrice,
+    pub levels_each_side: u32,
+    pub max_quote_market_attempts: usize,
+    pub portfolio_exposure_dusdc: f64,
+    pub over_hedge_cap_bps: u16,
+    pub convex_gamma_bps: u16,
+    pub dead_zone_bps: u16,
+    pub moonshot_range_weight_bps: u16,
+    pub moonshot_tail_gamma_bps: u16,
+    pub downside_range_weight_bps: u16,
+    pub downside_tail_gamma_bps: u16,
+    pub upside_near_range_weight_bps: u16,
+    pub upside_upper_range_weight_bps: u16,
+    pub upside_tail_gamma_bps: u16,
 }
-
 #[derive(Debug, Clone)]
 struct SmartCompiledCandidate {
     strategy: String,
@@ -1215,19 +1228,11 @@ async fn quote_single_binary_ask_raw(
     };
 
     let probe_plan = build_quote_plan(selected, &probe_compiled)?;
-    let probe_tx_kind = build_quote_tx_kind(
-        &probe_plan,
-        QuoteObjectRefs {
-            predict,
-            oracle,
-            clock,
-        },
-        &args.owner,
-    )?;
+    let probe_tx_kind =
+        build_quote_tx_kind(&probe_plan, QuoteObjectRefs { predict, oracle, clock }, &args.owner)?;
 
-    let probe_response = rpc
-        .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
-        .await?;
+    let probe_response =
+        rpc.dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64).await?;
 
     let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
     let Some((mint_cost_raw, _)) = probe_costs.first() else {
@@ -1240,7 +1245,6 @@ async fn quote_single_binary_ask_raw(
 
     Ok(infer_ask_price_raw(*mint_cost_raw, probe_quantity))
 }
-
 
 fn dusdc_f64_to_raw(value: f64) -> Result<u64, Box<dyn std::error::Error>> {
     if !value.is_finite() || value <= 0.0 {
@@ -1959,6 +1963,7 @@ async fn compile_strategy_json_command(
             | AdvancedStrategyKind::ExpiryMoveNote
             | AdvancedStrategyKind::MoonshotUpside
             | AdvancedStrategyKind::DownsideConvexity
+            | AdvancedStrategyKind::UpsideStepLadder
             | AdvancedStrategyKind::RangeConviction
             | AdvancedStrategyKind::SmartBudgetSelector),
         ) => Some(strategy),
@@ -2427,8 +2432,15 @@ async fn compile_smart_budget_selector_from_market(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let style = SmartBudgetStyle::from_api_value(&args.style);
 
-    let candidate_strategies =
-        ["BREAKOUT_PROTECTION", "PORTFOLIO_CRASH_SHIELD", "CONVEX_TAIL_LADDER", "EXPIRY_MOVE_NOTE"];
+    let candidate_strategies = [
+        "BREAKOUT_PROTECTION",
+        "PORTFOLIO_CRASH_SHIELD",
+        "CONVEX_TAIL_LADDER",
+        "EXPIRY_MOVE_NOTE",
+        "MOONSHOT_UPSIDE",
+        "DOWNSIDE_CONVEXITY",
+        "UPSIDE_STEP_LADDER",
+    ];
 
     let mut candidates = Vec::<SmartCompiledCandidate>::new();
     let mut selector_warnings = warnings;
@@ -2495,6 +2507,34 @@ async fn compile_smart_budget_selector_from_market(
                 compile_advanced_strategy_json_from_market(
                     args,
                     AdvancedStrategyKind::MoonshotUpside,
+                    selected,
+                    predict,
+                    oracle,
+                    clock,
+                    rpc,
+                    asset,
+                    vec![],
+                )
+                .await
+            }
+            "DOWNSIDE_CONVEXITY" => {
+                compile_advanced_strategy_json_from_market(
+                    args,
+                    AdvancedStrategyKind::DownsideConvexity,
+                    selected,
+                    predict,
+                    oracle,
+                    clock,
+                    rpc,
+                    asset,
+                    vec![],
+                )
+                .await
+            }
+            "UPSIDE_STEP_LADDER" => {
+                compile_advanced_strategy_json_from_market(
+                    args,
+                    AdvancedStrategyKind::UpsideStepLadder,
                     selected,
                     predict,
                     oracle,
@@ -2727,6 +2767,19 @@ fn payoff_weights_bps(strategy: &str, len: usize) -> Vec<u16> {
                 weights
             }
         },
+        "UPSIDE_STEP_LADDER" => match len {
+            0 => vec![],
+            1 => vec![10_000],
+            2 => vec![4_500, 5_500],
+            3 => vec![3_000, 3_500, 3_500],
+            _ => {
+                let mut weights = vec![0u16; len];
+                weights[len - 3] = 3_000;
+                weights[len - 2] = 3_500;
+                weights[len - 1] = 3_500;
+                weights
+            }
+        },
         _ => match len {
             0 => vec![],
             1 => vec![10_000],
@@ -2757,6 +2810,7 @@ fn estimate_hit_probability_bps(output: &serde_json::Value, strategy: &str) -> u
         "CONVEX_TAIL_LADDER" => 3_500,
         "EXPIRY_MOVE_NOTE" => 4_500,
         "MOONSHOT_UPSIDE" => 2_000,
+        "UPSIDE_STEP_LADDER" => 3_200,
         "BREAKOUT_PROTECTION" => 4_000,
         _ => (leg_count as u16).saturating_mul(800).min(6_000),
     }
@@ -2773,6 +2827,7 @@ fn estimate_worst_case_improvement(
         "CONVEX_TAIL_LADDER" => 7_000u64,
         "EXPIRY_MOVE_NOTE" => 5_000u64,
         "MOONSHOT_UPSIDE" => 6_000u64,
+        "UPSIDE_STEP_LADDER" => 6_500u64,
         "BREAKOUT_PROTECTION" => 7_000u64,
         _ => 5_000u64,
     };
@@ -2989,7 +3044,7 @@ async fn compile_advanced_strategy_json_from_market(
             })?
         }
 
-         AdvancedStrategyKind::DownsideConvexity => {
+        AdvancedStrategyKind::DownsideConvexity => {
             let ask_down_tail = quote_single_binary_ask_raw(
                 args,
                 selected,
@@ -3026,6 +3081,58 @@ async fn compile_advanced_strategy_json_from_market(
             })?
         }
 
+        AdvancedStrategyKind::UpsideStepLadder => {
+            let ask_near_up_range = quote_single_range_ask_raw(
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                center.raw,
+                k3.raw,
+                probe_quantity,
+            )
+            .await?;
+            let ask_upper_range = quote_single_range_ask_raw(
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k3.raw,
+                k4.raw,
+                probe_quantity,
+            )
+            .await?;
+            let ask_up_tail = quote_single_binary_ask_raw(
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k4.raw,
+                true,
+                probe_quantity,
+            )
+            .await?;
+
+            compile_upside_step_ladder(UpsideStepLadderInput {
+                spot_raw: selected.spot_raw,
+                budget_raw,
+                center_raw: center.raw,
+                k3_raw: k3.raw,
+                k4_raw: k4.raw,
+                near_up_range_ask_raw: ask_near_up_range,
+                upper_range_ask_raw: ask_upper_range,
+                up_tail_ask_raw: ask_up_tail,
+                near_range_weight_bps: args.upside_near_range_weight_bps,
+                upper_range_weight_bps: args.upside_upper_range_weight_bps,
+                tail_gamma_bps: args.upside_tail_gamma_bps,
+            })?
+        }
 
         AdvancedStrategyKind::RangeConviction => {
             let probe_compiled =
