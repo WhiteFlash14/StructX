@@ -16,11 +16,13 @@ use deepbook_client::{
 use structx_core::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
     build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
-    compile_breakout, guard_quote_preview, optimize_breakout_quantities, select_best_market,
-    select_candidate_markets, BreakoutAskInputs, BreakoutStyle, CompiledPayoff, DisplayPrice,
-    ManagerPositionRead, MintObjectRefs, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall,
-    QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind,
-    SelectedMarket, Strike,
+    compile_breakout, compile_bucket_payoff,compile_convex_tail_ladder, compile_portfolio_crash_shield,
+    guard_quote_preview, optimize_breakout_quantities, select_best_market,
+    select_candidate_markets, AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegKind,
+    AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle, CompiledPayoff, ConvexTailLadderInput,
+    DisplayPrice, ManagerPositionRead, MintObjectRefs, PortfolioCrashShieldInput, PredictLeg,
+    PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan,
+    QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket,Strike,PayoffBucket,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -248,6 +250,18 @@ enum Command {
 
         #[arg(long, default_value_t = 5)]
         max_quote_market_attempts: usize,
+
+        #[arg(long, default_value_t = 5_000.0)]
+        portfolio_exposure_dusdc: f64,
+
+        #[arg(long, default_value_t = 12_000)]
+        over_hedge_cap_bps: u16,
+
+        #[arg(long, default_value_t = 15_000)]
+        convex_gamma_bps: u16,
+
+        #[arg(long, default_value_t = 200)]
+        dead_zone_bps: u16,
     },
     DemoStatus {
         #[arg(long)]
@@ -534,6 +548,10 @@ async fn main() -> std::process::ExitCode {
             bucket_step_usd,
             levels_each_side,
             max_quote_market_attempts,
+            portfolio_exposure_dusdc,
+            over_hedge_cap_bps,
+            convex_gamma_bps,
+            dead_zone_bps,
         } => {
             compile_strategy_json_command(CompileStrategyJsonArgs {
                 server_url: cli.server_url,
@@ -548,6 +566,10 @@ async fn main() -> std::process::ExitCode {
                 bucket_step: DisplayPrice(bucket_step_usd),
                 levels_each_side,
                 max_quote_market_attempts,
+                portfolio_exposure_dusdc,
+                over_hedge_cap_bps,
+                convex_gamma_bps,
+                dead_zone_bps,
             })
             .await
         }
@@ -853,6 +875,10 @@ struct CompileStrategyJsonArgs {
     bucket_step: DisplayPrice,
     levels_each_side: u32,
     max_quote_market_attempts: usize,
+    portfolio_exposure_dusdc: f64,
+    over_hedge_cap_bps: u16,
+    convex_gamma_bps: u16,
+    dead_zone_bps: u16,
 }
 
 struct DevinspectQuoteBreakoutArgs {
@@ -1083,6 +1109,22 @@ fn infer_ask_price_raw(cost_raw: u64, quantity: u64) -> u64 {
 
     (((cost_raw as u128) * 1_000_000_000u128) / quantity as u128).max(1).min(u64::MAX as u128)
         as u64
+}
+
+fn dusdc_f64_to_raw(value: f64) -> Result<u64, Box<dyn std::error::Error>> {
+    if !value.is_finite() || value <= 0.0 {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "dUSDC value must be positive").into()
+        );
+    }
+
+    let raw = (value * 1_000_000.0).round();
+
+    if raw > u64::MAX as f64 {
+        return Err(io::Error::new(io::ErrorKind::InvalidInput, "dUSDC overflow").into());
+    }
+
+    Ok(raw as u64)
 }
 
 fn parse_dusdc_to_raw(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
@@ -1778,10 +1820,20 @@ struct PositionCheckSummary {
 async fn compile_strategy_json_command(
     args: CompileStrategyJsonArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    if args.strategy != "BREAKOUT_PROTECTION" {
+    let advanced_strategy = match AdvancedStrategyKind::from_api_value(&args.strategy) {
+        Ok(
+            strategy @ (
+                AdvancedStrategyKind::PortfolioCrashShield
+                | AdvancedStrategyKind::ConvexTailLadder
+            ),
+        ) => Some(strategy),
+        _ => None,
+    };
+
+    if args.strategy != "BREAKOUT_PROTECTION" && advanced_strategy.is_none() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "only BREAKOUT_PROTECTION is supported in this milestone",
+            "strategy is not wired into compile-strategy-json yet",
         )
         .into());
     }
@@ -1793,6 +1845,8 @@ async fn compile_strategy_json_command(
         )
         .into());
     }
+
+   
 
     let budget_raw = parse_dusdc_to_raw(&args.budget_dusdc)?;
     let style = BreakoutStyle::from_api_value(&args.style)?;
@@ -1812,6 +1866,8 @@ async fn compile_strategy_json_command(
     let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
     let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
 
+    
+
     let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
 
     let mut warnings = vec![
@@ -1829,6 +1885,31 @@ async fn compile_strategy_json_command(
         if let Err(err) = validate_quote_object_refs(&predict, &oracle, &clock) {
             warnings.push(format!("skipped oracle {}: {err}", selected.oracle_id));
             continue;
+        }
+
+        if let Some(strategy_kind) = advanced_strategy {
+            match compile_advanced_strategy_json_from_market(
+                &args,
+                strategy_kind,
+                &selected,
+                &predict,
+                &oracle,
+                &clock,
+                &rpc,
+                &asset,
+                warnings.clone(),
+            )
+            .await
+            {
+                Ok(output) => {
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                    return Ok(());
+                }
+                Err(err) => {
+                    warnings.push(format!("skipped oracle {}: {err}", selected.oracle_id));
+                    continue;
+                }
+            }
         }
 
         let strikes = selected.grid.centered_strikes_by_display_step(
@@ -2006,6 +2087,429 @@ async fn compile_strategy_json_command(
         format!("failed to compile strategy after {max_attempts} market attempts"),
     )
     .into())
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compile_advanced_strategy_json_from_market(
+    args: &CompileStrategyJsonArgs,
+    strategy_kind: AdvancedStrategyKind,
+    selected: &SelectedMarket<'_>,
+    predict: &SuiObjectInfo,
+    oracle: &SuiObjectInfo,
+    clock: &SuiObjectInfo,
+    rpc: &SuiRpcClient,
+    asset: &QuoteAssetDisplay,
+    warnings: Vec<String>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let budget_raw = parse_dusdc_to_raw(&args.budget_dusdc)?;
+
+    let strikes = selected.grid.centered_strikes_by_display_step(
+        selected.spot_raw,
+        args.bucket_step,
+        args.levels_each_side,
+    )?;
+
+    let center = selected
+        .grid
+        .snap_nearest(selected.spot_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
+
+    let center_idx = strikes
+        .iter()
+        .position(|strike| strike.raw == center.raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
+
+    if center_idx < 2 || center_idx + 2 >= strikes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not enough strikes around spot for advanced strategy",
+        )
+        .into());
+    }
+
+    let k1 = strikes[center_idx - 2];
+    let k2 = strikes[center_idx - 1];
+    let k3 = strikes[center_idx + 1];
+    let k4 = strikes[center_idx + 2];
+
+    let probe_quantity = 1_000_000u64;
+
+let advanced_result = match strategy_kind {
+    AdvancedStrategyKind::PortfolioCrashShield => {
+        let exposure_raw = dusdc_f64_to_raw(args.portfolio_exposure_dusdc)?;
+
+        let probe_compiled = compile_bucket_payoff(&[
+            PayoffBucket::new(None, Some(k1), probe_quantity),
+            PayoffBucket::new(Some(k1), Some(k2), probe_quantity),
+            PayoffBucket::new(Some(k2), Some(k3), probe_quantity),
+        ])?;
+
+        let probe_plan = build_quote_plan(selected, &probe_compiled)?;
+
+        let probe_tx_kind = build_quote_tx_kind(
+            &probe_plan,
+            QuoteObjectRefs {
+                predict,
+                oracle,
+                clock,
+            },
+            &args.owner,
+        )?;
+
+        let probe_response = rpc
+            .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
+            .await?;
+
+        let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
+
+        if probe_costs.len() != 3 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected 3 crash-shield probe quote legs, got {}", probe_costs.len()),
+            )
+            .into());
+        }
+
+        let ask_down_tail = infer_ask_price_raw(probe_costs[0].0, probe_quantity);
+        let ask_lower_range = infer_ask_price_raw(probe_costs[1].0, probe_quantity);
+        let ask_mild_range = infer_ask_price_raw(probe_costs[2].0, probe_quantity);
+
+        compile_portfolio_crash_shield(PortfolioCrashShieldInput {
+            spot_raw: selected.spot_raw,
+            exposure_raw,
+            budget_raw,
+            over_hedge_cap_bps: args.over_hedge_cap_bps,
+            gamma_bps: 10_000,
+            down_tail_strike_raw: k1.raw,
+            lower_range_upper_raw: k2.raw,
+            mild_range_upper_raw: Some(k3.raw),
+            down_tail_ask_raw: ask_down_tail,
+            lower_range_ask_raw: ask_lower_range,
+            mild_range_ask_raw: Some(ask_mild_range),
+        })?
+    }
+    AdvancedStrategyKind::ConvexTailLadder => {
+        let probe_compiled = compile_bucket_payoff(&[
+            PayoffBucket::new(None, Some(k1), probe_quantity),
+            PayoffBucket::new(Some(k1), Some(k2), probe_quantity),
+            PayoffBucket::new(Some(k3), Some(k4), probe_quantity),
+            PayoffBucket::new(Some(k4), None, probe_quantity),
+        ])?;
+
+        let probe_plan = build_quote_plan(selected, &probe_compiled)?;
+
+        let probe_tx_kind = build_quote_tx_kind(
+            &probe_plan,
+            QuoteObjectRefs {
+                predict,
+                oracle,
+                clock,
+            },
+            &args.owner,
+        )?;
+
+        let probe_response = rpc
+            .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
+            .await?;
+
+        let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
+
+        if probe_costs.len() != 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected 4 tail-ladder probe quote legs, got {}", probe_costs.len()),
+            )
+            .into());
+        }
+
+        let ask_down_tail = infer_ask_price_raw(probe_costs[0].0, probe_quantity);
+        let ask_lower_range = infer_ask_price_raw(probe_costs[1].0, probe_quantity);
+        let ask_upper_range = infer_ask_price_raw(probe_costs[2].0, probe_quantity);
+        let ask_up_tail = infer_ask_price_raw(probe_costs[3].0, probe_quantity);
+
+        compile_convex_tail_ladder(ConvexTailLadderInput {
+            spot_raw: selected.spot_raw,
+            budget_raw,
+            dead_zone_bps: args.dead_zone_bps,
+            gamma_bps: args.convex_gamma_bps,
+            k1_raw: k1.raw,
+            k2_raw: k2.raw,
+            k3_raw: k3.raw,
+            k4_raw: k4.raw,
+            down_tail_ask_raw: ask_down_tail,
+            lower_range_ask_raw: ask_lower_range,
+            upper_range_ask_raw: ask_upper_range,
+            up_tail_ask_raw: ask_up_tail,
+        })?
+    }
+    other => {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("advanced strategy not wired yet: {}", other.api_value()),
+        )
+        .into());
+    }
+};
+
+    let final_compiled = advanced_result_to_compiled_payoff(&advanced_result)?;
+    let final_plan = build_quote_plan(selected, &final_compiled)?;
+
+    let final_tx_kind =
+        build_quote_tx_kind(&final_plan, QuoteObjectRefs { predict, oracle, clock }, &args.owner)?;
+
+    let final_response =
+        rpc.dev_inspect_transaction_kind(&final_tx_kind.sender, &final_tx_kind.tx_kind_b64).await?;
+
+    let final_costs = quote_costs_from_response(&final_tx_kind, &final_response)?;
+
+    if final_costs.len() != advanced_result.legs.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "final quote returned {} legs, expected {}",
+                final_costs.len(),
+                advanced_result.legs.len()
+            ),
+        )
+        .into());
+    }
+
+    let total_cost_raw = final_costs
+        .iter()
+        .try_fold(0u64, |acc, (cost, _)| acc.checked_add(*cost))
+        .ok_or_else(|| io::Error::other("total cost overflow"))?;
+
+    let max_gross_payout_raw =
+        advanced_result.legs.iter().map(|leg| leg.quantity).max().unwrap_or(0);
+
+    let max_loss_raw = total_cost_raw;
+    let max_net_payout_raw = max_gross_payout_raw.saturating_sub(total_cost_raw);
+
+    let mut all_warnings = warnings;
+    all_warnings.extend(advanced_result.warnings.clone());
+    all_warnings.push("Advanced strategy quantities are generated by StructX optimizer and re-quoted live before wallet signing.".to_string());
+
+    if total_cost_raw > budget_raw {
+        all_warnings.push(format!(
+            "Final quote exceeds budget: required {}, budget {}. Transaction build should refuse unless user increases budget.",
+            total_cost_raw, budget_raw
+        ));
+    }
+
+    let compiled_strategy_id = format!(
+        "{}:{}:{}:{}:{}",
+        strategy_kind.api_value(),
+        args.owner,
+        selected.oracle_id,
+        selected.expiry.timestamp_millis(),
+        total_cost_raw
+    );
+
+    let legs_json = advanced_result
+        .legs
+        .iter()
+        .zip(final_costs.iter())
+        .map(|(leg, (premium_raw, _))| advanced_leg_json(leg, *premium_raw, asset))
+        .collect::<Vec<_>>();
+
+    let payoff_table = advanced_payoff_table_json(&advanced_result.legs, total_cost_raw, asset);
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "compiledStrategyId": compiled_strategy_id,
+        "strategy": strategy_kind.api_value(),
+        "network": "sui:testnet",
+        "owner": args.owner,
+        "oracleId": selected.oracle_id,
+        "expiry": selected.expiry.to_rfc3339(),
+        "spot": format_raw_price_e9(selected.spot_raw),
+        "style": args.style,
+        "budgetRaw": budget_raw.to_string(),
+        "budgetDisplay": asset.format_amount(budget_raw),
+        "premiumRequiredRaw": total_cost_raw.to_string(),
+        "premiumRequiredDisplay": asset.format_amount(total_cost_raw),
+        "maxLossRaw": max_loss_raw.to_string(),
+        "maxLossDisplay": asset.format_amount(max_loss_raw),
+        "maxGrossPayoutRaw": max_gross_payout_raw.to_string(),
+        "maxGrossPayoutDisplay": asset.format_amount(max_gross_payout_raw),
+        "maxNetPayoutRaw": max_net_payout_raw.to_string(),
+        "maxNetPayoutDisplay": asset.format_amount(max_net_payout_raw),
+        "strikes": {
+            "k1": format_raw_price_e9(k1.raw),
+            "k2": format_raw_price_e9(k2.raw),
+            "k3": format_raw_price_e9(k3.raw),
+            "k4": format_raw_price_e9(k4.raw),
+            "k1Raw": k1.raw.to_string(),
+            "k2Raw": k2.raw.to_string(),
+            "k3Raw": k3.raw.to_string(),
+            "k4Raw": k4.raw.to_string()
+        },
+        "advanced": {
+            "requestedBudgetRaw": advanced_result.requested_budget_raw.to_string(),
+            "usedBudgetRaw": advanced_result.used_budget_raw.to_string(),
+            "unusedBudgetRaw": advanced_result.unused_budget_raw.to_string(),
+            "portfolioExposureDUSDC": args.portfolio_exposure_dusdc,
+            "overHedgeCapBps": args.over_hedge_cap_bps,
+            "deadZoneBps": args.dead_zone_bps,
+            "convexGammaBps": args.convex_gamma_bps
+        },
+        "legs": legs_json,
+        "payoffTable": payoff_table,
+        "warnings": all_warnings
+    }))
+}
+
+fn advanced_result_to_compiled_payoff(
+    result: &AdvancedCompileResult,
+) -> Result<CompiledPayoff, Box<dyn std::error::Error>> {
+    let mut buckets = Vec::new();
+
+    for leg in &result.legs {
+        if leg.quantity == 0 {
+            continue;
+        }
+
+        match leg.kind {
+            AdvancedLegKind::Down => {
+                let strike_raw = leg.strike_raw.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "DOWN leg missing strike")
+                })?;
+
+                buckets.push(PayoffBucket::new(
+                    None,
+                    Some(Strike { raw: strike_raw }),
+                    leg.quantity,
+                ));
+            }
+            AdvancedLegKind::Up => {
+                let strike_raw = leg.strike_raw.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "UP leg missing strike")
+                })?;
+
+                buckets.push(PayoffBucket::new(
+                    Some(Strike { raw: strike_raw }),
+                    None,
+                    leg.quantity,
+                ));
+            }
+            AdvancedLegKind::Range => {
+                let lower_raw = leg.lower_raw.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "RANGE leg missing lower")
+                })?;
+                let upper_raw = leg.upper_raw.ok_or_else(|| {
+                    io::Error::new(io::ErrorKind::InvalidData, "RANGE leg missing upper")
+                })?;
+
+                buckets.push(PayoffBucket::new(
+                    Some(Strike { raw: lower_raw }),
+                    Some(Strike { raw: upper_raw }),
+                    leg.quantity,
+                ));
+            }
+        }
+    }
+
+    if buckets.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "advanced strategy produced no legs",
+        )
+        .into());
+    }
+
+    compile_bucket_payoff(&buckets).map_err(|err| err.into())
+}
+
+fn advanced_leg_json(
+    leg: &AdvancedCompiledLeg,
+    premium_raw: u64,
+    asset: &QuoteAssetDisplay,
+) -> serde_json::Value {
+    match leg.kind {
+        AdvancedLegKind::Down => serde_json::json!({
+            "kind": "DOWN",
+            "role": leg.role,
+            "strike": format_raw_price_e9(leg.strike_raw.unwrap_or_default()),
+            "strikeRaw": leg.strike_raw.unwrap_or_default().to_string(),
+            "quantityRaw": leg.quantity.to_string(),
+            "quantityDisplay": asset.format_amount(leg.quantity),
+            "askPriceRaw": leg.ask_price_raw.to_string(),
+            "premiumRaw": premium_raw.to_string(),
+            "premiumDisplay": asset.format_amount(premium_raw),
+            "midpoint": format_raw_price_e9(leg.midpoint_raw),
+            "midpointRaw": leg.midpoint_raw.to_string(),
+            "weightE6": leg.weight_e6.to_string(),
+            "maxQuantity": leg.max_quantity.map(|v| v.to_string())
+        }),
+        AdvancedLegKind::Up => serde_json::json!({
+            "kind": "UP",
+            "role": leg.role,
+            "strike": format_raw_price_e9(leg.strike_raw.unwrap_or_default()),
+            "strikeRaw": leg.strike_raw.unwrap_or_default().to_string(),
+            "quantityRaw": leg.quantity.to_string(),
+            "quantityDisplay": asset.format_amount(leg.quantity),
+            "askPriceRaw": leg.ask_price_raw.to_string(),
+            "premiumRaw": premium_raw.to_string(),
+            "premiumDisplay": asset.format_amount(premium_raw),
+            "midpoint": format_raw_price_e9(leg.midpoint_raw),
+            "midpointRaw": leg.midpoint_raw.to_string(),
+            "weightE6": leg.weight_e6.to_string(),
+            "maxQuantity": leg.max_quantity.map(|v| v.to_string())
+        }),
+        AdvancedLegKind::Range => serde_json::json!({
+            "kind": "RANGE",
+            "role": leg.role,
+            "lower": format_raw_price_e9(leg.lower_raw.unwrap_or_default()),
+            "upper": format_raw_price_e9(leg.upper_raw.unwrap_or_default()),
+            "lowerRaw": leg.lower_raw.unwrap_or_default().to_string(),
+            "upperRaw": leg.upper_raw.unwrap_or_default().to_string(),
+            "quantityRaw": leg.quantity.to_string(),
+            "quantityDisplay": asset.format_amount(leg.quantity),
+            "askPriceRaw": leg.ask_price_raw.to_string(),
+            "premiumRaw": premium_raw.to_string(),
+            "premiumDisplay": asset.format_amount(premium_raw),
+            "midpoint": format_raw_price_e9(leg.midpoint_raw),
+            "midpointRaw": leg.midpoint_raw.to_string(),
+            "weightE6": leg.weight_e6.to_string(),
+            "maxQuantity": leg.max_quantity.map(|v| v.to_string())
+        }),
+    }
+}
+
+fn advanced_payoff_table_json(
+    legs: &[AdvancedCompiledLeg],
+    total_cost_raw: u64,
+    asset: &QuoteAssetDisplay,
+) -> Vec<serde_json::Value> {
+    legs.iter()
+        .map(|leg| {
+            let condition = match leg.kind {
+                AdvancedLegKind::Down => format!(
+                    "BTC settles <= {}",
+                    format_raw_price_e9(leg.strike_raw.unwrap_or_default())
+                ),
+                AdvancedLegKind::Up => format!(
+                    "BTC settles >= {}",
+                    format_raw_price_e9(leg.strike_raw.unwrap_or_default())
+                ),
+                AdvancedLegKind::Range => format!(
+                    "{} < BTC settles <= {}",
+                    format_raw_price_e9(leg.lower_raw.unwrap_or_default()),
+                    format_raw_price_e9(leg.upper_raw.unwrap_or_default())
+                ),
+            };
+
+            let net_pnl_raw = leg.quantity as i128 - total_cost_raw as i128;
+
+            serde_json::json!({
+                "condition": condition,
+                "grossPayoutRaw": leg.quantity.to_string(),
+                "grossPayoutDisplay": asset.format_amount(leg.quantity),
+                "netPnlRaw": net_pnl_raw.to_string(),
+                "netPnlDisplay": format_signed_asset_amount(net_pnl_raw, asset)
+            })
+        })
+        .collect()
 }
 
 fn compile_json_leg_down(

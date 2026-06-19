@@ -161,6 +161,18 @@ struct CompileStrategyRequest {
     expiry_preference: String,
     #[serde(rename = "slippageBps")]
     slippage_bps: u16,
+
+    #[serde(rename = "portfolioExposureDUSDC")]
+    portfolio_exposure_dusdc: Option<f64>,
+
+    #[serde(rename = "overHedgeCapBps")]
+    over_hedge_cap_bps: Option<u16>,
+
+    #[serde(rename = "deadZoneBps")]
+    dead_zone_bps: Option<u16>,
+
+    #[serde(rename = "convexGammaBps")]
+    convex_gamma_bps: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -487,7 +499,7 @@ async fn compile_strategy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<CompileStrategyRequest>,
 ) -> impl IntoResponse {
-    let args = vec![
+    let mut args = vec![
         "compile-strategy-json".to_string(),
         "--owner".to_string(),
         req.owner,
@@ -502,6 +514,26 @@ async fn compile_strategy(
         "--slippage-bps".to_string(),
         req.slippage_bps.to_string(),
     ];
+
+    if let Some(value) = req.portfolio_exposure_dusdc {
+        args.push("--portfolio-exposure-dusdc".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.over_hedge_cap_bps {
+        args.push("--over-hedge-cap-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.dead_zone_bps {
+        args.push("--dead-zone-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.convex_gamma_bps {
+        args.push("--convex-gamma-bps".to_string());
+        args.push(value.to_string());
+    }
 
     match run_cli_value(&state, args).await {
         Ok(value) => {
