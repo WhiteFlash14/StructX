@@ -1571,6 +1571,7 @@ dependencies = [
  "deepbook-client",
  "serde_json",
  "structx-core",
+ "sui-sdk-types",
  "tokio",
 ]
 

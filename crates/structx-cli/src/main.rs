@@ -1,10 +1,12 @@
 use std::path::{Path, PathBuf};
+use std::str::FromStr;
 use std::time::Duration as StdDuration;
 use std::{fs, io};
 
 use chrono::{Duration, Utc};
 use clap::{Parser, Subcommand};
 use comfy_table::{presets::UTF8_FULL, Cell, Table};
+use sui_sdk_types::Address;
 
 use deepbook_client::{
     verify_predict_abi, AbiCheckStatus, AbiVerificationReport, DeepBookClient, DeepBookConfig,
@@ -743,7 +745,7 @@ async fn main() -> std::process::ExitCode {
     }
 }
 
-fn build_freshness(
+pub fn build_freshness(
     max_price_age_secs: i64,
     max_svi_age_secs: i64,
     min_time_to_expiry_secs: i64,
@@ -756,6 +758,29 @@ fn build_freshness(
         require_price_timestamp: strict_freshness,
         require_svi_timestamp: strict_freshness,
     }
+}
+
+fn validate_sui_address_arg(name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let value = value.trim();
+
+    if value.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "`--{name}` is empty. Make sure the shell variable you passed is exported/set."
+            ),
+        )
+        .into());
+    }
+
+    Address::from_str(value).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`--{name}` is not a valid Sui address `{value}`: {err}"),
+        )
+    })?;
+
+    Ok(())
 }
 
 fn build_client(
@@ -2065,7 +2090,7 @@ async fn compile_strategy_json_command(
     for selected in candidates.into_iter().take(max_attempts) {
         let oracle = resolve_sui_object(&rpc, selected.oracle_id).await?;
 
-        if let Err(err) = validate_quote_object_refs(&predict, &oracle, &clock) {
+        if let Err(err) = validate_quote_object_refs_quiet(&predict, &oracle, &clock) {
             warnings.push(format!("skipped oracle {}: {err}", selected.oracle_id));
             continue;
         }
@@ -2296,6 +2321,14 @@ async fn compile_strategy_json_command(
     .into())
 }
 
+fn compile_strategy_sender(owner: &str) -> String {
+    if owner.trim().is_empty() {
+        "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
+    } else {
+        owner.to_string()
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn compile_breakout_strategy_json_from_market(
     args: &CompileStrategyJsonArgs,
@@ -2309,6 +2342,7 @@ async fn compile_breakout_strategy_json_from_market(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let budget_raw = parse_dusdc_to_raw(&args.budget_dusdc)?;
     let style = BreakoutStyle::from_api_value(&args.style)?;
+    let compile_sender = compile_strategy_sender(&args.owner);
     let probe_quantity = 1_000_000u64;
 
     let strikes = selected.grid.centered_strikes_by_display_step(
@@ -2343,8 +2377,11 @@ async fn compile_breakout_strategy_json_from_market(
     let probe_compiled = compile_breakout(k1, k2, k3, k4, probe_quantity, probe_quantity)?;
     let probe_plan = build_quote_plan(selected, &probe_compiled)?;
 
-    let probe_tx_kind =
-        build_quote_tx_kind(&probe_plan, QuoteObjectRefs { predict, oracle, clock }, &args.owner)?;
+    let probe_tx_kind = build_quote_tx_kind(
+        &probe_plan,
+        QuoteObjectRefs { predict, oracle, clock },
+        &compile_sender,
+    )?;
 
     let probe_response =
         rpc.dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64).await?;
@@ -2379,8 +2416,11 @@ async fn compile_breakout_strategy_json_from_market(
 
     let final_plan = build_quote_plan(selected, &final_compiled)?;
 
-    let final_tx_kind =
-        build_quote_tx_kind(&final_plan, QuoteObjectRefs { predict, oracle, clock }, &args.owner)?;
+    let final_tx_kind = build_quote_tx_kind(
+        &final_plan,
+        QuoteObjectRefs { predict, oracle, clock },
+        &compile_sender,
+    )?;
 
     let final_response =
         rpc.dev_inspect_transaction_kind(&final_tx_kind.sender, &final_tx_kind.tx_kind_b64).await?;
@@ -5197,6 +5237,9 @@ async fn manager_balance_command(
     manager_id: String,
     sender: String,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    validate_sui_address_arg("manager-id", &manager_id)?;
+    validate_sui_address_arg("sender", &sender)?;
+
     let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
 
     let manager = resolve_sui_object(&rpc, &manager_id).await?;
@@ -5411,6 +5454,34 @@ fn validate_quote_object_refs(
     }
 
     println!("Quote object refs: ok");
+    Ok(())
+}
+
+fn validate_quote_object_refs_quiet(
+    predict: &SuiObjectInfo,
+    oracle: &SuiObjectInfo,
+    clock: &SuiObjectInfo,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let checks = [("predict", predict), ("oracle", oracle), ("clock", clock)];
+
+    for (role, object) in checks {
+        if object.owner_kind != ObjectOwnerKind::Shared {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{role} object is not shared: owner={}", object.owner_kind),
+            )
+            .into());
+        }
+
+        if object.initial_shared_version.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{role} object is missing initial_shared_version"),
+            )
+            .into());
+        }
+    }
+
     Ok(())
 }
 

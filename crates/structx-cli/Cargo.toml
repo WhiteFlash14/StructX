@@ -13,3 +13,4 @@ comfy-table.workspace = true
 deepbook-client = { path = "../deepbook-client" }
 structx-core = { path = "../structx-core" }
 tokio.workspace = true
+sui-sdk-types.workspace = true
