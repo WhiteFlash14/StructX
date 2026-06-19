@@ -14,17 +14,7 @@ use deepbook_client::{
     SUI_CLOCK_OBJECT_ID,
 };
 use structx_core::{
-    build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
-    build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
-    compile_breakout, compile_bucket_payoff, compile_convex_tail_ladder, compile_expiry_move_note,
-    compile_moonshot_upside, compile_portfolio_crash_shield, guard_quote_preview,
-    optimize_breakout_quantities, score_smart_candidate, select_best_market,
-    select_candidate_markets, AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegKind,
-    AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle, CompiledPayoff, ConvexTailLadderInput,
-    DisplayPrice, ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs, MoonshotUpsideInput,
-    PayoffBucket, PortfolioCrashShieldInput, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall,
-    QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind,
-    SelectedMarket, SmartBudgetStyle, SmartCandidateMetrics, SmartCandidateScore, Strike,
+    AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegKind, AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle, CompiledPayoff, ConvexTailLadderInput, DisplayPrice, ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs, MoonshotUpsideInput, PayoffBucket, PortfolioCrashShieldInput, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind, RangeConvictionInput, SelectedMarket, SmartBudgetStyle, SmartCandidateMetrics, SmartCandidateScore, Strike, build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind, build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind, compile_breakout, compile_bucket_payoff, compile_convex_tail_ladder, compile_expiry_move_note, compile_moonshot_upside, compile_portfolio_crash_shield, compile_range_conviction, guard_quote_preview, optimize_breakout_quantities, score_smart_candidate, select_best_market, select_candidate_markets,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -1135,6 +1125,51 @@ fn infer_ask_price_raw(cost_raw: u64, quantity: u64) -> u64 {
         as u64
 }
 
+#[allow(clippy::too_many_arguments)]
+async fn quote_single_range_ask_raw(
+    args: &CompileStrategyJsonArgs,
+    selected: &SelectedMarket<'_>,
+    predict: &SuiObjectInfo,
+    oracle: &SuiObjectInfo,
+    clock: &SuiObjectInfo,
+    rpc: &SuiRpcClient,
+    lower_raw: u64,
+    upper_raw: u64,
+    probe_quantity: u64,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let probe_compiled = compile_bucket_payoff(&[PayoffBucket::new(
+        Some(Strike { raw: lower_raw }),
+        Some(Strike { raw: upper_raw }),
+        probe_quantity,
+    )])?;
+
+    let probe_plan = build_quote_plan(selected, &probe_compiled)?;
+    let probe_tx_kind = build_quote_tx_kind(
+        &probe_plan,
+        QuoteObjectRefs {
+            predict,
+            oracle,
+            clock,
+        },
+        &args.owner,
+    )?;
+
+    let probe_response = rpc
+        .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
+        .await?;
+
+    let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
+    let Some((mint_cost_raw, _)) = probe_costs.first() else {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "single range quote returned no costs",
+        )
+        .into());
+    };
+
+    Ok(infer_ask_price_raw(*mint_cost_raw, probe_quantity))
+}
+
 fn dusdc_f64_to_raw(value: f64) -> Result<u64, Box<dyn std::error::Error>> {
     if !value.is_finite() || value <= 0.0 {
         return Err(
@@ -1851,6 +1886,7 @@ async fn compile_strategy_json_command(
             | AdvancedStrategyKind::ConvexTailLadder
             | AdvancedStrategyKind::ExpiryMoveNote
             | AdvancedStrategyKind::MoonshotUpside
+            | AdvancedStrategyKind::RangeConviction
             | AdvancedStrategyKind::SmartBudgetSelector),
         ) => Some(strategy),
         _ => None,
@@ -2880,7 +2916,49 @@ async fn compile_advanced_strategy_json_from_market(
             })?
         }
 
-        AdvancedStrategyKind::MoonshotUpside => {
+        
+        AdvancedStrategyKind::RangeConviction => {
+            let probe_compiled = compile_bucket_payoff(&[
+                PayoffBucket::new(Some(k2), Some(k3), probe_quantity),
+            ])?;
+
+            let probe_plan = build_quote_plan(selected, &probe_compiled)?;
+
+            let probe_tx_kind = build_quote_tx_kind(
+                &probe_plan,
+                QuoteObjectRefs {
+                    predict,
+                    oracle,
+                    clock,
+                },
+                &args.owner,
+            )?;
+
+            let probe_response = rpc
+                .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
+                .await?;
+
+            let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
+
+            if probe_costs.len() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected 1 range conviction probe quote leg, got {}", probe_costs.len()),
+                )
+                .into());
+            }
+
+            let ask_central_range = infer_ask_price_raw(probe_costs[0].0, probe_quantity);
+
+            compile_range_conviction(RangeConvictionInput {
+                budget_raw,
+                lower_raw: k2.raw,
+                upper_raw: k3.raw,
+                range_ask_raw: ask_central_range,
+            })?
+        },
+
+AdvancedStrategyKind::MoonshotUpside => {
             let probe_compiled = compile_bucket_payoff(&[
                 PayoffBucket::new(Some(k3), Some(k4), probe_quantity),
                 PayoffBucket::new(Some(k4), None, probe_quantity),
