@@ -179,6 +179,12 @@ struct CompileStrategyRequest {
 
     #[serde(rename = "moonshotTailGammaBps")]
     moonshot_tail_gamma_bps: Option<u16>,
+
+    #[serde(rename = "downsideRangeWeightBps")]
+    downside_range_weight_bps: Option<u16>,
+
+    #[serde(rename = "downsideTailGammaBps")]
+    downside_tail_gamma_bps: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -548,6 +554,16 @@ async fn compile_strategy(
 
     if let Some(value) = req.moonshot_tail_gamma_bps {
         args.push("--moonshot-tail-gamma-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.downside_range_weight_bps {
+        args.push("--downside-range-weight-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.downside_tail_gamma_bps {
+        args.push("--downside-tail-gamma-bps".to_string());
         args.push(value.to_string());
     }
 
@@ -1636,6 +1652,7 @@ fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
             | "CONVEX_TAIL_LADDER"
             | "EXPIRY_MOVE_NOTE"
             | "MOONSHOT_UPSIDE"
+            | "DOWNSIDE_CONVEXITY"
             | "RANGE_CONVICTION"
             | "SMART_BUDGET_SELECTOR"
     ) {

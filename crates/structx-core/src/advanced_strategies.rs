@@ -9,6 +9,7 @@ pub enum AdvancedStrategyKind {
     ConvexTailLadder,
     ExpiryMoveNote,
     MoonshotUpside,
+    DownsideConvexity,
     RangeConviction,
     SmartBudgetSelector,
 }
@@ -20,6 +21,7 @@ impl AdvancedStrategyKind {
             "CONVEX_TAIL_LADDER" | "convex_tail_ladder" => Ok(Self::ConvexTailLadder),
             "EXPIRY_MOVE_NOTE" | "expiry_move_note" => Ok(Self::ExpiryMoveNote),
             "MOONSHOT_UPSIDE" | "moonshot_upside" => Ok(Self::MoonshotUpside),
+            "DOWNSIDE_CONVEXITY" | "downside_convexity" => Ok(Self::DownsideConvexity),
             "RANGE_CONVICTION" | "range_conviction" => Ok(Self::RangeConviction),
             "SMART_BUDGET_SELECTOR" | "smart_budget_selector" => Ok(Self::SmartBudgetSelector),
             other => Err(AdvancedStrategyError::UnknownStrategy(other.to_string())),
@@ -32,6 +34,7 @@ impl AdvancedStrategyKind {
             Self::ConvexTailLadder => "CONVEX_TAIL_LADDER",
             Self::ExpiryMoveNote => "EXPIRY_MOVE_NOTE",
             Self::MoonshotUpside => "MOONSHOT_UPSIDE",
+            Self::DownsideConvexity => "DOWNSIDE_CONVEXITY",
             Self::RangeConviction => "RANGE_CONVICTION",
             Self::SmartBudgetSelector => "SMART_BUDGET_SELECTOR",
         }
@@ -550,13 +553,24 @@ pub struct MoonshotUpsideInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DownsideConvexityInput {
+    pub spot_raw: u64,
+    pub budget_raw: u64,
+    pub k1_raw: u64,
+    pub k2_raw: u64,
+    pub down_tail_ask_raw: u64,
+    pub lower_range_ask_raw: u64,
+    pub range_weight_bps: u16,
+    pub tail_gamma_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeConvictionInput {
     pub budget_raw: u64,
     pub lower_raw: u64,
     pub upper_raw: u64,
     pub range_ask_raw: u64,
 }
-
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConvexTailLadderInput {
@@ -722,7 +736,6 @@ pub fn compile_expiry_move_note(
     Ok(result)
 }
 
-
 pub fn compile_range_conviction(
     input: RangeConvictionInput,
 ) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
@@ -828,6 +841,76 @@ pub fn compile_moonshot_upside(
     result
         .warnings
         .push("Moonshot Upside is terminal-expiry exposure, not a touch option.".to_string());
+
+    Ok(result)
+}
+
+pub fn compile_downside_convexity(
+    input: DownsideConvexityInput,
+) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
+    if input.spot_raw == 0 {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "spot_raw must be greater than zero".to_string(),
+        ));
+    }
+
+    if input.k1_raw >= input.k2_raw {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "downside convexity requires k1 < k2".to_string(),
+        ));
+    }
+
+    let range_weight_bps = input.range_weight_bps.min(10_000);
+    let tail_weight_bps = 10_000u16.saturating_sub(range_weight_bps);
+
+    let lower_range_mid = midpoint(input.k1_raw, input.k2_raw)?;
+
+    let down_tail_mid = input.k1_raw.saturating_mul(99).checked_div(100).unwrap_or(input.k1_raw);
+
+    let mut lower_range = tail_ladder_leg(
+        AdvancedLegKind::Range,
+        "downside_breakdown_zone",
+        None,
+        Some(input.k1_raw),
+        Some(input.k2_raw),
+        lower_range_mid,
+        input.lower_range_ask_raw,
+        input.spot_raw,
+        0,
+        10_000,
+    )?;
+
+    lower_range.base_weight_e6 = scale_weight_bps(lower_range.base_weight_e6, range_weight_bps)?;
+
+    let mut down_tail = tail_ladder_leg(
+        AdvancedLegKind::Down,
+        "crash_tail",
+        Some(input.k1_raw),
+        None,
+        None,
+        down_tail_mid,
+        input.down_tail_ask_raw,
+        input.spot_raw,
+        0,
+        input.tail_gamma_bps,
+    )?;
+
+    down_tail.base_weight_e6 = scale_weight_bps(down_tail.base_weight_e6, tail_weight_bps)?;
+
+    let mut result = allocate_weighted_budget(
+        AdvancedStrategyKind::DownsideConvexity,
+        input.budget_raw,
+        vec![lower_range, down_tail],
+    )?;
+
+    result.warnings.push(
+        "Downside Convexity is downside-only. It can expire worthless if BTC settles above the lower breakdown range."
+            .to_string(),
+    );
+
+    result
+        .warnings
+        .push("Downside Convexity is terminal-expiry exposure, not a touch option.".to_string());
 
     Ok(result)
 }
@@ -1199,5 +1282,29 @@ mod tests {
         assert_eq!(result.legs[0].kind, AdvancedLegKind::Range);
         assert!(result.used_budget_raw <= input.budget_raw);
         assert!(result.legs[0].quantity > 0);
+    }
+
+    #[test]
+    fn downside_convexity_allocates_range_and_tail() {
+        let input = DownsideConvexityInput {
+            spot_raw: 100_000_000_000_000,
+            budget_raw: 100_000_000,
+            k1_raw: 95_000_000_000_000,
+            k2_raw: 98_000_000_000_000,
+            down_tail_ask_raw: 70_000_000,
+            lower_range_ask_raw: 120_000_000,
+            range_weight_bps: 6_000,
+            tail_gamma_bps: 15_000,
+        };
+
+        let result = compile_downside_convexity(input).unwrap();
+
+        assert_eq!(result.strategy, AdvancedStrategyKind::DownsideConvexity);
+        assert_eq!(result.legs.len(), 2);
+        assert!(result.used_budget_raw <= input.budget_raw);
+
+        assert!(result.legs.iter().any(|leg| leg.role == "downside_breakdown_zone"));
+
+        assert!(result.legs.iter().any(|leg| leg.role == "crash_tail"));
     }
 }

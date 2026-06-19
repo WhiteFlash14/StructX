@@ -5,6 +5,7 @@ use serde_json::Value;
 pub struct ExpectedAbiFunction {
     pub module: &'static str,
     pub function: &'static str,
+    pub expected_type_parameter_count: usize,
     pub expected_parameters: &'static [&'static str],
     pub expected_returns: &'static [&'static str],
     pub source_note: &'static str,
@@ -48,6 +49,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
     ExpectedAbiFunction {
         module: "predict",
         function: "get_trade_amounts",
+        expected_type_parameter_count: 0,
         expected_parameters: &[PREDICT_REF, ORACLE_SVI_REF, MARKET_KEY, "U64", CLOCK_REF],
         expected_returns: &["U64", "U64"],
         source_note: "predict.move + official Predict docs",
@@ -56,6 +58,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
     ExpectedAbiFunction {
         module: "predict",
         function: "get_range_trade_amounts",
+        expected_type_parameter_count: 0,
         expected_parameters: &[PREDICT_REF, ORACLE_SVI_REF, RANGE_KEY, "U64", CLOCK_REF],
         expected_returns: &["U64", "U64"],
         source_note: "predict.move + official Predict docs",
@@ -65,6 +68,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
     ExpectedAbiFunction {
         module: "predict",
         function: "create_manager",
+        expected_type_parameter_count: 0,
         expected_parameters: &[TX_CONTEXT_MUT_REF],
         expected_returns: &[OBJECT_ID],
         source_note: "predict.move + official Predict docs",
@@ -74,6 +78,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
     ExpectedAbiFunction {
         module: "predict_manager",
         function: "balance",
+        expected_type_parameter_count: 1,
         expected_parameters: &[PREDICT_MANAGER_REF],
         expected_returns: &["U64"],
         source_note: "predict_manager.move + official PredictManager docs",
@@ -83,6 +88,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
     ExpectedAbiFunction {
         module: "predict",
         function: "mint",
+        expected_type_parameter_count: 1,
         expected_parameters: &[
             PREDICT_MUT_REF,
             PREDICT_MANAGER_MUT_REF,
@@ -100,6 +106,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
     ExpectedAbiFunction {
         module: "predict",
         function: "mint_range",
+        expected_type_parameter_count: 1,
         expected_parameters: &[
             PREDICT_MUT_REF,
             PREDICT_MANAGER_MUT_REF,
@@ -118,6 +125,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
     ExpectedAbiFunction {
         module: "predict",
         function: "redeem",
+        expected_type_parameter_count: 1,
         expected_parameters: &[
             PREDICT_MUT_REF,
             PREDICT_MANAGER_MUT_REF,
@@ -134,6 +142,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
     ExpectedAbiFunction {
         module: "predict",
         function: "redeem_range",
+        expected_type_parameter_count: 1,
         expected_parameters: &[
             PREDICT_MUT_REF,
             PREDICT_MANAGER_MUT_REF,
@@ -150,6 +159,7 @@ pub const REQUIRED_PREDICT_ABI: &[ExpectedAbiFunction] = &[
 ExpectedAbiFunction {
         module: "predict_manager",
         function: "position",
+        expected_type_parameter_count: 0,
         expected_parameters: &[PREDICT_MANAGER_REF, MARKET_KEY],
         expected_returns: &["U64"],
         source_note: "predict_manager.move + official PredictManager docs",
@@ -158,6 +168,7 @@ ExpectedAbiFunction {
     ExpectedAbiFunction {
         module: "predict_manager",
         function: "range_position",
+        expected_type_parameter_count: 0,
         expected_parameters: &[PREDICT_MANAGER_REF, RANGE_KEY],
         expected_returns: &["U64"],
         source_note: "predict_manager.move + official PredictManager docs",
@@ -166,6 +177,7 @@ ExpectedAbiFunction {
 ExpectedAbiFunction {
         module: "market_key",
         function: "up",
+        expected_type_parameter_count: 0,
         expected_parameters: &[OBJECT_ID, "U64", "U64"],
         expected_returns: &[MARKET_KEY],
         source_note: "official Market Keys docs + live ABI",
@@ -174,6 +186,7 @@ ExpectedAbiFunction {
     ExpectedAbiFunction {
         module: "market_key",
         function: "down",
+        expected_type_parameter_count: 0,
         expected_parameters: &[OBJECT_ID, "U64", "U64"],
         expected_returns: &[MARKET_KEY],
         source_note: "official Market Keys docs + live ABI",
@@ -182,6 +195,7 @@ ExpectedAbiFunction {
     ExpectedAbiFunction {
         module: "range_key",
         function: "new",
+        expected_type_parameter_count: 0,
         expected_parameters: &[OBJECT_ID, "U64", "U64", "U64"],
         expected_returns: &[RANGE_KEY],
         source_note: "official Market Keys docs + live ABI",
@@ -210,7 +224,8 @@ pub struct AbiFunctionCheck {
     pub function: String,
     pub status: AbiCheckStatus,
     pub visibility: Option<String>,
-
+    pub expected_type_parameter_count: usize,
+    pub actual_type_parameter_count: Option<usize>,
     pub expected_parameter_count: usize,
     pub actual_parameter_count: Option<usize>,
     pub expected_return_count: usize,
@@ -266,6 +281,8 @@ fn verify_function(modules: &Value, expected: &ExpectedAbiFunction) -> AbiFuncti
             function: expected.function.to_string(),
             status: AbiCheckStatus::Fail,
             visibility: None,
+            expected_type_parameter_count: expected.expected_type_parameter_count,
+            actual_type_parameter_count: None,
             expected_parameter_count: expected.expected_parameters.len(),
             actual_parameter_count: None,
             expected_return_count: expected.expected_returns.len(),
@@ -290,6 +307,8 @@ fn verify_function(modules: &Value, expected: &ExpectedAbiFunction) -> AbiFuncti
             function: expected.function.to_string(),
             status: AbiCheckStatus::Fail,
             visibility: None,
+            expected_type_parameter_count: expected.expected_type_parameter_count,
+            actual_type_parameter_count: None,
             expected_parameter_count: expected.expected_parameters.len(),
             actual_parameter_count: None,
             expected_return_count: expected.expected_returns.len(),
@@ -319,7 +338,21 @@ fn verify_function(modules: &Value, expected: &ExpectedAbiFunction) -> AbiFuncti
 
     let visibility = function.get("visibility").and_then(Value::as_str).map(ToString::to_string);
 
+    let type_parameter_count = function
+        .get("typeParameters")
+        .or_else(|| function.get("type_parameters"))
+        .and_then(Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+
     let mut failures = Vec::new();
+
+    if type_parameter_count != expected.expected_type_parameter_count {
+        failures.push(format!(
+            "type parameter count mismatch: expected {}, got {}",
+            expected.expected_type_parameter_count, type_parameter_count
+        ));
+    }
 
     if parameters.len() != expected.expected_parameters.len() {
         failures.push(format!(
@@ -372,6 +405,8 @@ fn verify_function(modules: &Value, expected: &ExpectedAbiFunction) -> AbiFuncti
         function: expected.function.to_string(),
         status: if failures.is_empty() { AbiCheckStatus::Pass } else { AbiCheckStatus::Fail },
         visibility,
+        expected_type_parameter_count: expected.expected_type_parameter_count,
+        actual_type_parameter_count: Some(type_parameter_count),
         expected_parameter_count: expected.expected_parameters.len(),
         actual_parameter_count: Some(parameters.len()),
         expected_return_count: expected.expected_returns.len(),
@@ -404,6 +439,7 @@ mod tests {
                 "exposedFunctions": {
                     "get_trade_amounts": {
                         "visibility": "Public",
+                        "typeParameters": [],
                         "parameters": [
                             {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict","name":"Predict","typeArguments":[]}}},
                             {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"oracle","name":"OracleSVI","typeArguments":[]}}},
@@ -415,6 +451,7 @@ mod tests {
                     },
                     "get_range_trade_amounts": {
                         "visibility": "Public",
+                        "typeParameters": [],
                         "parameters": [
                             {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict","name":"Predict","typeArguments":[]}}},
                             {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"oracle","name":"OracleSVI","typeArguments":[]}}},
@@ -426,6 +463,7 @@ mod tests {
                     },
                     "create_manager": {
                         "visibility": "Public",
+                        "typeParameters": [],
                         "parameters": [
                             {"MutableReference":{"Struct":{"address":"0x2","module":"tx_context","name":"TxContext","typeArguments":[]}}}
                         ],
@@ -435,6 +473,7 @@ mod tests {
                     },
                     "mint": {
                         "visibility": "Public",
+                        "typeParameters": [{"abilities": ["store"]}],
                         "parameters": [
                             {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict","name":"Predict","typeArguments":[]}}},
                             {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}},
@@ -448,6 +487,7 @@ mod tests {
                     },
                     "mint_range": {
                         "visibility": "Public",
+                        "typeParameters": [{"abilities": ["store"]}],
                         "parameters": [
                             {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict","name":"Predict","typeArguments":[]}}},
                             {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}},
@@ -461,6 +501,7 @@ mod tests {
                     },
                     "redeem": {
                         "visibility": "Public",
+                        "typeParameters": [{"abilities": ["store"]}],
                         "parameters": [
                             {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict","name":"Predict","typeArguments":[]}}},
                             {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}},
@@ -474,6 +515,7 @@ mod tests {
                     },
                     "redeem_range": {
                         "visibility": "Public",
+                        "typeParameters": [{"abilities": ["store"]}],
                         "parameters": [
                             {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict","name":"Predict","typeArguments":[]}}},
                             {"MutableReference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}},
@@ -491,6 +533,7 @@ mod tests {
                 "exposedFunctions": {
                     "balance": {
                         "visibility": "Public",
+                        "typeParameters": [{"abilities": ["store"]}],
                         "parameters": [
                             {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}}
                         ],
@@ -498,6 +541,7 @@ mod tests {
                     },
                     "position": {
                         "visibility": "Public",
+                        "typeParameters": [],
                         "parameters": [
                             {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}},
                             {"Struct":{"address":PREDICT_PACKAGE,"module":"market_key","name":"MarketKey","typeArguments":[]}}
@@ -506,6 +550,7 @@ mod tests {
                     },
                     "range_position": {
                         "visibility": "Public",
+                        "typeParameters": [],
                         "parameters": [
                             {"Reference":{"Struct":{"address":PREDICT_PACKAGE,"module":"predict_manager","name":"PredictManager","typeArguments":[]}}},
                             {"Struct":{"address":PREDICT_PACKAGE,"module":"range_key","name":"RangeKey","typeArguments":[]}}
@@ -518,6 +563,7 @@ mod tests {
                 "exposedFunctions": {
                     "up": {
                         "visibility": "Public",
+                        "typeParameters": [],
                         "parameters": [
                             {"Struct":{"address":"0x2","module":"object","name":"ID","typeArguments":[]}},
                             "U64",
@@ -529,6 +575,7 @@ mod tests {
                     },
                     "down": {
                         "visibility": "Public",
+                        "typeParameters": [],
                         "parameters": [
                             {"Struct":{"address":"0x2","module":"object","name":"ID","typeArguments":[]}},
                             "U64",
@@ -544,6 +591,7 @@ mod tests {
                 "exposedFunctions": {
                     "new": {
                         "visibility": "Public",
+                        "typeParameters": [],
                         "parameters": [
                             {"Struct":{"address":"0x2","module":"object","name":"ID","typeArguments":[]}},
                             "U64",
@@ -561,7 +609,7 @@ mod tests {
         let report = verify_predict_abi(PREDICT_PACKAGE, &modules);
 
         assert!(report.is_pass());
-        assert_eq!(report.checks.len(), 13);
+        assert_eq!(report.checks.len(), REQUIRED_PREDICT_ABI.len());
     }
 
     #[test]

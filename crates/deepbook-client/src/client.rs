@@ -7,7 +7,7 @@ use serde_json::Value;
 
 use crate::constants::{PREDICT_OBJECT_ID, PREDICT_SERVER_URL};
 use crate::error::{DeepBookClientError, Result};
-use crate::market::{FreshnessConfig, MarketSnapshot};
+use crate::market::{FreshnessConfig, MarketEvaluationContext, MarketSnapshot};
 use crate::models::{
     parse_oracle_list_from_value, parse_quote_assets_from_value, AskBounds, LatestPrice, LatestSvi,
     OracleListItem, OracleState, PredictState, QuoteAsset, ServerStatus, VaultSummary,
@@ -126,31 +126,43 @@ impl DeepBookClient {
         &self,
         freshness: FreshnessConfig,
     ) -> Result<Vec<MarketSnapshot>> {
-        let vault_available =
-            self.vault_summary().await.map(|summary| summary.is_present()).unwrap_or(false);
+        self.load_markets_filtered(freshness, |oracle| {
+            oracle.is_btc() && oracle.is_active_or_live()
+        })
+        .await
+    }
+
+    pub async fn load_market_directory(
+        &self,
+        freshness: FreshnessConfig,
+    ) -> Result<Vec<MarketSnapshot>> {
+        self.load_markets_filtered(freshness, OracleListItem::is_active_or_live).await
+    }
+
+    async fn load_markets_filtered<F>(
+        &self,
+        freshness: FreshnessConfig,
+        mut predicate: F,
+    ) -> Result<Vec<MarketSnapshot>>
+    where
+        F: FnMut(&OracleListItem) -> bool,
+    {
+        let vault_available = self.vault_summary().await.map(|v| v.is_present()).unwrap_or(false);
 
         let oracles = self.oracle_list().await?;
         let now = Utc::now();
 
-        let active_btc_oracles = oracles
-            .into_iter()
-            .filter(|oracle| oracle.is_btc() && oracle.is_active_or_live())
-            .collect::<Vec<_>>();
+        let context =
+            MarketEvaluationContext { vault_summary_available: vault_available, now, freshness };
 
-        let mut snapshots = Vec::with_capacity(active_btc_oracles.len());
+        let selected_oracles =
+            oracles.into_iter().filter(|oracle| predicate(oracle)).collect::<Vec<_>>();
 
-        for oracle in active_btc_oracles {
+        let mut snapshots = Vec::with_capacity(selected_oracles.len());
+
+        for oracle in selected_oracles {
             let Some(oracle_id) = oracle.oracle_id.clone() else {
-                snapshots.push(MarketSnapshot::evaluate(
-                    oracle,
-                    None,
-                    None,
-                    None,
-                    None,
-                    vault_available,
-                    now,
-                    freshness,
-                ));
+                snapshots.push(MarketSnapshot::evaluate(oracle, None, None, None, None, context));
                 continue;
             };
 
@@ -167,9 +179,7 @@ impl DeepBookClient {
                 latest_price.ok(),
                 latest_svi.ok(),
                 ask_bounds.ok(),
-                vault_available,
-                now,
-                freshness,
+                context,
             ));
         }
 

@@ -18,14 +18,17 @@ impl Default for FreshnessConfig {
             max_price_age: Duration::seconds(60),
             max_svi_age: Duration::seconds(60),
             min_time_to_expiry: Duration::minutes(5),
-
-            // Testnet public-server responses can expose latest values without
-            // timestamp fields in the shape our parser recognizes. For market
-            // discovery, missing timestamps should warn, not reject.
             require_price_timestamp: false,
             require_svi_timestamp: false,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct MarketEvaluationContext {
+    pub vault_summary_available: bool,
+    pub now: DateTime<Utc>,
+    pub freshness: FreshnessConfig,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -85,16 +88,13 @@ pub struct MarketSnapshot {
 
 impl MarketSnapshot {
     #[must_use]
-    #[allow(clippy::too_many_arguments)]
     pub fn evaluate(
         list_item: OracleListItem,
         state: Option<OracleState>,
         latest_price: Option<LatestPrice>,
         latest_svi: Option<LatestSvi>,
         ask_bounds: Option<AskBounds>,
-        vault_summary_available: bool,
-        now: DateTime<Utc>,
-        config: FreshnessConfig,
+        context: MarketEvaluationContext,
     ) -> Self {
         let evaluation = evaluate_market(
             &list_item,
@@ -102,9 +102,7 @@ impl MarketSnapshot {
             latest_price.as_ref(),
             latest_svi.as_ref(),
             ask_bounds.as_ref(),
-            vault_summary_available,
-            now,
-            config,
+            context,
         );
 
         let structx_status = if evaluation.rejections.is_empty() && evaluation.warnings.is_empty() {
@@ -181,16 +179,13 @@ struct MarketEvaluation {
     warnings: Vec<MarketWarning>,
 }
 
-#[allow(clippy::too_many_arguments)]
 fn evaluate_market(
     list_item: &OracleListItem,
     state: Option<&OracleState>,
     latest_price: Option<&LatestPrice>,
     latest_svi: Option<&LatestSvi>,
     ask_bounds: Option<&AskBounds>,
-    vault_summary_available: bool,
-    now: DateTime<Utc>,
-    config: FreshnessConfig,
+    context: MarketEvaluationContext,
 ) -> MarketEvaluation {
     let mut evaluation = MarketEvaluation::default();
 
@@ -211,11 +206,11 @@ fn evaluate_market(
     match latest_price {
         Some(price) => match price.timestamp_datetime() {
             Some(ts) => {
-                if now.signed_duration_since(ts) > config.max_price_age {
+                if context.now.signed_duration_since(ts) > context.freshness.max_price_age {
                     evaluation.rejections.push(MarketRejectionReason::StalePrice);
                 }
             }
-            None if config.require_price_timestamp => {
+            None if context.freshness.require_price_timestamp => {
                 evaluation.rejections.push(MarketRejectionReason::StalePrice);
             }
             None => {
@@ -228,11 +223,11 @@ fn evaluate_market(
     match latest_svi {
         Some(svi) => match svi.timestamp_datetime() {
             Some(ts) => {
-                if now.signed_duration_since(ts) > config.max_svi_age {
+                if context.now.signed_duration_since(ts) > context.freshness.max_svi_age {
                     evaluation.rejections.push(MarketRejectionReason::StaleSvi);
                 }
             }
-            None if config.require_svi_timestamp => {
+            None if context.freshness.require_svi_timestamp => {
                 evaluation.rejections.push(MarketRejectionReason::StaleSvi);
             }
             None => {
@@ -246,7 +241,7 @@ fn evaluate_market(
 
     match expiry_ms.and_then(|ms| Utc.timestamp_millis_opt(ms).single()) {
         Some(expiry) => {
-            if expiry.signed_duration_since(now) < config.min_time_to_expiry {
+            if expiry.signed_duration_since(context.now) < context.freshness.min_time_to_expiry {
                 evaluation.rejections.push(MarketRejectionReason::ExpiryTooClose);
             }
         }
@@ -261,7 +256,7 @@ fn evaluate_market(
         evaluation.rejections.push(MarketRejectionReason::MissingTickSize);
     }
 
-    if !vault_summary_available {
+    if !context.vault_summary_available {
         evaluation.rejections.push(MarketRejectionReason::VaultSummaryUnavailable);
     }
 
@@ -318,6 +313,14 @@ mod tests {
         }
     }
 
+    fn evaluation_context(now: DateTime<Utc>) -> MarketEvaluationContext {
+        MarketEvaluationContext {
+            vault_summary_available: true,
+            now,
+            freshness: FreshnessConfig::default(),
+        }
+    }
+
     #[test]
     fn market_freshness_filter_accepts_valid_market() {
         let now = Utc.timestamp_millis_opt(1_900_000_000_000).single().expect("valid timestamp");
@@ -328,9 +331,7 @@ mod tests {
             Some(latest_price_at(now - Duration::seconds(10))),
             Some(latest_svi_at(now - Duration::seconds(20))),
             Some(AskBounds { raw: json!({}) }),
-            true,
-            now,
-            FreshnessConfig::default(),
+            evaluation_context(now),
         );
 
         assert!(snapshot.structx_status.is_usable());
@@ -351,9 +352,7 @@ mod tests {
                 raw: json!({}),
             }),
             Some(AskBounds { raw: json!({}) }),
-            true,
-            now,
-            FreshnessConfig::default(),
+            evaluation_context(now),
         );
 
         assert!(snapshot.structx_status.is_usable());
@@ -378,12 +377,13 @@ mod tests {
                 raw: json!({}),
             }),
             Some(AskBounds { raw: json!({}) }),
-            true,
-            now,
-            FreshnessConfig {
-                require_price_timestamp: true,
-                require_svi_timestamp: true,
-                ..FreshnessConfig::default()
+            MarketEvaluationContext {
+                freshness: FreshnessConfig {
+                    require_price_timestamp: true,
+                    require_svi_timestamp: true,
+                    ..FreshnessConfig::default()
+                },
+                ..evaluation_context(now)
             },
         );
 
@@ -406,9 +406,7 @@ mod tests {
             Some(latest_price_at(now - Duration::seconds(120))),
             Some(latest_svi_at(now - Duration::seconds(20))),
             Some(AskBounds { raw: json!({}) }),
-            true,
-            now,
-            FreshnessConfig::default(),
+            evaluation_context(now),
         );
 
         match snapshot.structx_status {
@@ -429,9 +427,7 @@ mod tests {
             Some(latest_price_at(now - Duration::seconds(20))),
             Some(latest_svi_at(now - Duration::seconds(120))),
             Some(AskBounds { raw: json!({}) }),
-            true,
-            now,
-            FreshnessConfig::default(),
+            evaluation_context(now),
         );
 
         match snapshot.structx_status {
@@ -454,16 +450,8 @@ mod tests {
             extra: Default::default(),
         };
 
-        let snapshot = MarketSnapshot::evaluate(
-            list_item,
-            None,
-            None,
-            None,
-            None,
-            true,
-            now,
-            FreshnessConfig::default(),
-        );
+        let snapshot =
+            MarketSnapshot::evaluate(list_item, None, None, None, None, evaluation_context(now));
 
         match snapshot.structx_status {
             StructxMarketStatus::Rejected { reasons, .. } => {

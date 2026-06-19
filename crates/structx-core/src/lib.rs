@@ -1,10 +1,11 @@
 pub use advanced_strategies::{
-    allocate_weighted_budget, compile_convex_tail_ladder, compile_expiry_move_note,
-    compile_moonshot_upside, compile_portfolio_crash_shield, compile_range_conviction,
-    score_smart_candidate, AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegInput,
-    AdvancedLegKind, AdvancedStrategyError, AdvancedStrategyKind, ConvexTailLadderInput,
-    ExpiryMoveNoteInput, MoonshotUpsideInput, PortfolioCrashShieldInput, RangeConvictionInput,
-    SmartBudgetStyle, SmartCandidateMetrics, SmartCandidateScore,
+    allocate_weighted_budget, compile_convex_tail_ladder, compile_downside_convexity,
+    compile_expiry_move_note, compile_moonshot_upside, compile_portfolio_crash_shield,
+    compile_range_conviction, score_smart_candidate, AdvancedCompileResult, AdvancedCompiledLeg,
+    AdvancedLegInput, AdvancedLegKind, AdvancedStrategyError, AdvancedStrategyKind,
+    ConvexTailLadderInput, DownsideConvexityInput, ExpiryMoveNoteInput, MoonshotUpsideInput,
+    PortfolioCrashShieldInput, RangeConvictionInput, SmartBudgetStyle, SmartCandidateMetrics,
+    SmartCandidateScore,
 };
 pub mod advanced_strategies;
 pub use breakout_optimizer::{
