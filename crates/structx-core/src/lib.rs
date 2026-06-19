@@ -1,11 +1,12 @@
 pub use advanced_strategies::{
     allocate_weighted_budget, compile_center_band_condor, compile_convex_tail_ladder,
     compile_downside_convexity, compile_downside_step_ladder, compile_expiry_move_note,
-    compile_moonshot_upside, compile_portfolio_crash_shield, compile_range_conviction,
-    compile_upside_step_ladder, score_smart_candidate, AdvancedCompileResult, AdvancedCompiledLeg,
-    AdvancedLegInput, AdvancedLegKind, AdvancedStrategyError, AdvancedStrategyKind,
-    CenterBandCondorInput, ConvexTailLadderInput, DownsideConvexityInput, DownsideStepLadderInput,
-    ExpiryMoveNoteInput, MoonshotUpsideInput, PortfolioCrashShieldInput, RangeConvictionInput,
+    compile_moonshot_upside, compile_near_barrier_proxy, compile_portfolio_crash_shield,
+    compile_range_conviction, compile_upside_step_ladder, score_smart_candidate,
+    AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegInput, AdvancedLegKind,
+    AdvancedStrategyError, AdvancedStrategyKind, BarrierSide, CenterBandCondorInput,
+    ConvexTailLadderInput, DownsideConvexityInput, DownsideStepLadderInput, ExpiryMoveNoteInput,
+    MoonshotUpsideInput, NearBarrierProxyInput, PortfolioCrashShieldInput, RangeConvictionInput,
     SmartBudgetStyle, SmartCandidateMetrics, SmartCandidateScore, UpsideStepLadderInput,
 };
 pub mod advanced_strategies;

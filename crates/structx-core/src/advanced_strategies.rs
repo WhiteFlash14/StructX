@@ -13,6 +13,7 @@ pub enum AdvancedStrategyKind {
     UpsideStepLadder,
     DownsideStepLadder,
     CenterBandCondor,
+    NearBarrierProxy,
     RangeConviction,
     SmartBudgetSelector,
 }
@@ -28,6 +29,7 @@ impl AdvancedStrategyKind {
             "UPSIDE_STEP_LADDER" | "upside_step_ladder" => Ok(Self::UpsideStepLadder),
             "DOWNSIDE_STEP_LADDER" | "downside_step_ladder" => Ok(Self::DownsideStepLadder),
             "CENTER_BAND_CONDOR" | "center_band_condor" => Ok(Self::CenterBandCondor),
+            "NEAR_BARRIER_PROXY" | "near_barrier_proxy" => Ok(Self::NearBarrierProxy),
             "RANGE_CONVICTION" | "range_conviction" => Ok(Self::RangeConviction),
             "SMART_BUDGET_SELECTOR" | "smart_budget_selector" => Ok(Self::SmartBudgetSelector),
             other => Err(AdvancedStrategyError::UnknownStrategy(other.to_string())),
@@ -44,8 +46,34 @@ impl AdvancedStrategyKind {
             Self::UpsideStepLadder => "UPSIDE_STEP_LADDER",
             Self::DownsideStepLadder => "DOWNSIDE_STEP_LADDER",
             Self::CenterBandCondor => "CENTER_BAND_CONDOR",
+            Self::NearBarrierProxy => "NEAR_BARRIER_PROXY",
             Self::RangeConviction => "RANGE_CONVICTION",
             Self::SmartBudgetSelector => "SMART_BUDGET_SELECTOR",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BarrierSide {
+    Up,
+    Down,
+}
+
+impl BarrierSide {
+    pub fn from_api_value(value: &str) -> Result<Self, AdvancedStrategyError> {
+        match value {
+            "up" | "UP" | "upside" | "UPSIDE" => Ok(Self::Up),
+            "down" | "DOWN" | "downside" | "DOWNSIDE" => Ok(Self::Down),
+            other => {
+                Err(AdvancedStrategyError::InvalidInput(format!("unknown barrier side `{other}`")))
+            }
+        }
+    }
+
+    pub fn api_value(self) -> &'static str {
+        match self {
+            Self::Up => "up",
+            Self::Down => "down",
         }
     }
 }
@@ -616,6 +644,23 @@ pub struct CenterBandCondorInput {
     pub upper_center_ask_raw: u64,
     pub upper_wing_ask_raw: u64,
     pub center_weight_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NearBarrierProxyInput {
+    pub spot_raw: u64,
+    pub budget_raw: u64,
+    pub side: BarrierSide,
+    pub k1_raw: u64,
+    pub k2_raw: u64,
+    pub k3_raw: u64,
+    pub k4_raw: u64,
+    pub down_tail_ask_raw: u64,
+    pub lower_range_ask_raw: u64,
+    pub upper_range_ask_raw: u64,
+    pub up_tail_ask_raw: u64,
+    pub near_range_weight_bps: u16,
+    pub tail_gamma_bps: u16,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1226,6 +1271,117 @@ pub fn compile_center_band_condor(
     Ok(result)
 }
 
+pub fn compile_near_barrier_proxy(
+    input: NearBarrierProxyInput,
+) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
+    if input.spot_raw == 0 {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "spot_raw must be greater than zero".to_string(),
+        ));
+    }
+
+    if !(input.k1_raw < input.k2_raw && input.k2_raw < input.k3_raw && input.k3_raw < input.k4_raw)
+    {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "near barrier proxy requires k1 < k2 < k3 < k4".to_string(),
+        ));
+    }
+
+    let near_range_weight_bps = input.near_range_weight_bps.min(10_000);
+    let tail_weight_bps = 10_000u16.saturating_sub(near_range_weight_bps);
+    let mut legs = Vec::new();
+
+    match input.side {
+        BarrierSide::Up => {
+            let range_mid = midpoint(input.k3_raw, input.k4_raw)?;
+            let tail_mid =
+                input.k4_raw.saturating_mul(101).checked_div(100).unwrap_or(input.k4_raw);
+
+            let mut near_range = tail_ladder_leg(
+                AdvancedLegKind::Range,
+                "near_up_barrier_range",
+                None,
+                Some(input.k3_raw),
+                Some(input.k4_raw),
+                range_mid,
+                input.upper_range_ask_raw,
+                input.spot_raw,
+                0,
+                10_000,
+            )?;
+            near_range.base_weight_e6 =
+                scale_weight_bps(near_range.base_weight_e6, near_range_weight_bps)?;
+
+            let mut tail = tail_ladder_leg(
+                AdvancedLegKind::Up,
+                "beyond_up_barrier_tail",
+                Some(input.k4_raw),
+                None,
+                None,
+                tail_mid,
+                input.up_tail_ask_raw,
+                input.spot_raw,
+                0,
+                input.tail_gamma_bps,
+            )?;
+            tail.base_weight_e6 = scale_weight_bps(tail.base_weight_e6, tail_weight_bps)?;
+
+            legs.push(near_range);
+            legs.push(tail);
+        }
+        BarrierSide::Down => {
+            let range_mid = midpoint(input.k1_raw, input.k2_raw)?;
+            let tail_mid = input.k1_raw.saturating_mul(99).checked_div(100).unwrap_or(input.k1_raw);
+
+            let mut near_range = tail_ladder_leg(
+                AdvancedLegKind::Range,
+                "near_down_barrier_range",
+                None,
+                Some(input.k1_raw),
+                Some(input.k2_raw),
+                range_mid,
+                input.lower_range_ask_raw,
+                input.spot_raw,
+                0,
+                10_000,
+            )?;
+            near_range.base_weight_e6 =
+                scale_weight_bps(near_range.base_weight_e6, near_range_weight_bps)?;
+
+            let mut tail = tail_ladder_leg(
+                AdvancedLegKind::Down,
+                "beyond_down_barrier_tail",
+                Some(input.k1_raw),
+                None,
+                None,
+                tail_mid,
+                input.down_tail_ask_raw,
+                input.spot_raw,
+                0,
+                input.tail_gamma_bps,
+            )?;
+            tail.base_weight_e6 = scale_weight_bps(tail.base_weight_e6, tail_weight_bps)?;
+
+            legs.push(near_range);
+            legs.push(tail);
+        }
+    }
+
+    let mut result =
+        allocate_weighted_budget(AdvancedStrategyKind::NearBarrierProxy, input.budget_raw, legs)?;
+
+    result.warnings.push(format!(
+        "Near-Barrier Proxy is not a true touch option. It only pays if BTC settles near or beyond the {} barrier at expiry.",
+        input.side.api_value()
+    ));
+    result.warnings.push(
+        "This strategy is terminal-expiry exposure; intraperiod touches before expiry do not trigger payout."
+            .to_string(),
+    );
+
+    Ok(result)
+}
+
 fn expiry_move_leg(
     kind: AdvancedLegKind,
     role: &'static str,
@@ -1695,5 +1851,57 @@ mod tests {
         assert!(result.legs.iter().any(|leg| leg.role == "lower_center_band"));
         assert!(result.legs.iter().any(|leg| leg.role == "upper_center_band"));
         assert!(result.legs.iter().all(|leg| leg.kind == AdvancedLegKind::Range));
+    }
+
+    #[test]
+    fn near_barrier_proxy_up_allocates_range_and_up_tail() {
+        let input = NearBarrierProxyInput {
+            spot_raw: 100_000_000_000_000,
+            budget_raw: 100_000_000,
+            side: BarrierSide::Up,
+            k1_raw: 95_000_000_000_000,
+            k2_raw: 98_000_000_000_000,
+            k3_raw: 102_000_000_000_000,
+            k4_raw: 105_000_000_000_000,
+            down_tail_ask_raw: 70_000_000,
+            lower_range_ask_raw: 120_000_000,
+            upper_range_ask_raw: 130_000_000,
+            up_tail_ask_raw: 75_000_000,
+            near_range_weight_bps: 7_000,
+            tail_gamma_bps: 15_000,
+        };
+
+        let result = compile_near_barrier_proxy(input).unwrap();
+
+        assert_eq!(result.strategy, AdvancedStrategyKind::NearBarrierProxy);
+        assert_eq!(result.legs.len(), 2);
+        assert!(result.legs.iter().any(|leg| leg.role == "near_up_barrier_range"));
+        assert!(result.legs.iter().any(|leg| leg.role == "beyond_up_barrier_tail"));
+    }
+
+    #[test]
+    fn near_barrier_proxy_down_allocates_range_and_down_tail() {
+        let input = NearBarrierProxyInput {
+            spot_raw: 100_000_000_000_000,
+            budget_raw: 100_000_000,
+            side: BarrierSide::Down,
+            k1_raw: 95_000_000_000_000,
+            k2_raw: 98_000_000_000_000,
+            k3_raw: 102_000_000_000_000,
+            k4_raw: 105_000_000_000_000,
+            down_tail_ask_raw: 70_000_000,
+            lower_range_ask_raw: 120_000_000,
+            upper_range_ask_raw: 130_000_000,
+            up_tail_ask_raw: 75_000_000,
+            near_range_weight_bps: 7_000,
+            tail_gamma_bps: 15_000,
+        };
+
+        let result = compile_near_barrier_proxy(input).unwrap();
+
+        assert_eq!(result.strategy, AdvancedStrategyKind::NearBarrierProxy);
+        assert_eq!(result.legs.len(), 2);
+        assert!(result.legs.iter().any(|leg| leg.role == "near_down_barrier_range"));
+        assert!(result.legs.iter().any(|leg| leg.role == "beyond_down_barrier_tail"));
     }
 }

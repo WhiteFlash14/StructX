@@ -18,17 +18,17 @@ use structx_core::{
     build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
     compile_breakout, compile_bucket_payoff, compile_center_band_condor,
     compile_convex_tail_ladder, compile_downside_convexity, compile_downside_step_ladder,
-    compile_expiry_move_note, compile_moonshot_upside, compile_portfolio_crash_shield,
-    compile_range_conviction, compile_upside_step_ladder, guard_quote_preview,
-    optimize_breakout_quantities, score_smart_candidate, select_best_market,
+    compile_expiry_move_note, compile_moonshot_upside, compile_near_barrier_proxy,
+    compile_portfolio_crash_shield, compile_range_conviction, compile_upside_step_ladder,
+    guard_quote_preview, optimize_breakout_quantities, score_smart_candidate, select_best_market,
     select_candidate_markets, AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegKind,
-    AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle, CenterBandCondorInput, CompiledPayoff,
-    ConvexTailLadderInput, DisplayPrice, DownsideConvexityInput, DownsideStepLadderInput,
-    ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs, MoonshotUpsideInput, PayoffBucket,
-    PortfolioCrashShieldInput, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall,
-    QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind,
-    RangeConvictionInput, SelectedMarket, SmartBudgetStyle, SmartCandidateMetrics,
-    SmartCandidateScore, Strike, UpsideStepLadderInput,
+    AdvancedStrategyKind, BarrierSide, BreakoutAskInputs, BreakoutStyle, CenterBandCondorInput,
+    CompiledPayoff, ConvexTailLadderInput, DisplayPrice, DownsideConvexityInput,
+    DownsideStepLadderInput, ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs,
+    MoonshotUpsideInput, NearBarrierProxyInput, PayoffBucket, PortfolioCrashShieldInput,
+    PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs,
+    QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind, RangeConvictionInput, SelectedMarket,
+    SmartBudgetStyle, SmartCandidateMetrics, SmartCandidateScore, Strike, UpsideStepLadderInput,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -301,6 +301,15 @@ enum Command {
 
         #[arg(long, default_value_t = 8_000)]
         condor_center_weight_bps: u16,
+
+        #[arg(long, default_value = "up")]
+        barrier_side: String,
+
+        #[arg(long, default_value_t = 7_000)]
+        barrier_near_range_weight_bps: u16,
+
+        #[arg(long, default_value_t = 15_000)]
+        barrier_tail_gamma_bps: u16,
     },
     DemoStatus {
         #[arg(long)]
@@ -600,6 +609,9 @@ async fn main() -> std::process::ExitCode {
             downside_lower_range_weight_bps,
             downside_step_tail_gamma_bps,
             condor_center_weight_bps,
+            barrier_side,
+            barrier_near_range_weight_bps,
+            barrier_tail_gamma_bps,
             downside_range_weight_bps,
             downside_tail_gamma_bps,
         } => {
@@ -631,6 +643,9 @@ async fn main() -> std::process::ExitCode {
                 downside_lower_range_weight_bps,
                 downside_step_tail_gamma_bps,
                 condor_center_weight_bps,
+                barrier_side,
+                barrier_near_range_weight_bps,
+                barrier_tail_gamma_bps,
             })
             .await
         }
@@ -951,6 +966,9 @@ pub struct CompileStrategyJsonArgs {
     pub downside_lower_range_weight_bps: u16,
     pub downside_step_tail_gamma_bps: u16,
     pub condor_center_weight_bps: u16,
+    pub barrier_side: String,
+    pub barrier_near_range_weight_bps: u16,
+    pub barrier_tail_gamma_bps: u16,
 }
 #[derive(Debug, Clone)]
 struct SmartCompiledCandidate {
@@ -1992,6 +2010,7 @@ async fn compile_strategy_json_command(
             | AdvancedStrategyKind::UpsideStepLadder
             | AdvancedStrategyKind::DownsideStepLadder
             | AdvancedStrategyKind::CenterBandCondor
+            | AdvancedStrategyKind::NearBarrierProxy
             | AdvancedStrategyKind::RangeConviction
             | AdvancedStrategyKind::SmartBudgetSelector),
         ) => Some(strategy),
@@ -3342,6 +3361,97 @@ async fn compile_advanced_strategy_json_from_market(
             })?
         }
 
+        AdvancedStrategyKind::NearBarrierProxy => {
+            let ask_down_tail = if args.barrier_side.eq_ignore_ascii_case("down") {
+                Some(
+                    quote_single_binary_ask_raw(
+                        args,
+                        selected,
+                        predict,
+                        oracle,
+                        clock,
+                        rpc,
+                        k1.raw,
+                        false,
+                        probe_quantity,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let ask_lower_range = if args.barrier_side.eq_ignore_ascii_case("down") {
+                Some(
+                    quote_single_range_ask_raw(
+                        args,
+                        selected,
+                        predict,
+                        oracle,
+                        clock,
+                        rpc,
+                        k1.raw,
+                        k2.raw,
+                        probe_quantity,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let ask_upper_range = if args.barrier_side.eq_ignore_ascii_case("up") {
+                Some(
+                    quote_single_range_ask_raw(
+                        args,
+                        selected,
+                        predict,
+                        oracle,
+                        clock,
+                        rpc,
+                        k3.raw,
+                        k4.raw,
+                        probe_quantity,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+            let ask_up_tail = if args.barrier_side.eq_ignore_ascii_case("up") {
+                Some(
+                    quote_single_binary_ask_raw(
+                        args,
+                        selected,
+                        predict,
+                        oracle,
+                        clock,
+                        rpc,
+                        k4.raw,
+                        true,
+                        probe_quantity,
+                    )
+                    .await?,
+                )
+            } else {
+                None
+            };
+
+            compile_near_barrier_proxy(NearBarrierProxyInput {
+                spot_raw: selected.spot_raw,
+                budget_raw,
+                side: BarrierSide::from_api_value(&args.barrier_side)?,
+                k1_raw: k1.raw,
+                k2_raw: k2.raw,
+                k3_raw: k3.raw,
+                k4_raw: k4.raw,
+                down_tail_ask_raw: ask_down_tail.unwrap_or(0),
+                lower_range_ask_raw: ask_lower_range.unwrap_or(0),
+                upper_range_ask_raw: ask_upper_range.unwrap_or(0),
+                up_tail_ask_raw: ask_up_tail.unwrap_or(0),
+                near_range_weight_bps: args.barrier_near_range_weight_bps,
+                tail_gamma_bps: args.barrier_tail_gamma_bps,
+            })?
+        }
+
         AdvancedStrategyKind::RangeConviction => {
             let probe_compiled =
                 compile_bucket_payoff(&[PayoffBucket::new(Some(k2), Some(k3), probe_quantity)])?;
@@ -3496,6 +3606,30 @@ async fn compile_advanced_strategy_json_from_market(
 
     let payoff_table = advanced_payoff_table_json(&advanced_result.legs, total_cost_raw, asset);
 
+    let advanced_json = serde_json::json!({
+        "requestedBudgetRaw": advanced_result.requested_budget_raw.to_string(),
+        "usedBudgetRaw": advanced_result.used_budget_raw.to_string(),
+        "unusedBudgetRaw": advanced_result.unused_budget_raw.to_string(),
+        "portfolioExposureDUSDC": args.portfolio_exposure_dusdc,
+        "overHedgeCapBps": args.over_hedge_cap_bps,
+        "deadZoneBps": args.dead_zone_bps,
+        "convexGammaBps": args.convex_gamma_bps,
+        "moonshotRangeWeightBps": args.moonshot_range_weight_bps,
+        "moonshotTailGammaBps": args.moonshot_tail_gamma_bps,
+        "downsideRangeWeightBps": args.downside_range_weight_bps,
+        "downsideTailGammaBps": args.downside_tail_gamma_bps,
+        "upsideNearRangeWeightBps": args.upside_near_range_weight_bps,
+        "upsideUpperRangeWeightBps": args.upside_upper_range_weight_bps,
+        "upsideTailGammaBps": args.upside_tail_gamma_bps,
+        "downsideNearRangeWeightBps": args.downside_near_range_weight_bps,
+        "downsideLowerRangeWeightBps": args.downside_lower_range_weight_bps,
+        "downsideStepTailGammaBps": args.downside_step_tail_gamma_bps,
+        "condorCenterWeightBps": args.condor_center_weight_bps,
+        "barrierSide": args.barrier_side,
+        "barrierNearRangeWeightBps": args.barrier_near_range_weight_bps,
+        "barrierTailGammaBps": args.barrier_tail_gamma_bps
+    });
+
     Ok(serde_json::json!({
         "ok": true,
         "compiledStrategyId": compiled_strategy_id,
@@ -3526,26 +3660,7 @@ async fn compile_advanced_strategy_json_from_market(
             "k3Raw": k3.raw.to_string(),
             "k4Raw": k4.raw.to_string()
         },
-        "advanced": {
-            "requestedBudgetRaw": advanced_result.requested_budget_raw.to_string(),
-            "usedBudgetRaw": advanced_result.used_budget_raw.to_string(),
-            "unusedBudgetRaw": advanced_result.unused_budget_raw.to_string(),
-            "portfolioExposureDUSDC": args.portfolio_exposure_dusdc,
-            "overHedgeCapBps": args.over_hedge_cap_bps,
-            "deadZoneBps": args.dead_zone_bps,
-            "convexGammaBps": args.convex_gamma_bps,
-            "moonshotRangeWeightBps": args.moonshot_range_weight_bps,
-            "moonshotTailGammaBps": args.moonshot_tail_gamma_bps,
-            "downsideRangeWeightBps": args.downside_range_weight_bps,
-            "downsideTailGammaBps": args.downside_tail_gamma_bps,
-            "upsideNearRangeWeightBps": args.upside_near_range_weight_bps,
-            "upsideUpperRangeWeightBps": args.upside_upper_range_weight_bps,
-            "upsideTailGammaBps": args.upside_tail_gamma_bps,
-            "downsideNearRangeWeightBps": args.downside_near_range_weight_bps,
-            "downsideLowerRangeWeightBps": args.downside_lower_range_weight_bps,
-            "downsideStepTailGammaBps": args.downside_step_tail_gamma_bps,
-            "condorCenterWeightBps": args.condor_center_weight_bps
-        },
+        "advanced": advanced_json,
         "legs": legs_json,
         "payoffTable": payoff_table,
         "warnings": all_warnings

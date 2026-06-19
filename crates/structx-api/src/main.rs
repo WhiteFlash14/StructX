@@ -197,6 +197,15 @@ struct CompileStrategyRequest {
 
     #[serde(rename = "condorCenterWeightBps")]
     condor_center_weight_bps: Option<u16>,
+
+    #[serde(rename = "barrierSide")]
+    barrier_side: Option<String>,
+
+    #[serde(rename = "barrierNearRangeWeightBps")]
+    barrier_near_range_weight_bps: Option<u16>,
+
+    #[serde(rename = "barrierTailGammaBps")]
+    barrier_tail_gamma_bps: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -596,6 +605,21 @@ async fn compile_strategy(
 
     if let Some(value) = req.condor_center_weight_bps {
         args.push("--condor-center-weight-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.barrier_side {
+        args.push("--barrier-side".to_string());
+        args.push(value);
+    }
+
+    if let Some(value) = req.barrier_near_range_weight_bps {
+        args.push("--barrier-near-range-weight-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.barrier_tail_gamma_bps {
+        args.push("--barrier-tail-gamma-bps".to_string());
         args.push(value.to_string());
     }
 
@@ -1404,7 +1428,7 @@ async fn parse_intent_with_openai_or_fallback(
             },
             "recommendedStrategy": {
                 "type": "string",
-                "enum": ["BREAKOUT_PROTECTION"]
+                "enum": ["BREAKOUT_PROTECTION", "NEAR_BARRIER_PROXY"]
             },
             "recommendedStyle": {
                 "type": "string",
@@ -1437,13 +1461,14 @@ StructX is a non-custodial structured payoff builder on DeepBook Predict testnet
 You do not give financial advice.
 You only convert user intent into strict JSON for deterministic compiler logic.
 Supported asset: BTC only.
-Supported strategy for this milestone: BREAKOUT_PROTECTION only.
+Supported strategies for this milestone: BREAKOUT_PROTECTION and NEAR_BARRIER_PROXY.
 Supported expiry preference: nearest_active.
 
 Rules:
 - If the user wants protection, crash hedge, dump protection, or downside coverage, goal = downside_protection.
 - If the user wants a big move either direction, volatility, or breakout, goal = two_sided_breakout.
 - If the user wants moonshot/upside/rally exposure, goal = upside_speculation.
+- If the user mentions a near barrier, barrier, close target, or near target, recommendedStrategy = NEAR_BARRIER_PROXY.
 - conservative -> higher-hit-rate unless user explicitly asks for tail.
 - aggressive/max payout -> tail-heavy.
 - balanced/default -> balanced.
@@ -1594,8 +1619,12 @@ fn deterministic_parse_intent(req: &ParseIntentRequest) -> ParsedIntent {
     let msg = req.message.to_lowercase();
 
     let recommended_strategy =
-        if contains_any(&msg, &["expires far", "far from current", "expiry move", "terminal move"])
-        {
+        if contains_any(&msg, &["near barrier", "barrier", "close to target", "near target"]) {
+            "NEAR_BARRIER_PROXY"
+        } else if contains_any(
+            &msg,
+            &["expires far", "far from current", "expiry move", "terminal move"],
+        ) {
             "EXPIRY_MOVE_NOTE"
         } else if contains_any(
             &msg,
@@ -1687,6 +1716,7 @@ fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
             | "DOWNSIDE_CONVEXITY"
             | "DOWNSIDE_STEP_LADDER"
             | "CENTER_BAND_CONDOR"
+            | "NEAR_BARRIER_PROXY"
             | "RANGE_CONVICTION"
             | "SMART_BUDGET_SELECTOR"
     ) {
