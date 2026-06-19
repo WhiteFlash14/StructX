@@ -16,13 +16,14 @@ use deepbook_client::{
 use structx_core::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
     build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
-    compile_breakout, compile_bucket_payoff,compile_convex_tail_ladder, compile_portfolio_crash_shield,
-    guard_quote_preview, optimize_breakout_quantities, select_best_market,
-    select_candidate_markets, AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegKind,
-    AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle, CompiledPayoff, ConvexTailLadderInput,
-    DisplayPrice, ManagerPositionRead, MintObjectRefs, PortfolioCrashShieldInput, PredictLeg,
-    PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan,
-    QuotePreview, QuotePreviewLeg, QuoteTxKind, SelectedMarket,Strike,PayoffBucket,
+    compile_breakout, compile_bucket_payoff, compile_convex_tail_ladder, compile_expiry_move_note,
+    compile_portfolio_crash_shield, guard_quote_preview, optimize_breakout_quantities,
+    select_best_market, select_candidate_markets, AdvancedCompileResult, AdvancedCompiledLeg,
+    AdvancedLegKind, AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle, CompiledPayoff,
+    ConvexTailLadderInput, DisplayPrice, ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs,
+    PayoffBucket, PortfolioCrashShieldInput, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall,
+    QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind,
+    SelectedMarket, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -1820,12 +1821,12 @@ struct PositionCheckSummary {
 async fn compile_strategy_json_command(
     args: CompileStrategyJsonArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _compile_slippage_bps = args.slippage_bps;
     let advanced_strategy = match AdvancedStrategyKind::from_api_value(&args.strategy) {
         Ok(
-            strategy @ (
-                AdvancedStrategyKind::PortfolioCrashShield
-                | AdvancedStrategyKind::ConvexTailLadder
-            ),
+            strategy @ (AdvancedStrategyKind::PortfolioCrashShield
+            | AdvancedStrategyKind::ConvexTailLadder
+            | AdvancedStrategyKind::ExpiryMoveNote),
         ) => Some(strategy),
         _ => None,
     };
@@ -1846,8 +1847,6 @@ async fn compile_strategy_json_command(
         .into());
     }
 
-   
-
     let budget_raw = parse_dusdc_to_raw(&args.budget_dusdc)?;
     let style = BreakoutStyle::from_api_value(&args.style)?;
 
@@ -1865,8 +1864,6 @@ async fn compile_strategy_json_command(
     let rpc = SuiRpcClient::new(args.rpc_url.clone(), StdDuration::from_secs(20))?;
     let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
     let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
-
-    
 
     let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
 
@@ -2134,122 +2131,156 @@ async fn compile_advanced_strategy_json_from_market(
 
     let probe_quantity = 1_000_000u64;
 
-let advanced_result = match strategy_kind {
-    AdvancedStrategyKind::PortfolioCrashShield => {
-        let exposure_raw = dusdc_f64_to_raw(args.portfolio_exposure_dusdc)?;
+    let advanced_result = match strategy_kind {
+        AdvancedStrategyKind::PortfolioCrashShield => {
+            let exposure_raw = dusdc_f64_to_raw(args.portfolio_exposure_dusdc)?;
 
-        let probe_compiled = compile_bucket_payoff(&[
-            PayoffBucket::new(None, Some(k1), probe_quantity),
-            PayoffBucket::new(Some(k1), Some(k2), probe_quantity),
-            PayoffBucket::new(Some(k2), Some(k3), probe_quantity),
-        ])?;
+            let probe_compiled = compile_bucket_payoff(&[
+                PayoffBucket::new(None, Some(k1), probe_quantity),
+                PayoffBucket::new(Some(k1), Some(k2), probe_quantity),
+                PayoffBucket::new(Some(k2), Some(k3), probe_quantity),
+            ])?;
 
-        let probe_plan = build_quote_plan(selected, &probe_compiled)?;
+            let probe_plan = build_quote_plan(selected, &probe_compiled)?;
 
-        let probe_tx_kind = build_quote_tx_kind(
-            &probe_plan,
-            QuoteObjectRefs {
-                predict,
-                oracle,
-                clock,
-            },
-            &args.owner,
-        )?;
+            let probe_tx_kind = build_quote_tx_kind(
+                &probe_plan,
+                QuoteObjectRefs { predict, oracle, clock },
+                &args.owner,
+            )?;
 
-        let probe_response = rpc
-            .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
-            .await?;
+            let probe_response = rpc
+                .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
+                .await?;
 
-        let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
+            let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
 
-        if probe_costs.len() != 3 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected 3 crash-shield probe quote legs, got {}", probe_costs.len()),
-            )
-            .into());
+            if probe_costs.len() != 3 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected 3 crash-shield probe quote legs, got {}", probe_costs.len()),
+                )
+                .into());
+            }
+
+            let ask_down_tail = infer_ask_price_raw(probe_costs[0].0, probe_quantity);
+            let ask_lower_range = infer_ask_price_raw(probe_costs[1].0, probe_quantity);
+            let ask_mild_range = infer_ask_price_raw(probe_costs[2].0, probe_quantity);
+
+            compile_portfolio_crash_shield(PortfolioCrashShieldInput {
+                spot_raw: selected.spot_raw,
+                exposure_raw,
+                budget_raw,
+                over_hedge_cap_bps: args.over_hedge_cap_bps,
+                gamma_bps: 10_000,
+                down_tail_strike_raw: k1.raw,
+                lower_range_upper_raw: k2.raw,
+                mild_range_upper_raw: Some(k3.raw),
+                down_tail_ask_raw: ask_down_tail,
+                lower_range_ask_raw: ask_lower_range,
+                mild_range_ask_raw: Some(ask_mild_range),
+            })?
+        }
+        AdvancedStrategyKind::ConvexTailLadder => {
+            let probe_compiled = compile_bucket_payoff(&[
+                PayoffBucket::new(None, Some(k1), probe_quantity),
+                PayoffBucket::new(Some(k1), Some(k2), probe_quantity),
+                PayoffBucket::new(Some(k3), Some(k4), probe_quantity),
+                PayoffBucket::new(Some(k4), None, probe_quantity),
+            ])?;
+
+            let probe_plan = build_quote_plan(selected, &probe_compiled)?;
+
+            let probe_tx_kind = build_quote_tx_kind(
+                &probe_plan,
+                QuoteObjectRefs { predict, oracle, clock },
+                &args.owner,
+            )?;
+
+            let probe_response = rpc
+                .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
+                .await?;
+
+            let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
+
+            if probe_costs.len() != 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected 4 tail-ladder probe quote legs, got {}", probe_costs.len()),
+                )
+                .into());
+            }
+
+            let ask_down_tail = infer_ask_price_raw(probe_costs[0].0, probe_quantity);
+            let ask_lower_range = infer_ask_price_raw(probe_costs[1].0, probe_quantity);
+            let ask_upper_range = infer_ask_price_raw(probe_costs[2].0, probe_quantity);
+            let ask_up_tail = infer_ask_price_raw(probe_costs[3].0, probe_quantity);
+
+            compile_convex_tail_ladder(ConvexTailLadderInput {
+                spot_raw: selected.spot_raw,
+                budget_raw,
+                dead_zone_bps: args.dead_zone_bps,
+                gamma_bps: args.convex_gamma_bps,
+                k1_raw: k1.raw,
+                k2_raw: k2.raw,
+                k3_raw: k3.raw,
+                k4_raw: k4.raw,
+                down_tail_ask_raw: ask_down_tail,
+                lower_range_ask_raw: ask_lower_range,
+                upper_range_ask_raw: ask_upper_range,
+                up_tail_ask_raw: ask_up_tail,
+            })?
         }
 
-        let ask_down_tail = infer_ask_price_raw(probe_costs[0].0, probe_quantity);
-        let ask_lower_range = infer_ask_price_raw(probe_costs[1].0, probe_quantity);
-        let ask_mild_range = infer_ask_price_raw(probe_costs[2].0, probe_quantity);
+        AdvancedStrategyKind::ExpiryMoveNote => {
+            let probe_compiled = compile_bucket_payoff(&[
+                PayoffBucket::new(None, Some(k1), probe_quantity),
+                PayoffBucket::new(Some(k1), Some(k2), probe_quantity),
+                PayoffBucket::new(Some(k3), Some(k4), probe_quantity),
+                PayoffBucket::new(Some(k4), None, probe_quantity),
+            ])?;
 
-        compile_portfolio_crash_shield(PortfolioCrashShieldInput {
-            spot_raw: selected.spot_raw,
-            exposure_raw,
-            budget_raw,
-            over_hedge_cap_bps: args.over_hedge_cap_bps,
-            gamma_bps: 10_000,
-            down_tail_strike_raw: k1.raw,
-            lower_range_upper_raw: k2.raw,
-            mild_range_upper_raw: Some(k3.raw),
-            down_tail_ask_raw: ask_down_tail,
-            lower_range_ask_raw: ask_lower_range,
-            mild_range_ask_raw: Some(ask_mild_range),
-        })?
-    }
-    AdvancedStrategyKind::ConvexTailLadder => {
-        let probe_compiled = compile_bucket_payoff(&[
-            PayoffBucket::new(None, Some(k1), probe_quantity),
-            PayoffBucket::new(Some(k1), Some(k2), probe_quantity),
-            PayoffBucket::new(Some(k3), Some(k4), probe_quantity),
-            PayoffBucket::new(Some(k4), None, probe_quantity),
-        ])?;
+            let probe_plan = build_quote_plan(selected, &probe_compiled)?;
 
-        let probe_plan = build_quote_plan(selected, &probe_compiled)?;
+            let probe_tx_kind = build_quote_tx_kind(
+                &probe_plan,
+                QuoteObjectRefs { predict, oracle, clock },
+                &args.owner,
+            )?;
 
-        let probe_tx_kind = build_quote_tx_kind(
-            &probe_plan,
-            QuoteObjectRefs {
-                predict,
-                oracle,
-                clock,
-            },
-            &args.owner,
-        )?;
+            let probe_response = rpc
+                .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
+                .await?;
 
-        let probe_response = rpc
-            .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
-            .await?;
+            let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
 
-        let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
+            if probe_costs.len() != 4 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected 4 expiry-move probe quote legs, got {}", probe_costs.len()),
+                )
+                .into());
+            }
 
-        if probe_costs.len() != 4 {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("expected 4 tail-ladder probe quote legs, got {}", probe_costs.len()),
-            )
-            .into());
+            let ask_down_tail = infer_ask_price_raw(probe_costs[0].0, probe_quantity);
+            let ask_lower_range = infer_ask_price_raw(probe_costs[1].0, probe_quantity);
+            let ask_upper_range = infer_ask_price_raw(probe_costs[2].0, probe_quantity);
+            let ask_up_tail = infer_ask_price_raw(probe_costs[3].0, probe_quantity);
+
+            compile_expiry_move_note(ExpiryMoveNoteInput {
+                spot_raw: selected.spot_raw,
+                budget_raw,
+                k1_raw: k1.raw,
+                k2_raw: k2.raw,
+                k3_raw: k3.raw,
+                k4_raw: k4.raw,
+                down_tail_ask_raw: ask_down_tail,
+                lower_range_ask_raw: ask_lower_range,
+                upper_range_ask_raw: ask_upper_range,
+                up_tail_ask_raw: ask_up_tail,
+            })?
         }
-
-        let ask_down_tail = infer_ask_price_raw(probe_costs[0].0, probe_quantity);
-        let ask_lower_range = infer_ask_price_raw(probe_costs[1].0, probe_quantity);
-        let ask_upper_range = infer_ask_price_raw(probe_costs[2].0, probe_quantity);
-        let ask_up_tail = infer_ask_price_raw(probe_costs[3].0, probe_quantity);
-
-        compile_convex_tail_ladder(ConvexTailLadderInput {
-            spot_raw: selected.spot_raw,
-            budget_raw,
-            dead_zone_bps: args.dead_zone_bps,
-            gamma_bps: args.convex_gamma_bps,
-            k1_raw: k1.raw,
-            k2_raw: k2.raw,
-            k3_raw: k3.raw,
-            k4_raw: k4.raw,
-            down_tail_ask_raw: ask_down_tail,
-            lower_range_ask_raw: ask_lower_range,
-            upper_range_ask_raw: ask_upper_range,
-            up_tail_ask_raw: ask_up_tail,
-        })?
-    }
-    other => {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidInput,
-            format!("advanced strategy not wired yet: {}", other.api_value()),
-        )
-        .into());
-    }
-};
+    };
 
     let final_compiled = advanced_result_to_compiled_payoff(&advanced_result)?;
     let final_plan = build_quote_plan(selected, &final_compiled)?;
@@ -2917,6 +2948,7 @@ struct DevinspectRedeemBreakoutArgs {
 async fn devinspect_redeem_breakout_command(
     args: DevinspectRedeemBreakoutArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let _redeem_sizing_flags = (args.auto_size_down, args.redeem_bps);
     let reads = load_position_reads_from_execution_json(&args.from_execution_json)?;
 
     if reads.is_empty() {

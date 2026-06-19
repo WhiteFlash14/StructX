@@ -375,6 +375,20 @@ pub fn compile_portfolio_crash_shield(
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ExpiryMoveNoteInput {
+    pub spot_raw: u64,
+    pub budget_raw: u64,
+    pub k1_raw: u64,
+    pub k2_raw: u64,
+    pub k3_raw: u64,
+    pub k4_raw: u64,
+    pub down_tail_ask_raw: u64,
+    pub lower_range_ask_raw: u64,
+    pub upper_range_ask_raw: u64,
+    pub up_tail_ask_raw: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConvexTailLadderInput {
     pub spot_raw: u64,
     pub budget_raw: u64,
@@ -466,6 +480,106 @@ pub fn compile_convex_tail_ladder(
     );
 
     Ok(result)
+}
+
+pub fn compile_expiry_move_note(
+    input: ExpiryMoveNoteInput,
+) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
+    if input.spot_raw == 0 {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "spot_raw must be greater than zero".to_string(),
+        ));
+    }
+
+    let severe_down_mid = input.k1_raw.saturating_mul(99).checked_div(100).unwrap_or(input.k1_raw);
+
+    let down_range_mid = midpoint(input.k1_raw, input.k2_raw)?;
+    let up_range_mid = midpoint(input.k3_raw, input.k4_raw)?;
+
+    let severe_up_mid = input.k4_raw.saturating_mul(101).checked_div(100).unwrap_or(input.k4_raw);
+
+    let legs = vec![
+        expiry_move_leg(
+            AdvancedLegKind::Down,
+            "large_downside_move",
+            Some(input.k1_raw),
+            None,
+            None,
+            severe_down_mid,
+            input.down_tail_ask_raw,
+            input.spot_raw,
+        )?,
+        expiry_move_leg(
+            AdvancedLegKind::Range,
+            "moderate_downside_move",
+            None,
+            Some(input.k1_raw),
+            Some(input.k2_raw),
+            down_range_mid,
+            input.lower_range_ask_raw,
+            input.spot_raw,
+        )?,
+        expiry_move_leg(
+            AdvancedLegKind::Range,
+            "moderate_upside_move",
+            None,
+            Some(input.k3_raw),
+            Some(input.k4_raw),
+            up_range_mid,
+            input.upper_range_ask_raw,
+            input.spot_raw,
+        )?,
+        expiry_move_leg(
+            AdvancedLegKind::Up,
+            "large_upside_move",
+            Some(input.k4_raw),
+            None,
+            None,
+            severe_up_mid,
+            input.up_tail_ask_raw,
+            input.spot_raw,
+        )?,
+    ];
+
+    let mut result =
+        allocate_weighted_budget(AdvancedStrategyKind::ExpiryMoveNote, input.budget_raw, legs)?;
+
+    result.warnings.push(
+        "Expiry Move Note is a terminal-settlement product. It does not pay for realized volatility, intraperiod touches, or path-dependent moves."
+            .to_string(),
+    );
+
+    Ok(result)
+}
+
+fn expiry_move_leg(
+    kind: AdvancedLegKind,
+    role: &'static str,
+    strike_raw: Option<u64>,
+    lower_raw: Option<u64>,
+    upper_raw: Option<u64>,
+    midpoint_raw: u64,
+    ask_price_raw: u64,
+    spot_raw: u64,
+) -> Result<AdvancedLegInput, AdvancedStrategyError> {
+    let move_bps = abs_return_bps(midpoint_raw, spot_raw)?;
+
+    let weight_e6 = (move_bps as u128)
+        .checked_mul(1_000_000)
+        .ok_or(AdvancedStrategyError::Overflow)?
+        .min(u64::MAX as u128) as u64;
+
+    Ok(AdvancedLegInput {
+        kind,
+        role,
+        strike_raw,
+        lower_raw,
+        upper_raw,
+        midpoint_raw,
+        ask_price_raw,
+        base_weight_e6: weight_e6,
+        max_quantity: None,
+    })
 }
 
 fn crash_bucket_leg(
@@ -674,5 +788,35 @@ mod tests {
             .unwrap_err();
 
         assert!(matches!(err, AdvancedStrategyError::ZeroBudget));
+    }
+
+    #[test]
+    fn expiry_move_note_allocates_by_terminal_distance() {
+        let input = ExpiryMoveNoteInput {
+            spot_raw: 100_000_000_000_000,
+            budget_raw: 100_000_000,
+            k1_raw: 95_000_000_000_000,
+            k2_raw: 98_000_000_000_000,
+            k3_raw: 102_000_000_000_000,
+            k4_raw: 105_000_000_000_000,
+            down_tail_ask_raw: 80_000_000,
+            lower_range_ask_raw: 130_000_000,
+            upper_range_ask_raw: 120_000_000,
+            up_tail_ask_raw: 70_000_000,
+        };
+
+        let result = compile_expiry_move_note(input).unwrap();
+
+        assert_eq!(result.strategy, AdvancedStrategyKind::ExpiryMoveNote);
+        assert_eq!(result.legs.len(), 4);
+        assert!(result.used_budget_raw <= input.budget_raw);
+        assert!(result.legs.iter().all(|leg| leg.quantity > 0));
+
+        let down_tail = result.legs.iter().find(|leg| leg.role == "large_downside_move").unwrap();
+
+        let lower_range =
+            result.legs.iter().find(|leg| leg.role == "moderate_downside_move").unwrap();
+
+        assert!(down_tail.weight_e6 > lower_range.weight_e6);
     }
 }

@@ -1529,6 +1529,38 @@ fn parsed_intent_from_value(
 fn deterministic_parse_intent(req: &ParseIntentRequest) -> ParsedIntent {
     let msg = req.message.to_lowercase();
 
+    let recommended_strategy =
+        if contains_any(&msg, &["expires far", "far from current", "expiry move", "terminal move"])
+        {
+            "EXPIRY_MOVE_NOTE"
+        } else if contains_any(
+            &msg,
+            &[
+                "protect",
+                "protection",
+                "hedge",
+                "downside",
+                "dump",
+                "crash",
+                "sell-off",
+                "selldown",
+            ],
+        ) {
+            "PORTFOLIO_CRASH_SHIELD"
+        } else if contains_any(
+            &msg,
+            &["moon", "upside", "rally", "pump", "breaks up", "breakout up"],
+        ) {
+            "CONVEX_TAIL_LADDER"
+        } else if contains_any(
+            &msg,
+            &["big move", "breakout", "volatile", "volatility", "either direction", "move a lot"],
+        ) {
+            "CONVEX_TAIL_LADDER"
+        } else {
+            "BREAKOUT_PROTECTION"
+        };
+
     let goal = if contains_any(
         &msg,
         &["protect", "protection", "hedge", "downside", "dump", "crash", "sell-off", "selldown"],
@@ -1565,7 +1597,7 @@ fn deterministic_parse_intent(req: &ParseIntentRequest) -> ParsedIntent {
             .time_preference
             .clone()
             .unwrap_or_else(|| "nearest_active".to_string()),
-        recommended_strategy: "BREAKOUT_PROTECTION".to_string(),
+        recommended_strategy: recommended_strategy.to_string(),
         recommended_style: style,
         confidence: 0.62,
         reasoning_summary: reasoning_for_goal(goal).to_string(),
@@ -1581,7 +1613,15 @@ fn deterministic_parse_intent(req: &ParseIntentRequest) -> ParsedIntent {
 
 fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
     parsed.asset = "BTC".to_string();
-    parsed.recommended_strategy = "BREAKOUT_PROTECTION".to_string();
+    if !matches!(
+        parsed.recommended_strategy.as_str(),
+        "BREAKOUT_PROTECTION"
+            | "PORTFOLIO_CRASH_SHIELD"
+            | "CONVEX_TAIL_LADDER"
+            | "EXPIRY_MOVE_NOTE"
+    ) {
+        parsed.recommended_strategy = "BREAKOUT_PROTECTION".to_string();
+    }
 
     parsed.risk_preference = normalize_risk(&parsed.risk_preference).to_string();
 
