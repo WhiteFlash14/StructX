@@ -12,6 +12,7 @@ pub enum AdvancedStrategyKind {
     DownsideConvexity,
     UpsideStepLadder,
     DownsideStepLadder,
+    CenterBandCondor,
     RangeConviction,
     SmartBudgetSelector,
 }
@@ -26,6 +27,7 @@ impl AdvancedStrategyKind {
             "DOWNSIDE_CONVEXITY" | "downside_convexity" => Ok(Self::DownsideConvexity),
             "UPSIDE_STEP_LADDER" | "upside_step_ladder" => Ok(Self::UpsideStepLadder),
             "DOWNSIDE_STEP_LADDER" | "downside_step_ladder" => Ok(Self::DownsideStepLadder),
+            "CENTER_BAND_CONDOR" | "center_band_condor" => Ok(Self::CenterBandCondor),
             "RANGE_CONVICTION" | "range_conviction" => Ok(Self::RangeConviction),
             "SMART_BUDGET_SELECTOR" | "smart_budget_selector" => Ok(Self::SmartBudgetSelector),
             other => Err(AdvancedStrategyError::UnknownStrategy(other.to_string())),
@@ -41,6 +43,7 @@ impl AdvancedStrategyKind {
             Self::DownsideConvexity => "DOWNSIDE_CONVEXITY",
             Self::UpsideStepLadder => "UPSIDE_STEP_LADDER",
             Self::DownsideStepLadder => "DOWNSIDE_STEP_LADDER",
+            Self::CenterBandCondor => "CENTER_BAND_CONDOR",
             Self::RangeConviction => "RANGE_CONVICTION",
             Self::SmartBudgetSelector => "SMART_BUDGET_SELECTOR",
         }
@@ -601,6 +604,21 @@ pub struct DownsideStepLadderInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CenterBandCondorInput {
+    pub budget_raw: u64,
+    pub k1_raw: u64,
+    pub k2_raw: u64,
+    pub center_raw: u64,
+    pub k3_raw: u64,
+    pub k4_raw: u64,
+    pub lower_wing_ask_raw: u64,
+    pub lower_center_ask_raw: u64,
+    pub upper_center_ask_raw: u64,
+    pub upper_wing_ask_raw: u64,
+    pub center_weight_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RangeConvictionInput {
     pub budget_raw: u64,
     pub lower_raw: u64,
@@ -1119,6 +1137,95 @@ pub fn compile_downside_step_ladder(
     Ok(result)
 }
 
+pub fn compile_center_band_condor(
+    input: CenterBandCondorInput,
+) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
+    if !(input.k1_raw < input.k2_raw
+        && input.k2_raw < input.center_raw
+        && input.center_raw < input.k3_raw
+        && input.k3_raw < input.k4_raw)
+    {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "center band condor requires k1 < k2 < center < k3 < k4".to_string(),
+        ));
+    }
+
+    let center_weight_bps = input.center_weight_bps.min(10_000);
+    let wing_weight_bps = 10_000u16.saturating_sub(center_weight_bps);
+    let each_center_bps = center_weight_bps / 2;
+    let each_wing_bps = wing_weight_bps / 2;
+
+    let lower_wing_mid = midpoint(input.k1_raw, input.k2_raw)?;
+    let lower_center_mid = midpoint(input.k2_raw, input.center_raw)?;
+    let upper_center_mid = midpoint(input.center_raw, input.k3_raw)?;
+    let upper_wing_mid = midpoint(input.k3_raw, input.k4_raw)?;
+
+    let lower_wing = AdvancedLegInput {
+        kind: AdvancedLegKind::Range,
+        role: "lower_outside_wing",
+        strike_raw: None,
+        lower_raw: Some(input.k1_raw),
+        upper_raw: Some(input.k2_raw),
+        midpoint_raw: lower_wing_mid,
+        ask_price_raw: input.lower_wing_ask_raw,
+        base_weight_e6: scale_weight_bps(1_000_000, each_wing_bps)?,
+        max_quantity: None,
+    };
+
+    let lower_center = AdvancedLegInput {
+        kind: AdvancedLegKind::Range,
+        role: "lower_center_band",
+        strike_raw: None,
+        lower_raw: Some(input.k2_raw),
+        upper_raw: Some(input.center_raw),
+        midpoint_raw: lower_center_mid,
+        ask_price_raw: input.lower_center_ask_raw,
+        base_weight_e6: scale_weight_bps(1_000_000, each_center_bps)?,
+        max_quantity: None,
+    };
+
+    let upper_center = AdvancedLegInput {
+        kind: AdvancedLegKind::Range,
+        role: "upper_center_band",
+        strike_raw: None,
+        lower_raw: Some(input.center_raw),
+        upper_raw: Some(input.k3_raw),
+        midpoint_raw: upper_center_mid,
+        ask_price_raw: input.upper_center_ask_raw,
+        base_weight_e6: scale_weight_bps(1_000_000, each_center_bps)?,
+        max_quantity: None,
+    };
+
+    let upper_wing = AdvancedLegInput {
+        kind: AdvancedLegKind::Range,
+        role: "upper_outside_wing",
+        strike_raw: None,
+        lower_raw: Some(input.k3_raw),
+        upper_raw: Some(input.k4_raw),
+        midpoint_raw: upper_wing_mid,
+        ask_price_raw: input.upper_wing_ask_raw,
+        base_weight_e6: scale_weight_bps(1_000_000, each_wing_bps)?,
+        max_quantity: None,
+    };
+
+    let mut result = allocate_weighted_budget(
+        AdvancedStrategyKind::CenterBandCondor,
+        input.budget_raw,
+        vec![lower_wing, lower_center, upper_center, upper_wing],
+    )?;
+
+    result.warnings.push(
+        "Center Band Condor is terminal-settlement only. It does not pay for staying inside the corridor before expiry."
+            .to_string(),
+    );
+    result.warnings.push(
+        "This structure concentrates payout near the center band and keeps smaller outside-wing exposure."
+            .to_string(),
+    );
+
+    Ok(result)
+}
+
 fn expiry_move_leg(
     kind: AdvancedLegKind,
     role: &'static str,
@@ -1562,5 +1669,31 @@ mod tests {
         assert!(result.legs.iter().any(|leg| leg.role == "near_downside_step"));
         assert!(result.legs.iter().any(|leg| leg.role == "lower_downside_step"));
         assert!(result.legs.iter().any(|leg| leg.role == "downside_continuation_tail"));
+    }
+
+    #[test]
+    fn center_band_condor_allocates_four_range_legs() {
+        let input = CenterBandCondorInput {
+            budget_raw: 100_000_000,
+            k1_raw: 95_000_000_000_000,
+            k2_raw: 98_000_000_000_000,
+            center_raw: 100_000_000_000_000,
+            k3_raw: 102_000_000_000_000,
+            k4_raw: 105_000_000_000_000,
+            lower_wing_ask_raw: 90_000_000,
+            lower_center_ask_raw: 180_000_000,
+            upper_center_ask_raw: 170_000_000,
+            upper_wing_ask_raw: 95_000_000,
+            center_weight_bps: 8_000,
+        };
+
+        let result = compile_center_band_condor(input).unwrap();
+
+        assert_eq!(result.strategy, AdvancedStrategyKind::CenterBandCondor);
+        assert_eq!(result.legs.len(), 4);
+        assert!(result.used_budget_raw <= input.budget_raw);
+        assert!(result.legs.iter().any(|leg| leg.role == "lower_center_band"));
+        assert!(result.legs.iter().any(|leg| leg.role == "upper_center_band"));
+        assert!(result.legs.iter().all(|leg| leg.kind == AdvancedLegKind::Range));
     }
 }

@@ -16,18 +16,19 @@ use deepbook_client::{
 use structx_core::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
     build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
-    compile_breakout, compile_bucket_payoff, compile_convex_tail_ladder,
-    compile_downside_convexity, compile_downside_step_ladder, compile_expiry_move_note,
-    compile_moonshot_upside, compile_portfolio_crash_shield, compile_range_conviction,
-    compile_upside_step_ladder, guard_quote_preview, optimize_breakout_quantities,
-    score_smart_candidate, select_best_market, select_candidate_markets, AdvancedCompileResult,
-    AdvancedCompiledLeg, AdvancedLegKind, AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle,
-    CompiledPayoff, ConvexTailLadderInput, DisplayPrice, DownsideConvexityInput,
-    DownsideStepLadderInput, ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs,
-    MoonshotUpsideInput, PayoffBucket, PortfolioCrashShieldInput, PredictLeg, PriceScale,
-    QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview,
-    QuotePreviewLeg, QuoteTxKind, RangeConvictionInput, SelectedMarket, SmartBudgetStyle,
-    SmartCandidateMetrics, SmartCandidateScore, Strike, UpsideStepLadderInput,
+    compile_breakout, compile_bucket_payoff, compile_center_band_condor,
+    compile_convex_tail_ladder, compile_downside_convexity, compile_downside_step_ladder,
+    compile_expiry_move_note, compile_moonshot_upside, compile_portfolio_crash_shield,
+    compile_range_conviction, compile_upside_step_ladder, guard_quote_preview,
+    optimize_breakout_quantities, score_smart_candidate, select_best_market,
+    select_candidate_markets, AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegKind,
+    AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle, CenterBandCondorInput, CompiledPayoff,
+    ConvexTailLadderInput, DisplayPrice, DownsideConvexityInput, DownsideStepLadderInput,
+    ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs, MoonshotUpsideInput, PayoffBucket,
+    PortfolioCrashShieldInput, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall,
+    QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind,
+    RangeConvictionInput, SelectedMarket, SmartBudgetStyle, SmartCandidateMetrics,
+    SmartCandidateScore, Strike, UpsideStepLadderInput,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -297,6 +298,9 @@ enum Command {
 
         #[arg(long, default_value_t = 15_000)]
         downside_step_tail_gamma_bps: u16,
+
+        #[arg(long, default_value_t = 8_000)]
+        condor_center_weight_bps: u16,
     },
     DemoStatus {
         #[arg(long)]
@@ -595,6 +599,7 @@ async fn main() -> std::process::ExitCode {
             downside_near_range_weight_bps,
             downside_lower_range_weight_bps,
             downside_step_tail_gamma_bps,
+            condor_center_weight_bps,
             downside_range_weight_bps,
             downside_tail_gamma_bps,
         } => {
@@ -625,6 +630,7 @@ async fn main() -> std::process::ExitCode {
                 downside_near_range_weight_bps,
                 downside_lower_range_weight_bps,
                 downside_step_tail_gamma_bps,
+                condor_center_weight_bps,
             })
             .await
         }
@@ -944,6 +950,7 @@ pub struct CompileStrategyJsonArgs {
     pub downside_near_range_weight_bps: u16,
     pub downside_lower_range_weight_bps: u16,
     pub downside_step_tail_gamma_bps: u16,
+    pub condor_center_weight_bps: u16,
 }
 #[derive(Debug, Clone)]
 struct SmartCompiledCandidate {
@@ -1984,6 +1991,7 @@ async fn compile_strategy_json_command(
             | AdvancedStrategyKind::DownsideConvexity
             | AdvancedStrategyKind::UpsideStepLadder
             | AdvancedStrategyKind::DownsideStepLadder
+            | AdvancedStrategyKind::CenterBandCondor
             | AdvancedStrategyKind::RangeConviction
             | AdvancedStrategyKind::SmartBudgetSelector),
         ) => Some(strategy),
@@ -2461,6 +2469,7 @@ async fn compile_smart_budget_selector_from_market(
         "DOWNSIDE_CONVEXITY",
         "UPSIDE_STEP_LADDER",
         "DOWNSIDE_STEP_LADDER",
+        "CENTER_BAND_CONDOR",
     ];
 
     let mut candidates = Vec::<SmartCompiledCandidate>::new();
@@ -2570,6 +2579,20 @@ async fn compile_smart_budget_selector_from_market(
                 compile_advanced_strategy_json_from_market(
                     args,
                     AdvancedStrategyKind::DownsideStepLadder,
+                    selected,
+                    predict,
+                    oracle,
+                    clock,
+                    rpc,
+                    asset,
+                    vec![],
+                )
+                .await
+            }
+            "CENTER_BAND_CONDOR" => {
+                compile_advanced_strategy_json_from_market(
+                    args,
+                    AdvancedStrategyKind::CenterBandCondor,
                     selected,
                     predict,
                     oracle,
@@ -2828,6 +2851,21 @@ fn payoff_weights_bps(strategy: &str, len: usize) -> Vec<u16> {
                 weights
             }
         },
+        "CENTER_BAND_CONDOR" => match len {
+            0 => vec![],
+            1 => vec![10_000],
+            2 => vec![5_000, 5_000],
+            3 => vec![2_000, 6_000, 2_000],
+            4 => vec![1_000, 4_000, 4_000, 1_000],
+            _ => {
+                let mut weights = vec![0u16; len];
+                weights[0] = 1_000;
+                weights[1] = 4_000;
+                weights[2] = 4_000;
+                weights[3] = 1_000;
+                weights
+            }
+        },
         _ => match len {
             0 => vec![],
             1 => vec![10_000],
@@ -2860,6 +2898,7 @@ fn estimate_hit_probability_bps(output: &serde_json::Value, strategy: &str) -> u
         "MOONSHOT_UPSIDE" => 2_000,
         "UPSIDE_STEP_LADDER" => 3_200,
         "DOWNSIDE_STEP_LADDER" => 3_200,
+        "CENTER_BAND_CONDOR" => 5_500,
         "BREAKOUT_PROTECTION" => 4_000,
         _ => (leg_count as u16).saturating_mul(800).min(6_000),
     }
@@ -2878,6 +2917,7 @@ fn estimate_worst_case_improvement(
         "MOONSHOT_UPSIDE" => 6_000u64,
         "UPSIDE_STEP_LADDER" => 6_500u64,
         "DOWNSIDE_STEP_LADDER" => 6_500u64,
+        "CENTER_BAND_CONDOR" => 2_000u64,
         "BREAKOUT_PROTECTION" => 7_000u64,
         _ => 5_000u64,
     };
@@ -3237,6 +3277,71 @@ async fn compile_advanced_strategy_json_from_market(
             })?
         }
 
+        AdvancedStrategyKind::CenterBandCondor => {
+            let ask_lower_wing = quote_single_range_ask_raw(
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k1.raw,
+                k2.raw,
+                probe_quantity,
+            )
+            .await?;
+            let ask_lower_center_range = quote_single_range_ask_raw(
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k2.raw,
+                center.raw,
+                probe_quantity,
+            )
+            .await?;
+            let ask_upper_center_range = quote_single_range_ask_raw(
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                center.raw,
+                k3.raw,
+                probe_quantity,
+            )
+            .await?;
+            let ask_upper_wing = quote_single_range_ask_raw(
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k3.raw,
+                k4.raw,
+                probe_quantity,
+            )
+            .await?;
+
+            compile_center_band_condor(CenterBandCondorInput {
+                budget_raw,
+                k1_raw: k1.raw,
+                k2_raw: k2.raw,
+                center_raw: center.raw,
+                k3_raw: k3.raw,
+                k4_raw: k4.raw,
+                lower_wing_ask_raw: ask_lower_wing,
+                lower_center_ask_raw: ask_lower_center_range,
+                upper_center_ask_raw: ask_upper_center_range,
+                upper_wing_ask_raw: ask_upper_wing,
+                center_weight_bps: args.condor_center_weight_bps,
+            })?
+        }
+
         AdvancedStrategyKind::RangeConviction => {
             let probe_compiled =
                 compile_bucket_payoff(&[PayoffBucket::new(Some(k2), Some(k3), probe_quantity)])?;
@@ -3438,7 +3543,8 @@ async fn compile_advanced_strategy_json_from_market(
             "upsideTailGammaBps": args.upside_tail_gamma_bps,
             "downsideNearRangeWeightBps": args.downside_near_range_weight_bps,
             "downsideLowerRangeWeightBps": args.downside_lower_range_weight_bps,
-            "downsideStepTailGammaBps": args.downside_step_tail_gamma_bps
+            "downsideStepTailGammaBps": args.downside_step_tail_gamma_bps,
+            "condorCenterWeightBps": args.condor_center_weight_bps
         },
         "legs": legs_json,
         "payoffTable": payoff_table,

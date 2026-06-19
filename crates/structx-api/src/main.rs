@@ -194,6 +194,9 @@ struct CompileStrategyRequest {
 
     #[serde(rename = "downsideStepTailGammaBps")]
     downside_step_tail_gamma_bps: Option<u16>,
+
+    #[serde(rename = "condorCenterWeightBps")]
+    condor_center_weight_bps: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -588,6 +591,11 @@ async fn compile_strategy(
 
     if let Some(value) = req.downside_step_tail_gamma_bps {
         args.push("--downside-step-tail-gamma-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.condor_center_weight_bps {
+        args.push("--condor-center-weight-bps".to_string());
         args.push(value.to_string());
     }
 
@@ -1678,6 +1686,7 @@ fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
             | "MOONSHOT_UPSIDE"
             | "DOWNSIDE_CONVEXITY"
             | "DOWNSIDE_STEP_LADDER"
+            | "CENTER_BAND_CONDOR"
             | "RANGE_CONVICTION"
             | "SMART_BUDGET_SELECTOR"
     ) {
