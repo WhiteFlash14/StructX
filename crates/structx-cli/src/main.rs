@@ -17,14 +17,14 @@ use structx_core::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
     build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
     compile_breakout, compile_bucket_payoff, compile_convex_tail_ladder, compile_expiry_move_note,
-    compile_portfolio_crash_shield, guard_quote_preview, optimize_breakout_quantities,
-    score_smart_candidate, select_best_market, select_candidate_markets, AdvancedCompileResult,
-    AdvancedCompiledLeg, AdvancedLegKind, AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle,
-    CompiledPayoff, ConvexTailLadderInput, DisplayPrice, ExpiryMoveNoteInput, ManagerPositionRead,
-    MintObjectRefs, PayoffBucket, PortfolioCrashShieldInput, PredictLeg, PriceScale,
-    QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview,
-    QuotePreviewLeg, QuoteTxKind, SelectedMarket, SmartBudgetStyle, SmartCandidateMetrics,
-    SmartCandidateScore, Strike,
+    compile_moonshot_upside, compile_portfolio_crash_shield, guard_quote_preview,
+    optimize_breakout_quantities, score_smart_candidate, select_best_market,
+    select_candidate_markets, AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegKind,
+    AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle, CompiledPayoff, ConvexTailLadderInput,
+    DisplayPrice, ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs, MoonshotUpsideInput,
+    PayoffBucket, PortfolioCrashShieldInput, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall,
+    QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind,
+    SelectedMarket, SmartBudgetStyle, SmartCandidateMetrics, SmartCandidateScore, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -264,6 +264,12 @@ enum Command {
 
         #[arg(long, default_value_t = 200)]
         dead_zone_bps: u16,
+
+        #[arg(long, default_value_t = 6_000)]
+        moonshot_range_weight_bps: u16,
+
+        #[arg(long, default_value_t = 15_000)]
+        moonshot_tail_gamma_bps: u16,
     },
     DemoStatus {
         #[arg(long)]
@@ -554,6 +560,8 @@ async fn main() -> std::process::ExitCode {
             over_hedge_cap_bps,
             convex_gamma_bps,
             dead_zone_bps,
+            moonshot_range_weight_bps,
+            moonshot_tail_gamma_bps,
         } => {
             compile_strategy_json_command(CompileStrategyJsonArgs {
                 server_url: cli.server_url,
@@ -572,6 +580,9 @@ async fn main() -> std::process::ExitCode {
                 over_hedge_cap_bps,
                 convex_gamma_bps,
                 dead_zone_bps,
+
+                moonshot_range_weight_bps,
+                moonshot_tail_gamma_bps,
             })
             .await
         }
@@ -881,6 +892,9 @@ struct CompileStrategyJsonArgs {
     over_hedge_cap_bps: u16,
     convex_gamma_bps: u16,
     dead_zone_bps: u16,
+
+    moonshot_range_weight_bps: u16,
+    moonshot_tail_gamma_bps: u16,
 }
 
 #[derive(Debug, Clone)]
@@ -1836,6 +1850,7 @@ async fn compile_strategy_json_command(
             strategy @ (AdvancedStrategyKind::PortfolioCrashShield
             | AdvancedStrategyKind::ConvexTailLadder
             | AdvancedStrategyKind::ExpiryMoveNote
+            | AdvancedStrategyKind::MoonshotUpside
             | AdvancedStrategyKind::SmartBudgetSelector),
         ) => Some(strategy),
         _ => None,
@@ -2366,6 +2381,21 @@ async fn compile_smart_budget_selector_from_market(
                 )
                 .await
             }
+
+            "MOONSHOT_UPSIDE" => {
+                compile_advanced_strategy_json_from_market(
+                    args,
+                    AdvancedStrategyKind::MoonshotUpside,
+                    selected,
+                    predict,
+                    oracle,
+                    clock,
+                    rpc,
+                    asset,
+                    vec![],
+                )
+                .await
+            }
             _ => unreachable!(),
         };
 
@@ -2576,6 +2606,18 @@ fn payoff_weights_bps(strategy: &str, len: usize) -> Vec<u16> {
                 weights
             }
         },
+
+        "MOONSHOT_UPSIDE" => match len {
+            0 => vec![],
+            1 => vec![10_000],
+            2 => vec![4_000, 6_000],
+            _ => {
+                let mut weights = vec![0u16; len];
+                weights[len - 2] = 4_000;
+                weights[len - 1] = 6_000;
+                weights
+            }
+        },
         _ => match len {
             0 => vec![],
             1 => vec![10_000],
@@ -2605,6 +2647,7 @@ fn estimate_hit_probability_bps(output: &serde_json::Value, strategy: &str) -> u
         "PORTFOLIO_CRASH_SHIELD" => 2_500,
         "CONVEX_TAIL_LADDER" => 3_500,
         "EXPIRY_MOVE_NOTE" => 4_500,
+        "MOONSHOT_UPSIDE" => 2_000,
         "BREAKOUT_PROTECTION" => 4_000,
         _ => (leg_count as u16).saturating_mul(800).min(6_000),
     }
@@ -2620,6 +2663,7 @@ fn estimate_worst_case_improvement(
         "PORTFOLIO_CRASH_SHIELD" => 9_000u64,
         "CONVEX_TAIL_LADDER" => 7_000u64,
         "EXPIRY_MOVE_NOTE" => 5_000u64,
+        "MOONSHOT_UPSIDE" => 6_000u64,
         "BREAKOUT_PROTECTION" => 7_000u64,
         _ => 5_000u64,
     };
@@ -2836,6 +2880,49 @@ async fn compile_advanced_strategy_json_from_market(
             })?
         }
 
+        AdvancedStrategyKind::MoonshotUpside => {
+            let probe_compiled = compile_bucket_payoff(&[
+                PayoffBucket::new(Some(k3), Some(k4), probe_quantity),
+                PayoffBucket::new(Some(k4), None, probe_quantity),
+            ])?;
+
+            let probe_plan = build_quote_plan(selected, &probe_compiled)?;
+
+            let probe_tx_kind = build_quote_tx_kind(
+                &probe_plan,
+                QuoteObjectRefs { predict, oracle, clock },
+                &args.owner,
+            )?;
+
+            let probe_response = rpc
+                .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
+                .await?;
+
+            let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
+
+            if probe_costs.len() != 2 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected 2 moonshot probe quote legs, got {}", probe_costs.len()),
+                )
+                .into());
+            }
+
+            let ask_upper_range = infer_ask_price_raw(probe_costs[0].0, probe_quantity);
+            let ask_up_tail = infer_ask_price_raw(probe_costs[1].0, probe_quantity);
+
+            compile_moonshot_upside(MoonshotUpsideInput {
+                spot_raw: selected.spot_raw,
+                budget_raw,
+                k3_raw: k3.raw,
+                k4_raw: k4.raw,
+                upper_range_ask_raw: ask_upper_range,
+                up_tail_ask_raw: ask_up_tail,
+                range_weight_bps: args.moonshot_range_weight_bps,
+                tail_gamma_bps: args.moonshot_tail_gamma_bps,
+            })?
+        }
+
         AdvancedStrategyKind::SmartBudgetSelector => {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -2945,7 +3032,9 @@ async fn compile_advanced_strategy_json_from_market(
             "portfolioExposureDUSDC": args.portfolio_exposure_dusdc,
             "overHedgeCapBps": args.over_hedge_cap_bps,
             "deadZoneBps": args.dead_zone_bps,
-            "convexGammaBps": args.convex_gamma_bps
+            "convexGammaBps": args.convex_gamma_bps,
+            "moonshotRangeWeightBps": args.moonshot_range_weight_bps,
+            "moonshotTailGammaBps": args.moonshot_tail_gamma_bps
         },
         "legs": legs_json,
         "payoffTable": payoff_table,

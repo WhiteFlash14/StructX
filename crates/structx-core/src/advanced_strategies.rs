@@ -8,6 +8,7 @@ pub enum AdvancedStrategyKind {
     PortfolioCrashShield,
     ConvexTailLadder,
     ExpiryMoveNote,
+    MoonshotUpside,
     SmartBudgetSelector,
 }
 
@@ -17,6 +18,7 @@ impl AdvancedStrategyKind {
             "PORTFOLIO_CRASH_SHIELD" | "portfolio_crash_shield" => Ok(Self::PortfolioCrashShield),
             "CONVEX_TAIL_LADDER" | "convex_tail_ladder" => Ok(Self::ConvexTailLadder),
             "EXPIRY_MOVE_NOTE" | "expiry_move_note" => Ok(Self::ExpiryMoveNote),
+            "MOONSHOT_UPSIDE" | "moonshot_upside" => Ok(Self::MoonshotUpside),
             "SMART_BUDGET_SELECTOR" | "smart_budget_selector" => Ok(Self::SmartBudgetSelector),
             other => Err(AdvancedStrategyError::UnknownStrategy(other.to_string())),
         }
@@ -27,6 +29,7 @@ impl AdvancedStrategyKind {
             Self::PortfolioCrashShield => "PORTFOLIO_CRASH_SHIELD",
             Self::ConvexTailLadder => "CONVEX_TAIL_LADDER",
             Self::ExpiryMoveNote => "EXPIRY_MOVE_NOTE",
+            Self::MoonshotUpside => "MOONSHOT_UPSIDE",
             Self::SmartBudgetSelector => "SMART_BUDGET_SELECTOR",
         }
     }
@@ -532,6 +535,18 @@ pub struct ExpiryMoveNoteInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MoonshotUpsideInput {
+    pub spot_raw: u64,
+    pub budget_raw: u64,
+    pub k3_raw: u64,
+    pub k4_raw: u64,
+    pub upper_range_ask_raw: u64,
+    pub up_tail_ask_raw: u64,
+    pub range_weight_bps: u16,
+    pub tail_gamma_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConvexTailLadderInput {
     pub spot_raw: u64,
     pub budget_raw: u64,
@@ -695,6 +710,73 @@ pub fn compile_expiry_move_note(
     Ok(result)
 }
 
+pub fn compile_moonshot_upside(
+    input: MoonshotUpsideInput,
+) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
+    if input.spot_raw == 0 {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "spot_raw must be greater than zero".to_string(),
+        ));
+    }
+
+    if input.k3_raw >= input.k4_raw {
+        return Err(AdvancedStrategyError::InvalidInput("moonshot requires k3 < k4".to_string()));
+    }
+
+    let range_weight_bps = input.range_weight_bps.min(10_000);
+    let tail_weight_bps = 10_000u16.saturating_sub(range_weight_bps);
+    let upper_range_mid = midpoint(input.k3_raw, input.k4_raw)?;
+
+    let up_tail_mid = input.k4_raw.saturating_mul(101).checked_div(100).unwrap_or(input.k4_raw);
+
+    let mut upper_range = tail_ladder_leg(
+        AdvancedLegKind::Range,
+        "upside_breakout_zone",
+        None,
+        Some(input.k3_raw),
+        Some(input.k4_raw),
+        upper_range_mid,
+        input.upper_range_ask_raw,
+        input.spot_raw,
+        0,
+        10_000,
+    )?;
+
+    upper_range.base_weight_e6 = scale_weight_bps(upper_range.base_weight_e6, range_weight_bps)?;
+
+    let mut up_tail = tail_ladder_leg(
+        AdvancedLegKind::Up,
+        "moonshot_tail",
+        Some(input.k4_raw),
+        None,
+        None,
+        up_tail_mid,
+        input.up_tail_ask_raw,
+        input.spot_raw,
+        0,
+        input.tail_gamma_bps,
+    )?;
+
+    up_tail.base_weight_e6 = scale_weight_bps(up_tail.base_weight_e6, tail_weight_bps)?;
+
+    let mut result = allocate_weighted_budget(
+        AdvancedStrategyKind::MoonshotUpside,
+        input.budget_raw,
+        vec![upper_range, up_tail],
+    )?;
+
+    result.warnings.push(
+        "Moonshot Upside is upside-only. It can expire worthless if BTC settles below the upper range."
+            .to_string(),
+    );
+
+    result
+        .warnings
+        .push("Moonshot Upside is terminal-expiry exposure, not a touch option.".to_string());
+
+    Ok(result)
+}
+
 fn expiry_move_leg(
     kind: AdvancedLegKind,
     role: &'static str,
@@ -723,6 +805,13 @@ fn expiry_move_leg(
         base_weight_e6: weight_e6,
         max_quantity: None,
     })
+}
+
+fn scale_weight_bps(weight: u64, bps: u16) -> Result<u64, AdvancedStrategyError> {
+    let scaled =
+        (weight as u128).checked_mul(bps as u128).ok_or(AdvancedStrategyError::Overflow)? / 10_000;
+
+    u64_checked(scaled)
 }
 
 fn crash_bucket_leg(
@@ -1014,5 +1103,27 @@ mod tests {
         let range_score = score_smart_candidate(range, SmartBudgetStyle::TailHeavy).unwrap();
 
         assert!(tail_score.score_e6 > range_score.score_e6);
+    }
+
+    #[test]
+    fn moonshot_upside_allocates_range_and_tail() {
+        let input = MoonshotUpsideInput {
+            spot_raw: 100_000_000_000_000,
+            budget_raw: 100_000_000,
+            k3_raw: 102_000_000_000_000,
+            k4_raw: 105_000_000_000_000,
+            upper_range_ask_raw: 120_000_000,
+            up_tail_ask_raw: 70_000_000,
+            range_weight_bps: 6_000,
+            tail_gamma_bps: 15_000,
+        };
+
+        let result = compile_moonshot_upside(input).unwrap();
+
+        assert_eq!(result.strategy, AdvancedStrategyKind::MoonshotUpside);
+        assert_eq!(result.legs.len(), 2);
+        assert!(result.used_budget_raw <= input.budget_raw);
+        assert!(result.legs.iter().any(|leg| leg.role == "upside_breakout_zone"));
+        assert!(result.legs.iter().any(|leg| leg.role == "moonshot_tail"));
     }
 }

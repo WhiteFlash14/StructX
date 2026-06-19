@@ -173,6 +173,12 @@ struct CompileStrategyRequest {
 
     #[serde(rename = "convexGammaBps")]
     convex_gamma_bps: Option<u16>,
+
+    #[serde(rename = "moonshotRangeWeightBps")]
+    moonshot_range_weight_bps: Option<u16>,
+
+    #[serde(rename = "moonshotTailGammaBps")]
+    moonshot_tail_gamma_bps: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -532,6 +538,16 @@ async fn compile_strategy(
 
     if let Some(value) = req.convex_gamma_bps {
         args.push("--convex-gamma-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.moonshot_range_weight_bps {
+        args.push("--moonshot-range-weight-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.moonshot_tail_gamma_bps {
+        args.push("--moonshot-tail-gamma-bps".to_string());
         args.push(value.to_string());
     }
 
@@ -1619,6 +1635,7 @@ fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
             | "PORTFOLIO_CRASH_SHIELD"
             | "CONVEX_TAIL_LADDER"
             | "EXPIRY_MOVE_NOTE"
+            | "MOONSHOT_UPSIDE"
             | "SMART_BUDGET_SELECTOR"
     ) {
         parsed.recommended_strategy = "BREAKOUT_PROTECTION".to_string();
