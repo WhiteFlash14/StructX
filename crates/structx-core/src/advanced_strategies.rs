@@ -8,6 +8,7 @@ pub enum AdvancedStrategyKind {
     PortfolioCrashShield,
     ConvexTailLadder,
     ExpiryMoveNote,
+    SmartBudgetSelector,
 }
 
 impl AdvancedStrategyKind {
@@ -16,6 +17,7 @@ impl AdvancedStrategyKind {
             "PORTFOLIO_CRASH_SHIELD" | "portfolio_crash_shield" => Ok(Self::PortfolioCrashShield),
             "CONVEX_TAIL_LADDER" | "convex_tail_ladder" => Ok(Self::ConvexTailLadder),
             "EXPIRY_MOVE_NOTE" | "expiry_move_note" => Ok(Self::ExpiryMoveNote),
+            "SMART_BUDGET_SELECTOR" | "smart_budget_selector" => Ok(Self::SmartBudgetSelector),
             other => Err(AdvancedStrategyError::UnknownStrategy(other.to_string())),
         }
     }
@@ -25,6 +27,7 @@ impl AdvancedStrategyKind {
             Self::PortfolioCrashShield => "PORTFOLIO_CRASH_SHIELD",
             Self::ConvexTailLadder => "CONVEX_TAIL_LADDER",
             Self::ExpiryMoveNote => "EXPIRY_MOVE_NOTE",
+            Self::SmartBudgetSelector => "SMART_BUDGET_SELECTOR",
         }
     }
 }
@@ -96,6 +99,146 @@ pub enum AdvancedStrategyError {
 
     #[error("invalid input: {0}")]
     InvalidInput(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SmartBudgetStyle {
+    TailHeavy,
+    Balanced,
+    HigherHitRate,
+}
+
+impl SmartBudgetStyle {
+    pub fn from_api_value(value: &str) -> Self {
+        match value {
+            "tail-heavy" | "TAIL_HEAVY" => Self::TailHeavy,
+            "higher-hit-rate" | "HIGHER_HIT_RATE" => Self::HigherHitRate,
+            _ => Self::Balanced,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmartCandidateMetrics {
+    pub premium_raw: u64,
+    pub max_payout_raw: u64,
+    pub expected_payout_raw: u64,
+    pub hit_probability_bps: u16,
+    pub worst_case_improvement_raw: u64,
+    pub complexity_penalty_bps: u16,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SmartCandidateScore {
+    pub score_e6: i128,
+    pub max_payout_score_e6: i128,
+    pub expected_payout_score_e6: i128,
+    pub hit_probability_score_e6: i128,
+    pub worst_case_score_e6: i128,
+    pub complexity_penalty_e6: i128,
+}
+
+pub fn score_smart_candidate(
+    metrics: SmartCandidateMetrics,
+    style: SmartBudgetStyle,
+) -> Result<SmartCandidateScore, AdvancedStrategyError> {
+    if metrics.premium_raw == 0 {
+        return Err(AdvancedStrategyError::InvalidInput(
+            "candidate premium must be greater than zero".to_string(),
+        ));
+    }
+
+    let params = smart_score_params(style);
+    let premium = metrics.premium_raw as i128;
+
+    let max_payout_score = ratio_score_e6(metrics.max_payout_raw, premium, params.alpha_bps)?;
+    let expected_score = ratio_score_e6(metrics.expected_payout_raw, premium, params.beta_bps)?;
+    let hit_score = (metrics.hit_probability_bps as i128)
+        .checked_mul(params.eta_bps as i128)
+        .ok_or(AdvancedStrategyError::Overflow)?
+        .checked_div(100)
+        .ok_or(AdvancedStrategyError::Overflow)?;
+
+    let worst_case_score =
+        ratio_score_e6(metrics.worst_case_improvement_raw, premium, params.rho_bps)?;
+
+    let complexity_penalty = (metrics.complexity_penalty_bps as i128)
+        .checked_mul(params.delta_bps as i128)
+        .ok_or(AdvancedStrategyError::Overflow)?
+        .checked_div(100)
+        .ok_or(AdvancedStrategyError::Overflow)?;
+
+    let total = max_payout_score
+        .checked_add(expected_score)
+        .ok_or(AdvancedStrategyError::Overflow)?
+        .checked_add(hit_score)
+        .ok_or(AdvancedStrategyError::Overflow)?
+        .checked_add(worst_case_score)
+        .ok_or(AdvancedStrategyError::Overflow)?
+        .checked_sub(complexity_penalty)
+        .ok_or(AdvancedStrategyError::Overflow)?;
+
+    Ok(SmartCandidateScore {
+        score_e6: total,
+        max_payout_score_e6: max_payout_score,
+        expected_payout_score_e6: expected_score,
+        hit_probability_score_e6: hit_score,
+        worst_case_score_e6: worst_case_score,
+        complexity_penalty_e6: complexity_penalty,
+    })
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SmartScoreParams {
+    alpha_bps: u16,
+    beta_bps: u16,
+    eta_bps: u16,
+    rho_bps: u16,
+    delta_bps: u16,
+}
+
+fn smart_score_params(style: SmartBudgetStyle) -> SmartScoreParams {
+    match style {
+        SmartBudgetStyle::TailHeavy => SmartScoreParams {
+            alpha_bps: 4_500,
+            beta_bps: 1_500,
+            eta_bps: 500,
+            rho_bps: 3_500,
+            delta_bps: 500,
+        },
+        SmartBudgetStyle::Balanced => SmartScoreParams {
+            alpha_bps: 2_500,
+            beta_bps: 3_000,
+            eta_bps: 2_000,
+            rho_bps: 2_500,
+            delta_bps: 500,
+        },
+        SmartBudgetStyle::HigherHitRate => SmartScoreParams {
+            alpha_bps: 1_000,
+            beta_bps: 2_500,
+            eta_bps: 5_000,
+            rho_bps: 1_500,
+            delta_bps: 500,
+        },
+    }
+}
+
+fn ratio_score_e6(
+    numerator_raw: u64,
+    premium_raw: i128,
+    weight_bps: u16,
+) -> Result<i128, AdvancedStrategyError> {
+    let numerator = numerator_raw as i128;
+
+    numerator
+        .checked_mul(1_000_000)
+        .ok_or(AdvancedStrategyError::Overflow)?
+        .checked_div(premium_raw)
+        .ok_or(AdvancedStrategyError::Overflow)?
+        .checked_mul(weight_bps as i128)
+        .ok_or(AdvancedStrategyError::Overflow)?
+        .checked_div(10_000)
+        .ok_or(AdvancedStrategyError::Overflow)
 }
 
 pub fn allocate_weighted_budget(
@@ -818,5 +961,58 @@ mod tests {
             result.legs.iter().find(|leg| leg.role == "moderate_downside_move").unwrap();
 
         assert!(down_tail.weight_e6 > lower_range.weight_e6);
+    }
+
+    #[test]
+    fn smart_candidate_score_prefers_hit_rate_when_requested() {
+        let crash = SmartCandidateMetrics {
+            premium_raw: 100,
+            max_payout_raw: 1_000,
+            expected_payout_raw: 110,
+            hit_probability_bps: 2_000,
+            worst_case_improvement_raw: 900,
+            complexity_penalty_bps: 100,
+        };
+
+        let expiry_move = SmartCandidateMetrics {
+            premium_raw: 100,
+            max_payout_raw: 550,
+            expected_payout_raw: 150,
+            hit_probability_bps: 4_500,
+            worst_case_improvement_raw: 500,
+            complexity_penalty_bps: 100,
+        };
+
+        let crash_score = score_smart_candidate(crash, SmartBudgetStyle::HigherHitRate).unwrap();
+        let expiry_score =
+            score_smart_candidate(expiry_move, SmartBudgetStyle::HigherHitRate).unwrap();
+
+        assert!(expiry_score.hit_probability_score_e6 > crash_score.hit_probability_score_e6);
+    }
+
+    #[test]
+    fn smart_candidate_score_tail_heavy_values_max_payout() {
+        let tail = SmartCandidateMetrics {
+            premium_raw: 100,
+            max_payout_raw: 1_200,
+            expected_payout_raw: 80,
+            hit_probability_bps: 1_500,
+            worst_case_improvement_raw: 900,
+            complexity_penalty_bps: 100,
+        };
+
+        let range = SmartCandidateMetrics {
+            premium_raw: 100,
+            max_payout_raw: 300,
+            expected_payout_raw: 160,
+            hit_probability_bps: 5_000,
+            worst_case_improvement_raw: 100,
+            complexity_penalty_bps: 100,
+        };
+
+        let tail_score = score_smart_candidate(tail, SmartBudgetStyle::TailHeavy).unwrap();
+        let range_score = score_smart_candidate(range, SmartBudgetStyle::TailHeavy).unwrap();
+
+        assert!(tail_score.score_e6 > range_score.score_e6);
     }
 }

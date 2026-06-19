@@ -1619,6 +1619,7 @@ fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
             | "PORTFOLIO_CRASH_SHIELD"
             | "CONVEX_TAIL_LADDER"
             | "EXPIRY_MOVE_NOTE"
+            | "SMART_BUDGET_SELECTOR"
     ) {
         parsed.recommended_strategy = "BREAKOUT_PROTECTION".to_string();
     }

@@ -18,12 +18,13 @@ use structx_core::{
     build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
     compile_breakout, compile_bucket_payoff, compile_convex_tail_ladder, compile_expiry_move_note,
     compile_portfolio_crash_shield, guard_quote_preview, optimize_breakout_quantities,
-    select_best_market, select_candidate_markets, AdvancedCompileResult, AdvancedCompiledLeg,
-    AdvancedLegKind, AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle, CompiledPayoff,
-    ConvexTailLadderInput, DisplayPrice, ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs,
-    PayoffBucket, PortfolioCrashShieldInput, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall,
-    QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind,
-    SelectedMarket, Strike,
+    score_smart_candidate, select_best_market, select_candidate_markets, AdvancedCompileResult,
+    AdvancedCompiledLeg, AdvancedLegKind, AdvancedStrategyKind, BreakoutAskInputs, BreakoutStyle,
+    CompiledPayoff, ConvexTailLadderInput, DisplayPrice, ExpiryMoveNoteInput, ManagerPositionRead,
+    MintObjectRefs, PayoffBucket, PortfolioCrashShieldInput, PredictLeg, PriceScale,
+    QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview,
+    QuotePreviewLeg, QuoteTxKind, SelectedMarket, SmartBudgetStyle, SmartCandidateMetrics,
+    SmartCandidateScore, Strike,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -880,6 +881,14 @@ struct CompileStrategyJsonArgs {
     over_hedge_cap_bps: u16,
     convex_gamma_bps: u16,
     dead_zone_bps: u16,
+}
+
+#[derive(Debug, Clone)]
+struct SmartCompiledCandidate {
+    strategy: String,
+    output: serde_json::Value,
+    metrics: SmartCandidateMetrics,
+    score: SmartCandidateScore,
 }
 
 struct DevinspectQuoteBreakoutArgs {
@@ -1826,7 +1835,8 @@ async fn compile_strategy_json_command(
         Ok(
             strategy @ (AdvancedStrategyKind::PortfolioCrashShield
             | AdvancedStrategyKind::ConvexTailLadder
-            | AdvancedStrategyKind::ExpiryMoveNote),
+            | AdvancedStrategyKind::ExpiryMoveNote
+            | AdvancedStrategyKind::SmartBudgetSelector),
         ) => Some(strategy),
         _ => None,
     };
@@ -1882,6 +1892,30 @@ async fn compile_strategy_json_command(
         if let Err(err) = validate_quote_object_refs(&predict, &oracle, &clock) {
             warnings.push(format!("skipped oracle {}: {err}", selected.oracle_id));
             continue;
+        }
+
+        if matches!(advanced_strategy, Some(AdvancedStrategyKind::SmartBudgetSelector)) {
+            match compile_smart_budget_selector_from_market(
+                &args,
+                &selected,
+                &predict,
+                &oracle,
+                &clock,
+                &rpc,
+                &asset,
+                warnings.clone(),
+            )
+            .await
+            {
+                Ok(output) => {
+                    println!("{}", serde_json::to_string_pretty(&output)?);
+                    return Ok(());
+                }
+                Err(err) => {
+                    warnings.push(format!("skipped oracle {}: {err}", selected.oracle_id));
+                    continue;
+                }
+            }
         }
 
         if let Some(strategy_kind) = advanced_strategy {
@@ -2087,6 +2121,527 @@ async fn compile_strategy_json_command(
 }
 
 #[allow(clippy::too_many_arguments)]
+async fn compile_breakout_strategy_json_from_market(
+    args: &CompileStrategyJsonArgs,
+    selected: &SelectedMarket<'_>,
+    predict: &SuiObjectInfo,
+    oracle: &SuiObjectInfo,
+    clock: &SuiObjectInfo,
+    rpc: &SuiRpcClient,
+    asset: &QuoteAssetDisplay,
+    mut warnings: Vec<String>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let budget_raw = parse_dusdc_to_raw(&args.budget_dusdc)?;
+    let style = BreakoutStyle::from_api_value(&args.style)?;
+    let probe_quantity = 1_000_000u64;
+
+    let strikes = selected.grid.centered_strikes_by_display_step(
+        selected.spot_raw,
+        args.bucket_step,
+        args.levels_each_side,
+    )?;
+
+    let center = selected
+        .grid
+        .snap_nearest(selected.spot_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
+
+    let center_idx = strikes
+        .iter()
+        .position(|strike| strike.raw == center.raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
+
+    if center_idx < 2 || center_idx + 2 >= strikes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not enough strikes around spot for breakout strategy",
+        )
+        .into());
+    }
+
+    let k1 = strikes[center_idx - 2];
+    let k2 = strikes[center_idx - 1];
+    let k3 = strikes[center_idx + 1];
+    let k4 = strikes[center_idx + 2];
+
+    let probe_compiled = compile_breakout(k1, k2, k3, k4, probe_quantity, probe_quantity)?;
+    let probe_plan = build_quote_plan(selected, &probe_compiled)?;
+
+    let probe_tx_kind =
+        build_quote_tx_kind(&probe_plan, QuoteObjectRefs { predict, oracle, clock }, &args.owner)?;
+
+    let probe_response =
+        rpc.dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64).await?;
+
+    let probe_costs = quote_costs_from_response(&probe_tx_kind, &probe_response)?;
+
+    if probe_costs.len() != 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("expected 4 breakout probe quote legs, got {}", probe_costs.len()),
+        )
+        .into());
+    }
+
+    let ask_inputs = BreakoutAskInputs {
+        down_tail_ask_raw: infer_ask_price_raw(probe_costs[0].0, probe_quantity),
+        downside_range_ask_raw: infer_ask_price_raw(probe_costs[1].0, probe_quantity),
+        upside_range_ask_raw: infer_ask_price_raw(probe_costs[2].0, probe_quantity),
+        up_tail_ask_raw: infer_ask_price_raw(probe_costs[3].0, probe_quantity),
+    };
+
+    let optimized = optimize_breakout_quantities(budget_raw, ask_inputs, style)?;
+
+    let final_compiled = compile_breakout(
+        k1,
+        k2,
+        k3,
+        k4,
+        optimized.down_tail_quantity,
+        optimized.downside_range_quantity,
+    )?;
+
+    let final_plan = build_quote_plan(selected, &final_compiled)?;
+
+    let final_tx_kind =
+        build_quote_tx_kind(&final_plan, QuoteObjectRefs { predict, oracle, clock }, &args.owner)?;
+
+    let final_response =
+        rpc.dev_inspect_transaction_kind(&final_tx_kind.sender, &final_tx_kind.tx_kind_b64).await?;
+
+    let final_costs = quote_costs_from_response(&final_tx_kind, &final_response)?;
+
+    if final_costs.len() != 4 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("final breakout quote returned {} legs", final_costs.len()),
+        )
+        .into());
+    }
+
+    let total_cost_raw = final_costs
+        .iter()
+        .try_fold(0u64, |acc, (cost, _)| acc.checked_add(*cost))
+        .ok_or_else(|| io::Error::other("total cost overflow"))?;
+
+    let max_gross_payout_raw = optimized.down_tail_quantity.max(optimized.downside_range_quantity);
+    let max_loss_raw = total_cost_raw;
+    let max_net_payout_raw = max_gross_payout_raw.saturating_sub(total_cost_raw);
+
+    warnings.push(
+        "Breakout Protection was compiled as a Smart Selector candidate and re-quoted live."
+            .to_string(),
+    );
+
+    let compiled_strategy_id = format!(
+        "breakout:{}:{}:{}:{}:{}",
+        args.owner,
+        selected.oracle_id,
+        selected.expiry.timestamp_millis(),
+        total_cost_raw,
+        style.api_value()
+    );
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "compiledStrategyId": compiled_strategy_id,
+        "strategy": "BREAKOUT_PROTECTION",
+        "network": "sui:testnet",
+        "owner": args.owner,
+        "oracleId": selected.oracle_id,
+        "expiry": selected.expiry.to_rfc3339(),
+        "spot": format_raw_price_e9(selected.spot_raw),
+        "style": style.api_value(),
+        "styleRatioBps": optimized.style_ratio_bps,
+        "budgetRaw": budget_raw.to_string(),
+        "budgetDisplay": asset.format_amount(budget_raw),
+        "premiumRequiredRaw": total_cost_raw.to_string(),
+        "premiumRequiredDisplay": asset.format_amount(total_cost_raw),
+        "maxLossRaw": max_loss_raw.to_string(),
+        "maxLossDisplay": asset.format_amount(max_loss_raw),
+        "maxGrossPayoutRaw": max_gross_payout_raw.to_string(),
+        "maxGrossPayoutDisplay": asset.format_amount(max_gross_payout_raw),
+        "maxNetPayoutRaw": max_net_payout_raw.to_string(),
+        "maxNetPayoutDisplay": asset.format_amount(max_net_payout_raw),
+        "strikes": {
+            "k1": format_raw_price_e9(k1.raw),
+            "k2": format_raw_price_e9(k2.raw),
+            "k3": format_raw_price_e9(k3.raw),
+            "k4": format_raw_price_e9(k4.raw),
+            "k1Raw": k1.raw.to_string(),
+            "k2Raw": k2.raw.to_string(),
+            "k3Raw": k3.raw.to_string(),
+            "k4Raw": k4.raw.to_string()
+        },
+        "legs": [
+            compile_json_leg_down(k1.raw, optimized.down_tail_quantity, final_costs[0].0, ask_inputs.down_tail_ask_raw, asset),
+            compile_json_leg_range("moderate_downside", k1.raw, k2.raw, optimized.downside_range_quantity, final_costs[1].0, ask_inputs.downside_range_ask_raw, asset),
+            compile_json_leg_range("moderate_upside", k3.raw, k4.raw, optimized.upside_range_quantity, final_costs[2].0, ask_inputs.upside_range_ask_raw, asset),
+            compile_json_leg_up(k4.raw, optimized.up_tail_quantity, final_costs[3].0, ask_inputs.up_tail_ask_raw, asset)
+        ],
+        "payoffTable": [
+            payoff_json("BTC settles <= K1", max_gross_payout_raw, total_cost_raw, asset),
+            payoff_json("K1 < BTC settles <= K2", optimized.downside_range_quantity, total_cost_raw, asset),
+            payoff_json("K2 < BTC settles < K3", 0, total_cost_raw, asset),
+            payoff_json("K3 <= BTC settles < K4", optimized.upside_range_quantity, total_cost_raw, asset),
+            payoff_json("BTC settles >= K4", max_gross_payout_raw, total_cost_raw, asset)
+        ],
+        "warnings": warnings
+    }))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compile_smart_budget_selector_from_market(
+    args: &CompileStrategyJsonArgs,
+    selected: &SelectedMarket<'_>,
+    predict: &SuiObjectInfo,
+    oracle: &SuiObjectInfo,
+    clock: &SuiObjectInfo,
+    rpc: &SuiRpcClient,
+    asset: &QuoteAssetDisplay,
+    warnings: Vec<String>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let style = SmartBudgetStyle::from_api_value(&args.style);
+
+    let candidate_strategies =
+        ["BREAKOUT_PROTECTION", "PORTFOLIO_CRASH_SHIELD", "CONVEX_TAIL_LADDER", "EXPIRY_MOVE_NOTE"];
+
+    let mut candidates = Vec::<SmartCompiledCandidate>::new();
+    let mut selector_warnings = warnings;
+
+    for strategy in candidate_strategies {
+        let candidate_output = match strategy {
+            "BREAKOUT_PROTECTION" => {
+                compile_breakout_strategy_json_from_market(
+                    args,
+                    selected,
+                    predict,
+                    oracle,
+                    clock,
+                    rpc,
+                    asset,
+                    vec![],
+                )
+                .await
+            }
+            "PORTFOLIO_CRASH_SHIELD" => {
+                compile_advanced_strategy_json_from_market(
+                    args,
+                    AdvancedStrategyKind::PortfolioCrashShield,
+                    selected,
+                    predict,
+                    oracle,
+                    clock,
+                    rpc,
+                    asset,
+                    vec![],
+                )
+                .await
+            }
+            "CONVEX_TAIL_LADDER" => {
+                compile_advanced_strategy_json_from_market(
+                    args,
+                    AdvancedStrategyKind::ConvexTailLadder,
+                    selected,
+                    predict,
+                    oracle,
+                    clock,
+                    rpc,
+                    asset,
+                    vec![],
+                )
+                .await
+            }
+            "EXPIRY_MOVE_NOTE" => {
+                compile_advanced_strategy_json_from_market(
+                    args,
+                    AdvancedStrategyKind::ExpiryMoveNote,
+                    selected,
+                    predict,
+                    oracle,
+                    clock,
+                    rpc,
+                    asset,
+                    vec![],
+                )
+                .await
+            }
+            _ => unreachable!(),
+        };
+
+        let output = match candidate_output {
+            Ok(output) => output,
+            Err(err) => {
+                selector_warnings.push(format!("Candidate {strategy} skipped: {err}"));
+                continue;
+            }
+        };
+
+        let metrics = smart_metrics_from_output(strategy, &output)?;
+        let score = score_smart_candidate(metrics, style)?;
+
+        candidates.push(SmartCompiledCandidate {
+            strategy: strategy.to_string(),
+            output,
+            metrics,
+            score,
+        });
+    }
+
+    if candidates.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "Smart Budget Selector produced no valid candidates",
+        )
+        .into());
+    }
+
+    candidates.sort_by(|a, b| b.score.score_e6.cmp(&a.score.score_e6));
+
+    let winner = candidates
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing smart winner"))?
+        .clone();
+
+    let winner_strategy = winner.strategy.clone();
+    let winner_score_e6 = winner.score.score_e6;
+    let candidate_count = candidates.len();
+    let mut output = winner.output;
+
+    let alternatives = candidates
+        .iter()
+        .map(|candidate| {
+            serde_json::json!({
+                "strategy": candidate.strategy,
+                "scoreE6": candidate.score.score_e6.to_string(),
+                "premiumRaw": candidate.metrics.premium_raw.to_string(),
+                "maxPayoutRaw": candidate.metrics.max_payout_raw.to_string(),
+                "expectedPayoutRaw": candidate.metrics.expected_payout_raw.to_string(),
+                "hitProbabilityBps": candidate.metrics.hit_probability_bps,
+                "worstCaseImprovementRaw": candidate.metrics.worst_case_improvement_raw.to_string(),
+                "complexityPenaltyBps": candidate.metrics.complexity_penalty_bps,
+                "scoreBreakdown": {
+                    "maxPayoutScoreE6": candidate.score.max_payout_score_e6.to_string(),
+                    "expectedPayoutScoreE6": candidate.score.expected_payout_score_e6.to_string(),
+                    "hitProbabilityScoreE6": candidate.score.hit_probability_score_e6.to_string(),
+                    "worstCaseScoreE6": candidate.score.worst_case_score_e6.to_string(),
+                    "complexityPenaltyE6": candidate.score.complexity_penalty_e6.to_string()
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+
+    if let Some(obj) = output.as_object_mut() {
+        obj.insert(
+            "strategy".to_string(),
+            serde_json::Value::String("SMART_BUDGET_SELECTOR".to_string()),
+        );
+
+        obj.insert(
+            "selectedStrategy".to_string(),
+            serde_json::Value::String(winner_strategy.clone()),
+        );
+
+        obj.insert(
+            "smartSelector".to_string(),
+            serde_json::json!({
+                "style": args.style,
+                "winner": winner_strategy.clone(),
+                "winnerScoreE6": winner_score_e6.to_string(),
+                "candidateCount": candidate_count,
+                "alternatives": alternatives
+            }),
+        );
+
+        let warnings_value = obj.entry("warnings").or_insert_with(|| serde_json::json!([]));
+
+        if let Some(warnings_array) = warnings_value.as_array_mut() {
+            warnings_array.push(serde_json::Value::String(format!(
+                "Smart Budget Selector chose {} from {} valid candidates.",
+                winner_strategy.as_str(),
+                candidate_count
+            )));
+
+            for warning in selector_warnings {
+                warnings_array.push(serde_json::Value::String(warning));
+            }
+        }
+    }
+
+    Ok(output)
+}
+
+fn smart_metrics_from_output(
+    strategy: &str,
+    output: &serde_json::Value,
+) -> Result<SmartCandidateMetrics, Box<dyn std::error::Error>> {
+    let premium_raw = json_string_u64(output, "premiumRequiredRaw")?;
+    let max_payout_raw = json_string_u64(output, "maxGrossPayoutRaw")?;
+
+    let expected_payout_raw = estimate_expected_payout_from_payoff_table(output, strategy)?;
+    let hit_probability_bps = estimate_hit_probability_bps(output, strategy);
+    let worst_case_improvement_raw = estimate_worst_case_improvement(output, strategy)?;
+    let complexity_penalty_bps = estimate_complexity_penalty_bps(output);
+
+    Ok(SmartCandidateMetrics {
+        premium_raw,
+        max_payout_raw,
+        expected_payout_raw,
+        hit_probability_bps,
+        worst_case_improvement_raw,
+        complexity_penalty_bps,
+    })
+}
+
+fn json_string_u64(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, format!("missing {key}")))?
+        .parse::<u64>()
+        .map_err(|err| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("bad {key}: {err}")).into()
+        })
+}
+
+fn estimate_expected_payout_from_payoff_table(
+    output: &serde_json::Value,
+    strategy: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let rows = output
+        .get("payoffTable")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing payoffTable"))?;
+
+    if rows.is_empty() {
+        return Ok(0);
+    }
+
+    let weights_bps = payoff_weights_bps(strategy, rows.len());
+
+    let mut total = 0u128;
+    let mut weight_total = 0u128;
+
+    for (row, weight_bps) in rows.iter().zip(weights_bps.iter()) {
+        let gross = row
+            .get("grossPayoutRaw")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0")
+            .parse::<u128>()
+            .unwrap_or(0);
+
+        total = total
+            .checked_add(gross.saturating_mul(*weight_bps as u128))
+            .ok_or_else(|| io::Error::other("expected payout overflow"))?;
+
+        weight_total = weight_total.saturating_add(*weight_bps as u128);
+    }
+
+    if weight_total == 0 {
+        return Ok(0);
+    }
+
+    Ok((total / weight_total).min(u64::MAX as u128) as u64)
+}
+
+fn payoff_weights_bps(strategy: &str, len: usize) -> Vec<u16> {
+    match strategy {
+        "PORTFOLIO_CRASH_SHIELD" => match len {
+            0 => vec![],
+            1 => vec![10_000],
+            2 => vec![7_000, 3_000],
+            3 => vec![5_000, 3_000, 2_000],
+            _ => {
+                let mut weights = vec![0u16; len];
+                weights[0] = 5_000;
+                weights[1] = 3_000;
+                weights[2] = 2_000;
+                weights
+            }
+        },
+        "CONVEX_TAIL_LADDER" | "EXPIRY_MOVE_NOTE" => match len {
+            0 => vec![],
+            1 => vec![10_000],
+            2 => vec![5_000, 5_000],
+            3 => vec![4_000, 2_000, 4_000],
+            _ => {
+                let mut weights = vec![0u16; len];
+                weights[0] = 3_000;
+                weights[1] = 2_000;
+                weights[len - 2] = 2_000;
+                weights[len - 1] = 3_000;
+                weights
+            }
+        },
+        _ => match len {
+            0 => vec![],
+            1 => vec![10_000],
+            2 => vec![5_000, 5_000],
+            3 => vec![3_333, 3_334, 3_333],
+            _ => {
+                let base = 10_000 / len as u16;
+                let mut weights = vec![base; len];
+                let used: u16 = weights.iter().sum();
+                if let Some(last) = weights.last_mut() {
+                    *last += 10_000u16.saturating_sub(used);
+                }
+                weights
+            }
+        },
+    }
+}
+
+fn estimate_hit_probability_bps(output: &serde_json::Value, strategy: &str) -> u16 {
+    let leg_count = output
+        .get("legs")
+        .and_then(serde_json::Value::as_array)
+        .map(|legs| legs.len())
+        .unwrap_or(0);
+
+    match strategy {
+        "PORTFOLIO_CRASH_SHIELD" => 2_500,
+        "CONVEX_TAIL_LADDER" => 3_500,
+        "EXPIRY_MOVE_NOTE" => 4_500,
+        "BREAKOUT_PROTECTION" => 4_000,
+        _ => (leg_count as u16).saturating_mul(800).min(6_000),
+    }
+}
+
+fn estimate_worst_case_improvement(
+    output: &serde_json::Value,
+    strategy: &str,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let max_payout = json_string_u64(output, "maxGrossPayoutRaw")?;
+
+    let improvement_bps = match strategy {
+        "PORTFOLIO_CRASH_SHIELD" => 9_000u64,
+        "CONVEX_TAIL_LADDER" => 7_000u64,
+        "EXPIRY_MOVE_NOTE" => 5_000u64,
+        "BREAKOUT_PROTECTION" => 7_000u64,
+        _ => 5_000u64,
+    };
+
+    Ok(((max_payout as u128) * improvement_bps as u128 / 10_000).min(u64::MAX as u128) as u64)
+}
+
+fn estimate_complexity_penalty_bps(output: &serde_json::Value) -> u16 {
+    let leg_count = output
+        .get("legs")
+        .and_then(serde_json::Value::as_array)
+        .map(|legs| legs.len())
+        .unwrap_or(0);
+
+    match leg_count {
+        0..=2 => 50,
+        3..=4 => 100,
+        5..=6 => 200,
+        _ => 350,
+    }
+}
+
 async fn compile_advanced_strategy_json_from_market(
     args: &CompileStrategyJsonArgs,
     strategy_kind: AdvancedStrategyKind,
@@ -2279,6 +2834,14 @@ async fn compile_advanced_strategy_json_from_market(
                 upper_range_ask_raw: ask_upper_range,
                 up_tail_ask_raw: ask_up_tail,
             })?
+        }
+
+        AdvancedStrategyKind::SmartBudgetSelector => {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "SMART_BUDGET_SELECTOR must be compiled through the selector path",
+            )
+            .into());
         }
     };
 
