@@ -185,6 +185,15 @@ struct CompileStrategyRequest {
 
     #[serde(rename = "downsideTailGammaBps")]
     downside_tail_gamma_bps: Option<u16>,
+
+    #[serde(rename = "downsideNearRangeWeightBps")]
+    downside_near_range_weight_bps: Option<u16>,
+
+    #[serde(rename = "downsideLowerRangeWeightBps")]
+    downside_lower_range_weight_bps: Option<u16>,
+
+    #[serde(rename = "downsideStepTailGammaBps")]
+    downside_step_tail_gamma_bps: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -564,6 +573,21 @@ async fn compile_strategy(
 
     if let Some(value) = req.downside_tail_gamma_bps {
         args.push("--downside-tail-gamma-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.downside_near_range_weight_bps {
+        args.push("--downside-near-range-weight-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.downside_lower_range_weight_bps {
+        args.push("--downside-lower-range-weight-bps".to_string());
+        args.push(value.to_string());
+    }
+
+    if let Some(value) = req.downside_step_tail_gamma_bps {
+        args.push("--downside-step-tail-gamma-bps".to_string());
         args.push(value.to_string());
     }
 
@@ -1653,6 +1677,7 @@ fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
             | "EXPIRY_MOVE_NOTE"
             | "MOONSHOT_UPSIDE"
             | "DOWNSIDE_CONVEXITY"
+            | "DOWNSIDE_STEP_LADDER"
             | "RANGE_CONVICTION"
             | "SMART_BUDGET_SELECTOR"
     ) {
