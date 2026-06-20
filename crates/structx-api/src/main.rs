@@ -1,6 +1,8 @@
 #[allow(dead_code)]
 mod intent_audit;
 mod intent_positions;
+#[allow(dead_code)]
+mod open_execution_audit;
 mod position_ledger;
 #[allow(dead_code)]
 mod proposal_store;
@@ -20,6 +22,7 @@ use deepbook_client::{
 };
 use intent_audit::DiskIntentAuditStore;
 use intent_positions::list_intent_positions;
+use open_execution_audit::minted_leg_from_audit_json;
 use position_ledger::{premium_basis_for_slice, LegKind, MintedLeg, PositionLedger, RedeemedLeg};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -241,6 +244,13 @@ struct ListPositionsQuery {
 }
 
 #[derive(Debug, Deserialize)]
+struct SyncPositionsRequest {
+    owner: String,
+    #[serde(rename = "managerId")]
+    manager_id: String,
+}
+
+#[derive(Debug, Deserialize)]
 struct SyncFromChainRequest {
     owner: String,
     #[serde(rename = "managerId")]
@@ -297,6 +307,22 @@ struct SyncRedeemedLeg {
     payout_raw: String,
     #[serde(rename = "sourceDigest")]
     source_digest: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditRedeemPositionRequest {
+    owner: String,
+    #[serde(rename = "managerId")]
+    manager_id: String,
+    #[serde(rename = "positionId")]
+    position_id: String,
+    digest: String,
+    #[serde(default)]
+    effects: serde_json::Value,
+    #[serde(default)]
+    events: Vec<serde_json::Value>,
+    #[serde(default, rename = "objectChanges")]
+    object_changes: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -584,7 +610,9 @@ async fn main() {
         .route("/api/markets/catalog/{market_id}", get(get_catalog_market))
         .route("/api/markets", get(list_markets))
         .route("/api/positions", get(list_positions))
+        .route("/api/positions/sync-from-audits", post(sync_positions_from_audits))
         .route("/api/positions/sync-from-chain", post(sync_positions_from_chain))
+        .route("/api/tx/audit-redeem-position", post(audit_redeem_position))
         .route(
             "/api/managers/{address}",
             get(get_manager_for_address).post(put_manager_for_address),
@@ -1324,6 +1352,96 @@ fn position_to_redeem_read(
     }
 }
 
+async fn sync_positions_from_audits(Json(req): Json<SyncPositionsRequest>) -> impl IntoResponse {
+    let mut ledger = PositionLedger::empty(&req.owner, &req.manager_id);
+    let mut warnings: Vec<String> = Vec::new();
+    let mut applied = 0usize;
+
+    let entries = match storage::list_dir(&storage::audits_dir()) {
+        Ok(e) => e,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("could not list audits dir: {err}"),
+                })),
+            );
+        }
+    };
+
+    for entry in entries {
+        if !entry
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(|n| n.ends_with(".record.json"))
+            .unwrap_or(false)
+        {
+            continue;
+        }
+        let record: serde_json::Value = match storage::read_json::<serde_json::Value>(&entry) {
+            Ok(Some(v)) => v,
+            Ok(None) => continue,
+            Err(err) => {
+                warnings.push(format!(
+                    "Skipping malformed audit record {}: {err}",
+                    entry.file_name().and_then(|n| n.to_str()).unwrap_or("?")
+                ));
+                continue;
+            }
+        };
+        let owner_ok =
+            record.get("owner").and_then(serde_json::Value::as_str).map(|s| s.to_lowercase())
+                == Some(req.owner.to_lowercase());
+        let manager_ok =
+            record.get("managerId").and_then(serde_json::Value::as_str).map(|s| s.to_lowercase())
+                == Some(req.manager_id.to_lowercase());
+        if !owner_ok || !manager_ok {
+            continue;
+        }
+        let digest = record.get("digest").and_then(serde_json::Value::as_str).unwrap_or("");
+        let oracle_id =
+            record.get("oracleId").and_then(serde_json::Value::as_str).unwrap_or("0x0").to_string();
+        let expiry_ms =
+            record.get("expiryMs").and_then(serde_json::Value::as_str).unwrap_or("0").to_string();
+        let strategy =
+            record.get("strategy").and_then(serde_json::Value::as_str).map(|s| s.to_string());
+        let opened_at =
+            record.get("createdAtUnix").and_then(serde_json::Value::as_i64).unwrap_or(0);
+        let empty_legs: Vec<serde_json::Value> = Vec::new();
+        let legs =
+            record.get("mintedLegs").and_then(serde_json::Value::as_array).unwrap_or(&empty_legs);
+        for leg in legs {
+            if let Some(leg) = minted_leg_from_audit_json(leg, &oracle_id, &expiry_ms, &strategy) {
+                ledger.apply_mint(&leg, digest, opened_at);
+                applied += 1;
+            }
+        }
+    }
+
+    if let Err(errs) = refresh_position_previews(&req.owner, &req.manager_id, &mut ledger).await {
+        warnings.extend(errs);
+    }
+
+    if let Err(err) = ledger.save() {
+        warnings.push(format!("Could not persist rebuilt ledger: {err}"));
+    }
+
+    let summary = ledger.summary();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "owner": ledger.owner,
+            "managerId": ledger.manager_id,
+            "appliedLegs": applied,
+            "positions": ledger.positions,
+            "summary": summary,
+            "warnings": warnings,
+        })),
+    )
+}
+
 fn parse_leg_kind(s: &str) -> Option<LegKind> {
     match s {
         "UP" => Some(LegKind::Up),
@@ -1447,6 +1565,98 @@ async fn sync_positions_from_chain(Json(req): Json<SyncFromChainRequest>) -> imp
     )
 }
 
+async fn audit_redeem_position(Json(req): Json<AuditRedeemPositionRequest>) -> impl IntoResponse {
+    let execution_status = req
+        .effects
+        .get("status")
+        .and_then(|s| s.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_string();
+    let success = execution_status == "success";
+
+    let mut warnings: Vec<String> = Vec::new();
+    let redeemed = parse_redeemed_legs_from_events(&req.events);
+
+    if success {
+        let mut ledger = match PositionLedger::load(&req.owner, &req.manager_id) {
+            Ok(l) => l,
+            Err(err) => {
+                warnings.push(format!(
+                    "Could not load position ledger before redeem audit: {err}. Starting fresh."
+                ));
+                PositionLedger::empty(&req.owner, &req.manager_id)
+            }
+        };
+        for leg in &redeemed {
+            ledger.apply_redeem(leg, &req.digest);
+        }
+        if let Err(errs) = refresh_position_previews(&req.owner, &req.manager_id, &mut ledger).await
+        {
+            warnings.extend(errs);
+        }
+        if let Err(err) = ledger.save() {
+            warnings.push(format!("Could not persist ledger after redeem: {err}"));
+        }
+
+        let record = serde_json::json!({
+            "schemaVersion": 1,
+            "digest": req.digest,
+            "owner": req.owner,
+            "managerId": req.manager_id,
+            "positionId": req.position_id,
+            "events": req.events,
+            "effects": req.effects,
+            "objectChanges": req.object_changes,
+            "createdAtUnix": storage::unix_now(),
+        });
+        if let Err(err) =
+            storage::atomic_write_json(&storage::redeem_record_path(&req.digest), &record)
+        {
+            warnings.push(format!("Could not persist redeem record: {err}"));
+        }
+
+        let summary = ledger.summary();
+        let updated_position =
+            ledger.positions.iter().find(|p| p.position_id == req.position_id).cloned();
+
+        let explorer_url =
+            format!("https://suiexplorer.com/txblock/{}?network=testnet", req.digest);
+
+        return (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "digest": req.digest,
+                "explorerUrl": explorer_url,
+                "executionStatus": execution_status,
+                "managerId": req.manager_id,
+                "positionId": req.position_id,
+                "updatedPosition": updated_position,
+                "summary": summary,
+                "redeemedLegs": redeemed_legs_to_json(&redeemed),
+                "warnings": warnings,
+            })),
+        );
+    }
+
+    let body = serde_json::json!({
+        "ok": false,
+        "digest": req.digest,
+        "executionStatus": execution_status,
+        "managerId": req.manager_id,
+        "positionId": req.position_id,
+        "redeemedLegs": redeemed_legs_to_json(&redeemed),
+        "error": req.effects
+            .get("status")
+            .and_then(|s| s.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Transaction did not succeed."),
+        "warnings": warnings,
+    });
+    (StatusCode::BAD_REQUEST, Json(body))
+}
+
 fn parse_redeemed_legs_from_events(events: &[serde_json::Value]) -> Vec<RedeemedLeg> {
     let mut out = Vec::new();
     for event in events {
@@ -1502,6 +1712,27 @@ fn parse_redeemed_legs_from_events(events: &[serde_json::Value]) -> Vec<Redeemed
         }
     }
     out
+}
+
+fn redeemed_legs_to_json(legs: &[RedeemedLeg]) -> Vec<serde_json::Value> {
+    legs.iter()
+        .map(|leg| {
+            serde_json::json!({
+                "kind": match leg.kind {
+                    LegKind::Down => "DOWN",
+                    LegKind::Up => "UP",
+                    LegKind::Range => "RANGE",
+                },
+                "oracleId": leg.oracle_id,
+                "expiryMs": leg.expiry_ms,
+                "strikeRaw": leg.strike_raw,
+                "lowerRaw": leg.lower_raw,
+                "upperRaw": leg.upper_raw,
+                "quantityRaw": leg.quantity_raw.to_string(),
+                "payoutRaw": leg.payout_raw.to_string(),
+            })
+        })
+        .collect()
 }
 
 fn json_value_as_u128_string(value: &serde_json::Value) -> Option<String> {
