@@ -1,0 +1,21 @@
+[package]
+name = "structx-service"
+version = "0.1.0"
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[dependencies]
+anyhow = "1"
+async-trait = "0.1"
+chrono.workspace = true
+deepbook-client = { path = "../deepbook-client" }
+serde = { version = "1.0", features = ["derive"] }
+serde_json.workspace = true
+structx-core = { path = "../structx-core" }
+sui-sdk-types.workspace = true
+tokio = { workspace = true, features = ["fs"] }
+uuid = { version = "1", features = ["v4", "serde"] }
+
+[dev-dependencies]
+tempfile = "3"
