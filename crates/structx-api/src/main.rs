@@ -1,3 +1,10 @@
+#[allow(dead_code)]
+mod intent_audit;
+#[allow(dead_code)]
+mod intent_positions;
+#[allow(dead_code)]
+mod proposal_store;
+
 use axum::{
     extract::{Path, Query, State},
     http::StatusCode,
