@@ -1,11 +1,10 @@
+use chrono::{Duration, Utc};
+use clap::{Parser, Subcommand};
+use comfy_table::{presets::UTF8_FULL, Cell, Table};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::time::Duration as StdDuration;
 use std::{fs, io};
-
-use chrono::{Duration, Utc};
-use clap::{Parser, Subcommand};
-use comfy_table::{presets::UTF8_FULL, Cell, Table};
 use sui_sdk_types::Address;
 
 use deepbook_client::{
@@ -17,20 +16,20 @@ use deepbook_client::{
 };
 use structx_core::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
-    build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind,
-    compile_breakout, compile_bucket_payoff, compile_center_band_condor,
+    build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind, compile_breakout, compile_bucket_payoff, compile_center_band_condor,
     compile_convex_tail_ladder, compile_downside_convexity, compile_downside_step_ladder,
     compile_expiry_move_note, compile_moonshot_upside, compile_near_barrier_proxy,
     compile_portfolio_crash_shield, compile_range_conviction, compile_upside_step_ladder,
     guard_quote_preview, optimize_breakout_quantities, score_smart_candidate, select_best_market,
     select_candidate_markets, AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegKind,
-    AdvancedStrategyKind, BarrierSide, BreakoutAskInputs, BreakoutStyle, CenterBandCondorInput,
-    CompiledPayoff, ConvexTailLadderInput, DisplayPrice, DownsideConvexityInput,
-    DownsideStepLadderInput, ExpiryMoveNoteInput, ManagerPositionRead, MintObjectRefs,
-    MoonshotUpsideInput, NearBarrierProxyInput, PayoffBucket, PortfolioCrashShieldInput,
-    PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall, QuoteCostGuard, QuoteObjectRefs,
-    QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind, RangeConvictionInput, SelectedMarket,
-    SmartBudgetStyle, SmartCandidateMetrics, SmartCandidateScore, Strike, UpsideStepLadderInput,
+    AdvancedStrategyKind, BarrierSide, BinaryDirection, BreakoutAskInputs, BreakoutStyle,
+    CenterBandCondorInput, CompiledPayoff, ConvexTailLadderInput, DisplayPrice,
+    DownsideConvexityInput, DownsideStepLadderInput, ExpiryMoveNoteInput, ManagerPositionRead,
+    MintObjectRefs, MoonshotUpsideInput, NearBarrierProxyInput, PayoffBucket,
+    PortfolioCrashShieldInput, PredictLeg, PriceScale, QuoteAssetDisplay, QuoteCall,
+    QuoteCostGuard, QuoteObjectRefs, QuotePlan, QuotePreview, QuotePreviewLeg, QuoteTxKind,
+    RangeConvictionInput, SelectedMarket, SmartBudgetStyle, SmartCandidateMetrics,
+    SmartCandidateScore, Strike, UpsideStepLadderInput,
 };
 #[derive(Debug, Parser)]
 #[command(name = "structx")]
@@ -47,6 +46,132 @@ struct Cli {
 
     #[command(subcommand)]
     command: Command,
+}
+
+pub struct CompileStrategyJsonArgs {
+    pub server_url: String,
+    pub predict_id: String,
+    pub rpc_url: String,
+    pub owner: String,
+    pub strategy: String,
+    pub budget_dusdc: String,
+    pub style: String,
+    pub expiry_preference: String,
+    pub slippage_bps: u16,
+    pub bucket_step: DisplayPrice,
+    pub custom_k1_price: Option<DisplayPrice>,
+    pub custom_k2_price: Option<DisplayPrice>,
+    pub custom_k3_price: Option<DisplayPrice>,
+    pub custom_k4_price: Option<DisplayPrice>,
+    pub exclude_oracle_ids: Vec<String>,
+    pub levels_each_side: u32,
+    pub max_quote_market_attempts: usize,
+    pub portfolio_exposure_dusdc: f64,
+    pub over_hedge_cap_bps: u16,
+    pub convex_gamma_bps: u16,
+    pub dead_zone_bps: u16,
+    pub moonshot_range_weight_bps: u16,
+    pub moonshot_tail_gamma_bps: u16,
+    pub downside_range_weight_bps: u16,
+    pub downside_tail_gamma_bps: u16,
+    pub upside_near_range_weight_bps: u16,
+    pub upside_upper_range_weight_bps: u16,
+    pub upside_tail_gamma_bps: u16,
+    pub downside_near_range_weight_bps: u16,
+    pub downside_lower_range_weight_bps: u16,
+    pub downside_step_tail_gamma_bps: u16,
+    pub condor_center_weight_bps: u16,
+    pub barrier_side: String,
+    pub barrier_near_range_weight_bps: u16,
+    pub barrier_tail_gamma_bps: u16,
+}
+#[derive(Debug, Clone)]
+struct SmartCompiledCandidate {
+    strategy: String,
+    output: serde_json::Value,
+    metrics: SmartCandidateMetrics,
+    score: SmartCandidateScore,
+}
+
+struct DevinspectQuoteBreakoutArgs {
+    server_url: String,
+    predict_id: String,
+    rpc_url: String,
+    freshness: FreshnessConfig,
+    bucket_step: DisplayPrice,
+    levels_each_side: u32,
+    tail_quantity: u64,
+    shoulder_quantity: u64,
+    sender: String,
+    max_quote_market_attempts: usize,
+    max_total_mint_cost_raw: Option<u64>,
+    slippage_bps: u16,
+}
+
+struct BreakoutQuotePlanPreparation {
+    k1: Strike,
+    k2: Strike,
+    k3: Strike,
+    k4: Strike,
+    compiled: CompiledPayoff,
+    plan: QuotePlan,
+}
+
+#[derive(Debug, Clone)]
+struct MintabilityFailure {
+    oracle_id: String,
+    stage: String,
+    reason: String,
+    premium_raw: Option<u64>,
+    premium_display: Option<String>,
+}
+
+impl MintabilityFailure {
+    fn json(&self) -> serde_json::Value {
+        serde_json::json!({
+            "oracleId": self.oracle_id,
+            "stage": self.stage,
+            "reason": self.reason,
+            "premiumRaw": self.premium_raw.map(|value| value.to_string()),
+            "premiumDisplay": self.premium_display,
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct StrategyStrikeSet {
+    center: Strike,
+    k1: Strike,
+    k2: Strike,
+    k3: Strike,
+    k4: Strike,
+}
+
+pub struct FindMintableBreakoutJsonArgs {
+    pub server_url: String,
+    pub predict_id: String,
+    pub owner: String,
+    pub manager_id: String,
+    pub budget_dusdc: String,
+    pub style: String,
+    pub expiry_preference: String,
+    pub slippage_bps: u16,
+    pub bucket_step: DisplayPrice,
+    pub levels_each_side: u32,
+    pub max_quote_market_attempts: usize,
+    pub max_budget_steps: usize,
+}
+struct CheckAnyMarketMintableArgs {
+    server_url: String,
+    predict_id: String,
+    rpc_url: String,
+    manager_id: String,
+    sender: String,
+    freshness: FreshnessConfig,
+    bucket_step: DisplayPrice,
+    levels_each_side: u32,
+    quantity: u64,
+    max_markets: usize,
 }
 
 #[derive(Debug, Subcommand)]
@@ -253,6 +378,18 @@ enum Command {
         #[arg(long, default_value_t = 250.0)]
         bucket_step_usd: f64,
 
+        #[arg(long)]
+        custom_k1_price: Option<f64>,
+
+        #[arg(long)]
+        custom_k2_price: Option<f64>,
+
+        #[arg(long)]
+        custom_k3_price: Option<f64>,
+
+        #[arg(long)]
+        custom_k4_price: Option<f64>,
+
         #[arg(long, default_value_t = 4)]
         levels_each_side: u32,
 
@@ -312,6 +449,9 @@ enum Command {
 
         #[arg(long, default_value_t = 15_000)]
         barrier_tail_gamma_bps: u16,
+
+        #[arg(long = "exclude-oracle-id")]
+        exclude_oracle_ids: Vec<String>,
     },
     DemoStatus {
         #[arg(long)]
@@ -362,6 +502,7 @@ enum Command {
         #[arg(long, default_value = "/tmp/structx_execute_redeem_breakout_plan.json")]
         execute_plan_json_path: PathBuf,
     },
+
     DevinspectMintBreakout {
         #[arg(long)]
         manager_id: String,
@@ -410,6 +551,68 @@ enum Command {
 
         #[arg(long, default_value = "/tmp/structx_execute_mint_breakout_plan.json")]
         execute_plan_json_path: PathBuf,
+    },
+    FindMintableBreakoutJson {
+        #[arg(long)]
+        owner: String,
+
+        #[arg(long)]
+        manager_id: String,
+
+        #[arg(long)]
+        budget_dusdc: String,
+
+        #[arg(long, default_value = "balanced")]
+        style: String,
+
+        #[arg(long, default_value = "nearest_active")]
+        expiry_preference: String,
+
+        #[arg(long, default_value_t = 100)]
+        slippage_bps: u16,
+
+        #[arg(long, default_value_t = 250.0)]
+        bucket_step_usd: f64,
+
+        #[arg(long, default_value_t = 4)]
+        levels_each_side: u32,
+
+        #[arg(long, default_value_t = 8)]
+        max_quote_market_attempts: usize,
+
+        #[arg(long, default_value_t = 5)]
+        max_budget_steps: usize,
+    },
+    CheckAnyMarketMintable {
+        #[arg(long)]
+        manager_id: String,
+
+        #[arg(long)]
+        sender: String,
+
+        #[arg(long, default_value_t = 60)]
+        max_price_age_secs: i64,
+
+        #[arg(long, default_value_t = 60)]
+        max_svi_age_secs: i64,
+
+        #[arg(long, default_value_t = 300)]
+        min_time_to_expiry_secs: i64,
+
+        #[arg(long, default_value_t = false)]
+        strict_freshness: bool,
+
+        #[arg(long, default_value_t = 250.0)]
+        bucket_step_usd: f64,
+
+        #[arg(long, default_value_t = 4)]
+        levels_each_side: u32,
+
+        #[arg(long, default_value_t = 1000)]
+        quantity: u64,
+
+        #[arg(long, default_value_t = 50)]
+        max_markets: usize,
     },
     VerifyAbi,
 }
@@ -596,6 +799,10 @@ async fn main() -> std::process::ExitCode {
             expiry_preference,
             slippage_bps,
             bucket_step_usd,
+            custom_k1_price,
+            custom_k2_price,
+            custom_k3_price,
+            custom_k4_price,
             levels_each_side,
             max_quote_market_attempts,
             portfolio_exposure_dusdc,
@@ -604,6 +811,8 @@ async fn main() -> std::process::ExitCode {
             dead_zone_bps,
             moonshot_range_weight_bps,
             moonshot_tail_gamma_bps,
+            downside_range_weight_bps,
+            downside_tail_gamma_bps,
             upside_near_range_weight_bps,
             upside_upper_range_weight_bps,
             upside_tail_gamma_bps,
@@ -614,8 +823,7 @@ async fn main() -> std::process::ExitCode {
             barrier_side,
             barrier_near_range_weight_bps,
             barrier_tail_gamma_bps,
-            downside_range_weight_bps,
-            downside_tail_gamma_bps,
+            exclude_oracle_ids,
         } => {
             compile_strategy_json_command(CompileStrategyJsonArgs {
                 server_url: cli.server_url,
@@ -628,6 +836,10 @@ async fn main() -> std::process::ExitCode {
                 expiry_preference,
                 slippage_bps,
                 bucket_step: DisplayPrice(bucket_step_usd),
+                custom_k1_price: custom_k1_price.map(DisplayPrice),
+                custom_k2_price: custom_k2_price.map(DisplayPrice),
+                custom_k3_price: custom_k3_price.map(DisplayPrice),
+                custom_k4_price: custom_k4_price.map(DisplayPrice),
                 levels_each_side,
                 max_quote_market_attempts,
                 portfolio_exposure_dusdc,
@@ -648,6 +860,7 @@ async fn main() -> std::process::ExitCode {
                 barrier_side,
                 barrier_near_range_weight_bps,
                 barrier_tail_gamma_bps,
+                exclude_oracle_ids,
             })
             .await
         }
@@ -730,6 +943,67 @@ async fn main() -> std::process::ExitCode {
                 write_execute_script,
                 execute_script_path,
                 execute_plan_json_path,
+            })
+            .await
+        }
+        Command::FindMintableBreakoutJson {
+            owner,
+            manager_id,
+            budget_dusdc,
+            style,
+            expiry_preference,
+            slippage_bps,
+            bucket_step_usd,
+            levels_each_side,
+            max_quote_market_attempts,
+            max_budget_steps,
+        } => {
+            find_mintable_breakout_json_command(FindMintableBreakoutJsonArgs {
+                server_url: cli.server_url,
+                predict_id: cli.predict_id,
+                owner,
+                manager_id,
+                budget_dusdc,
+                style,
+                expiry_preference,
+                slippage_bps,
+                bucket_step: DisplayPrice(bucket_step_usd),
+                levels_each_side,
+                max_quote_market_attempts,
+                max_budget_steps,
+            })
+            .await
+        }
+        Command::CheckAnyMarketMintable {
+            manager_id,
+            sender,
+            max_price_age_secs,
+            max_svi_age_secs,
+            min_time_to_expiry_secs,
+            strict_freshness,
+            bucket_step_usd,
+            levels_each_side,
+            quantity,
+            max_markets,
+        } => {
+            let freshness = build_freshness(
+                max_price_age_secs,
+                max_svi_age_secs,
+                min_time_to_expiry_secs,
+                strict_freshness,
+            );
+
+            check_any_market_mintable_command(CheckAnyMarketMintableArgs {
+                server_url: cli.server_url,
+                predict_id: cli.predict_id,
+                rpc_url: cli.rpc_url,
+                manager_id,
+                sender,
+                freshness,
+                bucket_step: DisplayPrice(bucket_step_usd),
+                levels_each_side,
+                quantity,
+                max_markets,
             })
             .await
         }
@@ -820,6 +1094,18 @@ async fn load_markets(
     Ok(client.load_structx_markets(freshness).await?)
 }
 
+async fn load_markets_quiet(
+    client: &DeepBookClient,
+    freshness: FreshnessConfig,
+) -> Result<Vec<MarketSnapshot>, Box<dyn std::error::Error>> {
+    let _status = client.status().await?;
+    let _predict_state = client.predict_state().await?;
+    let _quote_assets = client.quote_assets().await?;
+    let _vault_summary = client.vault_summary().await?;
+
+    Ok(client.load_structx_markets(freshness).await?)
+}
+
 async fn list_markets(
     server_url: String,
     predict_id: String,
@@ -838,7 +1124,6 @@ async fn list_markets(
 
     Ok(())
 }
-
 async fn select_market(
     server_url: String,
     predict_id: String,
@@ -961,70 +1246,6 @@ async fn plan_quote_breakout_command(
     print_quote_plan(&selected, &plan);
 
     Ok(())
-}
-
-pub struct CompileStrategyJsonArgs {
-    pub server_url: String,
-    pub predict_id: String,
-    pub rpc_url: String,
-    pub owner: String,
-    pub strategy: String,
-    pub budget_dusdc: String,
-    pub style: String,
-    pub expiry_preference: String,
-    pub slippage_bps: u16,
-    pub bucket_step: DisplayPrice,
-    pub levels_each_side: u32,
-    pub max_quote_market_attempts: usize,
-    pub portfolio_exposure_dusdc: f64,
-    pub over_hedge_cap_bps: u16,
-    pub convex_gamma_bps: u16,
-    pub dead_zone_bps: u16,
-    pub moonshot_range_weight_bps: u16,
-    pub moonshot_tail_gamma_bps: u16,
-    pub downside_range_weight_bps: u16,
-    pub downside_tail_gamma_bps: u16,
-    pub upside_near_range_weight_bps: u16,
-    pub upside_upper_range_weight_bps: u16,
-    pub upside_tail_gamma_bps: u16,
-    pub downside_near_range_weight_bps: u16,
-    pub downside_lower_range_weight_bps: u16,
-    pub downside_step_tail_gamma_bps: u16,
-    pub condor_center_weight_bps: u16,
-    pub barrier_side: String,
-    pub barrier_near_range_weight_bps: u16,
-    pub barrier_tail_gamma_bps: u16,
-}
-#[derive(Debug, Clone)]
-struct SmartCompiledCandidate {
-    strategy: String,
-    output: serde_json::Value,
-    metrics: SmartCandidateMetrics,
-    score: SmartCandidateScore,
-}
-
-struct DevinspectQuoteBreakoutArgs {
-    server_url: String,
-    predict_id: String,
-    rpc_url: String,
-    freshness: FreshnessConfig,
-    bucket_step: DisplayPrice,
-    levels_each_side: u32,
-    tail_quantity: u64,
-    shoulder_quantity: u64,
-    sender: String,
-    max_quote_market_attempts: usize,
-    max_total_mint_cost_raw: Option<u64>,
-    slippage_bps: u16,
-}
-
-struct BreakoutQuotePlanPreparation {
-    k1: Strike,
-    k2: Strike,
-    k3: Strike,
-    k4: Strike,
-    compiled: CompiledPayoff,
-    plan: QuotePlan,
 }
 
 fn build_breakout_quote_plan_for_selected_market(
@@ -2021,26 +2242,104 @@ struct PositionCheckSummary {
     bad: usize,
 }
 
+fn resolve_strategy_strikes(
+    args: &CompileStrategyJsonArgs,
+    selected: &SelectedMarket<'_>,
+) -> Result<StrategyStrikeSet, Box<dyn std::error::Error>> {
+    let center = selected
+        .grid
+        .snap_nearest(selected.spot_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
+
+    let custom_values =
+        [args.custom_k1_price, args.custom_k2_price, args.custom_k3_price, args.custom_k4_price];
+    let custom_count = custom_values.iter().filter(|value| value.is_some()).count();
+
+    if custom_count > 0 {
+        if custom_count != 4 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "custom strike override requires all of K1, K2, K3, and K4",
+            )
+            .into());
+        }
+
+        let [Some(k1_display), Some(k2_display), Some(k3_display), Some(k4_display)] =
+            custom_values
+        else {
+            unreachable!();
+        };
+
+        let to_strike = |display: DisplayPrice| -> Result<Strike, Box<dyn std::error::Error>> {
+            let raw = selected.grid.scale.raw_from_display(display).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidInput, "invalid custom strike")
+            })?;
+
+            selected.grid.snap_nearest(raw).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "custom strike is outside the market strike grid",
+                )
+                .into()
+            })
+        };
+
+        let k1 = to_strike(k1_display)?;
+        let k2 = to_strike(k2_display)?;
+        let k3 = to_strike(k3_display)?;
+        let k4 = to_strike(k4_display)?;
+
+        if !(k1.raw < k2.raw && k2.raw < center.raw && center.raw < k3.raw && k3.raw < k4.raw) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "custom strikes must satisfy K1 < K2 < center < K3 < K4",
+            )
+            .into());
+        }
+
+        return Ok(StrategyStrikeSet { center, k1, k2, k3, k4 });
+    }
+
+    let strikes = selected.grid.centered_strikes_by_display_step(
+        selected.spot_raw,
+        args.bucket_step,
+        args.levels_each_side,
+    )?;
+
+    let center_idx = strikes
+        .iter()
+        .position(|strike| strike.raw == center.raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
+
+    if center_idx < 2 || center_idx + 2 >= strikes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "not enough strikes around spot for strategy",
+        )
+        .into());
+    }
+
+    Ok(StrategyStrikeSet {
+        center,
+        k1: strikes[center_idx - 2],
+        k2: strikes[center_idx - 1],
+        k3: strikes[center_idx + 1],
+        k4: strikes[center_idx + 2],
+    })
+}
+
 async fn compile_strategy_json_command(
     args: CompileStrategyJsonArgs,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let _compile_slippage_bps = args.slippage_bps;
-    let advanced_strategy = match AdvancedStrategyKind::from_api_value(&args.strategy) {
-        Ok(
-            strategy @ (AdvancedStrategyKind::PortfolioCrashShield
-            | AdvancedStrategyKind::ConvexTailLadder
-            | AdvancedStrategyKind::ExpiryMoveNote
-            | AdvancedStrategyKind::MoonshotUpside
-            | AdvancedStrategyKind::DownsideConvexity
-            | AdvancedStrategyKind::UpsideStepLadder
-            | AdvancedStrategyKind::DownsideStepLadder
-            | AdvancedStrategyKind::CenterBandCondor
-            | AdvancedStrategyKind::NearBarrierProxy
-            | AdvancedStrategyKind::RangeConviction
-            | AdvancedStrategyKind::SmartBudgetSelector),
-        ) => Some(strategy),
-        _ => None,
-    };
+    let output = compile_strategy_json_value(args).await?;
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
+}
+
+pub async fn compile_strategy_json_value(
+    args: CompileStrategyJsonArgs,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let advanced_strategy = AdvancedStrategyKind::from_api_value(&args.strategy).ok();
 
     if args.strategy != "BREAKOUT_PROTECTION" && advanced_strategy.is_none() {
         return Err(io::Error::new(
@@ -2058,13 +2357,18 @@ async fn compile_strategy_json_command(
         .into());
     }
 
-    let budget_raw = parse_dusdc_to_raw(&args.budget_dusdc)?;
-    let style = BreakoutStyle::from_api_value(&args.style)?;
-
     let freshness = build_freshness(60, 60, 300, false);
     let client = build_client(args.server_url.clone(), args.predict_id.clone())?;
-    let markets = load_markets(&client, freshness).await?;
-    let candidates = select_candidate_markets(&markets, PriceScale::E9);
+    let markets = load_markets_quiet(&client, freshness).await?;
+    let excluded_oracles = args
+        .exclude_oracle_ids
+        .iter()
+        .map(|oracle| oracle.to_ascii_lowercase())
+        .collect::<std::collections::HashSet<_>>();
+    let candidates = select_candidate_markets(&markets, PriceScale::E9)
+        .into_iter()
+        .filter(|selected| !excluded_oracles.contains(&selected.oracle_id.to_ascii_lowercase()))
+        .collect::<Vec<_>>();
 
     if candidates.is_empty() {
         return Err(
@@ -2085,7 +2389,6 @@ async fn compile_strategy_json_command(
     ];
 
     let max_attempts = args.max_quote_market_attempts.min(candidates.len());
-    let probe_quantity = 1_000_000u64;
 
     for selected in candidates.into_iter().take(max_attempts) {
         let oracle = resolve_sui_object(&rpc, selected.oracle_id).await?;
@@ -2109,8 +2412,7 @@ async fn compile_strategy_json_command(
             .await
             {
                 Ok(output) => {
-                    println!("{}", serde_json::to_string_pretty(&output)?);
-                    return Ok(());
+                    return Ok(output);
                 }
                 Err(err) => {
                     warnings.push(format!("skipped oracle {}: {err}", selected.oracle_id));
@@ -2134,8 +2436,7 @@ async fn compile_strategy_json_command(
             .await
             {
                 Ok(output) => {
-                    println!("{}", serde_json::to_string_pretty(&output)?);
-                    return Ok(());
+                    return Ok(output);
                 }
                 Err(err) => {
                     warnings.push(format!("skipped oracle {}: {err}", selected.oracle_id));
@@ -2144,174 +2445,26 @@ async fn compile_strategy_json_command(
             }
         }
 
-        let strikes = selected.grid.centered_strikes_by_display_step(
-            selected.spot_raw,
-            args.bucket_step,
-            args.levels_each_side,
-        )?;
-
-        let center = selected
-            .grid
-            .snap_nearest(selected.spot_raw)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
-
-        let center_idx = strikes
-            .iter()
-            .position(|strike| strike.raw == center.raw)
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
-
-        if center_idx < 2 || center_idx + 2 >= strikes.len() {
-            warnings.push(format!(
-                "skipped oracle {}: not enough strikes around spot",
-                selected.oracle_id
-            ));
-            continue;
-        }
-
-        let k1 = strikes[center_idx - 2];
-        let k2 = strikes[center_idx - 1];
-        let k3 = strikes[center_idx + 1];
-        let k4 = strikes[center_idx + 2];
-
-        let probe_compiled = compile_breakout(k1, k2, k3, k4, probe_quantity, probe_quantity)?;
-
-        let probe_plan = build_quote_plan(&selected, &probe_compiled)?;
-
-        let probe_tx_kind = build_quote_tx_kind(
-            &probe_plan,
-            QuoteObjectRefs { predict: &predict, oracle: &oracle, clock: &clock },
-            &args.owner,
-        )?;
-
-        let probe_response = rpc
-            .dev_inspect_transaction_kind(&probe_tx_kind.sender, &probe_tx_kind.tx_kind_b64)
-            .await?;
-
-        let probe_costs = match quote_costs_from_response(&probe_tx_kind, &probe_response) {
-            Ok(costs) if costs.len() == 4 => costs,
-            Ok(costs) => {
-                warnings.push(format!(
-                    "skipped oracle {}: expected 4 quote legs, got {}",
-                    selected.oracle_id,
-                    costs.len()
-                ));
-                continue;
+        match compile_breakout_strategy_json_from_market(
+            &args,
+            &selected,
+            &predict,
+            &oracle,
+            &clock,
+            &rpc,
+            &asset,
+            warnings.clone(),
+        )
+        .await
+        {
+            Ok(output) => {
+                return Ok(output);
             }
             Err(err) => {
                 warnings.push(format!("skipped oracle {}: {err}", selected.oracle_id));
                 continue;
             }
-        };
-
-        let ask_inputs = BreakoutAskInputs {
-            down_tail_ask_raw: infer_ask_price_raw(probe_costs[0].0, probe_quantity),
-            downside_range_ask_raw: infer_ask_price_raw(probe_costs[1].0, probe_quantity),
-            upside_range_ask_raw: infer_ask_price_raw(probe_costs[2].0, probe_quantity),
-            up_tail_ask_raw: infer_ask_price_raw(probe_costs[3].0, probe_quantity),
-        };
-
-        let optimized = optimize_breakout_quantities(budget_raw, ask_inputs, style)?;
-
-        let final_compiled = compile_breakout(
-            k1,
-            k2,
-            k3,
-            k4,
-            optimized.down_tail_quantity,
-            optimized.downside_range_quantity,
-        )?;
-
-        let final_plan = build_quote_plan(&selected, &final_compiled)?;
-
-        let final_tx_kind = build_quote_tx_kind(
-            &final_plan,
-            QuoteObjectRefs { predict: &predict, oracle: &oracle, clock: &clock },
-            &args.owner,
-        )?;
-
-        let final_response = rpc
-            .dev_inspect_transaction_kind(&final_tx_kind.sender, &final_tx_kind.tx_kind_b64)
-            .await?;
-
-        let final_costs = quote_costs_from_response(&final_tx_kind, &final_response)?;
-
-        if final_costs.len() != 4 {
-            warnings.push(format!(
-                "skipped oracle {}: final quote returned {} legs",
-                selected.oracle_id,
-                final_costs.len()
-            ));
-            continue;
         }
-
-        let total_cost_raw = final_costs
-            .iter()
-            .try_fold(0u64, |acc, (cost, _)| acc.checked_add(*cost))
-            .ok_or_else(|| io::Error::other("total cost overflow"))?;
-
-        let max_gross_payout_raw =
-            optimized.down_tail_quantity.max(optimized.downside_range_quantity);
-        let max_loss_raw = total_cost_raw;
-        let max_net_payout_raw = max_gross_payout_raw.saturating_sub(total_cost_raw);
-
-        let compiled_strategy_id = format!(
-            "breakout:{}:{}:{}:{}:{}",
-            args.owner,
-            selected.oracle_id,
-            selected.expiry.timestamp_millis(),
-            total_cost_raw,
-            style.api_value()
-        );
-
-        let output = serde_json::json!({
-            "ok": true,
-            "compiledStrategyId": compiled_strategy_id,
-            "strategy": "BREAKOUT_PROTECTION",
-            "network": "sui:testnet",
-            "owner": args.owner,
-            "oracleId": selected.oracle_id,
-            "expiry": selected.expiry.to_rfc3339(),
-            "spot": format_raw_price_e9(selected.spot_raw),
-            "style": style.api_value(),
-            "styleRatioBps": optimized.style_ratio_bps,
-            "budgetRaw": budget_raw.to_string(),
-            "budgetDisplay": asset.format_amount(budget_raw),
-            "premiumRequiredRaw": total_cost_raw.to_string(),
-            "premiumRequiredDisplay": asset.format_amount(total_cost_raw),
-            "maxLossRaw": max_loss_raw.to_string(),
-            "maxLossDisplay": asset.format_amount(max_loss_raw),
-            "maxGrossPayoutRaw": max_gross_payout_raw.to_string(),
-            "maxGrossPayoutDisplay": asset.format_amount(max_gross_payout_raw),
-            "maxNetPayoutRaw": max_net_payout_raw.to_string(),
-            "maxNetPayoutDisplay": asset.format_amount(max_net_payout_raw),
-            "strikes": {
-                "k1": format_raw_price_e9(k1.raw),
-                "k2": format_raw_price_e9(k2.raw),
-                "k3": format_raw_price_e9(k3.raw),
-                "k4": format_raw_price_e9(k4.raw),
-                "k1Raw": k1.raw.to_string(),
-                "k2Raw": k2.raw.to_string(),
-                "k3Raw": k3.raw.to_string(),
-                "k4Raw": k4.raw.to_string()
-            },
-            "legs": [
-                compile_json_leg_down(k1.raw, optimized.down_tail_quantity, final_costs[0].0, ask_inputs.down_tail_ask_raw, &asset),
-                compile_json_leg_range("moderate_downside", k1.raw, k2.raw, optimized.downside_range_quantity, final_costs[1].0, ask_inputs.downside_range_ask_raw, &asset),
-                compile_json_leg_range("moderate_upside", k3.raw, k4.raw, optimized.upside_range_quantity, final_costs[2].0, ask_inputs.upside_range_ask_raw, &asset),
-                compile_json_leg_up(k4.raw, optimized.up_tail_quantity, final_costs[3].0, ask_inputs.up_tail_ask_raw, &asset)
-            ],
-            "payoffTable": [
-                payoff_json("BTC settles <= K1", max_gross_payout_raw, total_cost_raw, &asset),
-                payoff_json("K1 < BTC settles <= K2", optimized.downside_range_quantity, total_cost_raw, &asset),
-                payoff_json("K2 < BTC settles < K3", 0, total_cost_raw, &asset),
-                payoff_json("K3 <= BTC settles < K4", optimized.upside_range_quantity, total_cost_raw, &asset),
-                payoff_json("BTC settles >= K4", max_gross_payout_raw, total_cost_raw, &asset)
-            ],
-            "warnings": warnings
-        });
-
-        println!("{}", serde_json::to_string_pretty(&output)?);
-        return Ok(());
     }
 
     Err(io::Error::new(
@@ -2319,14 +2472,6 @@ async fn compile_strategy_json_command(
         format!("failed to compile strategy after {max_attempts} market attempts"),
     )
     .into())
-}
-
-fn compile_strategy_sender(owner: &str) -> String {
-    if owner.trim().is_empty() {
-        "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
-    } else {
-        owner.to_string()
-    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2345,34 +2490,7 @@ async fn compile_breakout_strategy_json_from_market(
     let compile_sender = compile_strategy_sender(&args.owner);
     let probe_quantity = 1_000_000u64;
 
-    let strikes = selected.grid.centered_strikes_by_display_step(
-        selected.spot_raw,
-        args.bucket_step,
-        args.levels_each_side,
-    )?;
-
-    let center = selected
-        .grid
-        .snap_nearest(selected.spot_raw)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
-
-    let center_idx = strikes
-        .iter()
-        .position(|strike| strike.raw == center.raw)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
-
-    if center_idx < 2 || center_idx + 2 >= strikes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not enough strikes around spot for breakout strategy",
-        )
-        .into());
-    }
-
-    let k1 = strikes[center_idx - 2];
-    let k2 = strikes[center_idx - 1];
-    let k3 = strikes[center_idx + 1];
-    let k4 = strikes[center_idx + 2];
+    let StrategyStrikeSet { k1, k2, k3, k4, .. } = resolve_strategy_strikes(args, selected)?;
 
     let probe_compiled = compile_breakout(k1, k2, k3, k4, probe_quantity, probe_quantity)?;
     let probe_plan = build_quote_plan(selected, &probe_compiled)?;
@@ -3012,34 +3130,7 @@ async fn compile_advanced_strategy_json_from_market(
 ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
     let budget_raw = parse_dusdc_to_raw(&args.budget_dusdc)?;
 
-    let strikes = selected.grid.centered_strikes_by_display_step(
-        selected.spot_raw,
-        args.bucket_step,
-        args.levels_each_side,
-    )?;
-
-    let center = selected
-        .grid
-        .snap_nearest(selected.spot_raw)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
-
-    let center_idx = strikes
-        .iter()
-        .position(|strike| strike.raw == center.raw)
-        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
-
-    if center_idx < 2 || center_idx + 2 >= strikes.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::InvalidData,
-            "not enough strikes around spot for advanced strategy",
-        )
-        .into());
-    }
-
-    let k1 = strikes[center_idx - 2];
-    let k2 = strikes[center_idx - 1];
-    let k3 = strikes[center_idx + 1];
-    let k4 = strikes[center_idx + 2];
+    let StrategyStrikeSet { center, k1, k2, k3, k4 } = resolve_strategy_strikes(args, selected)?;
 
     let probe_quantity = 1_000_000u64;
 
@@ -3766,6 +3857,209 @@ fn advanced_result_to_compiled_payoff(
     }
 
     compile_bucket_payoff(&buckets).map_err(|err| err.into())
+}
+
+async fn find_mintable_breakout_json_command(
+    args: FindMintableBreakoutJsonArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    if args.expiry_preference != "nearest_active" {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "only nearest_active expiry preference is supported",
+        )
+        .into());
+    }
+
+    let initial_budget_raw = parse_dusdc_to_raw(&args.budget_dusdc)?;
+
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+    let mut failures: Vec<MintabilityFailure> = Vec::new();
+
+    for step in 0..args.max_budget_steps {
+        let divisor = 2u64.saturating_pow(step as u32);
+        let budget_raw = initial_budget_raw / divisor;
+
+        if budget_raw == 0 {
+            break;
+        }
+
+        let budget_display = raw_dusdc_to_api_string(budget_raw);
+        let slippage_bps = args.slippage_bps.to_string();
+        let bucket_step = args.bucket_step.0.to_string();
+        let levels_each_side = args.levels_each_side.to_string();
+        let max_quote_market_attempts = args.max_quote_market_attempts.to_string();
+
+        let compile_output = run_self_json([
+            "compile-strategy-json",
+            "--owner",
+            args.owner.as_str(),
+            "--budget-dusdc",
+            budget_display.as_str(),
+            "--style",
+            args.style.as_str(),
+            "--expiry-preference",
+            args.expiry_preference.as_str(),
+            "--slippage-bps",
+            slippage_bps.as_str(),
+            "--bucket-step-usd",
+            bucket_step.as_str(),
+            "--levels-each-side",
+            levels_each_side.as_str(),
+            "--max-quote-market-attempts",
+            max_quote_market_attempts.as_str(),
+        ])
+        .await;
+
+        let compiled = match compile_output {
+            Ok(value) => value,
+            Err(err) => {
+                failures.push(MintabilityFailure {
+                    oracle_id: "unknown".to_string(),
+                    stage: "compile".to_string(),
+                    reason: err,
+                    premium_raw: None,
+                    premium_display: None,
+                });
+                continue;
+            }
+        };
+
+        let oracle_id = compiled
+            .get("oracleId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown")
+            .to_string();
+
+        let premium_raw = compiled
+            .get("premiumRequiredRaw")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|value| value.parse::<u64>().ok());
+
+        let premium_display = compiled
+            .get("premiumRequiredDisplay")
+            .and_then(serde_json::Value::as_str)
+            .map(ToOwned::to_owned);
+
+        let Some(legs) = compiled.get("legs").and_then(serde_json::Value::as_array) else {
+            failures.push(MintabilityFailure {
+                oracle_id,
+                stage: "compile".to_string(),
+                reason: "compiled response missing legs".to_string(),
+                premium_raw,
+                premium_display,
+            });
+            continue;
+        };
+
+        let tail_quantity = legs
+            .iter()
+            .find(|leg| {
+                leg.get("role").and_then(serde_json::Value::as_str) == Some("extreme_downside")
+            })
+            .and_then(|leg| leg.get("quantityRaw"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing tail quantity"))?
+            .to_string();
+
+        let shoulder_quantity = legs
+            .iter()
+            .find(|leg| {
+                leg.get("role").and_then(serde_json::Value::as_str) == Some("moderate_downside")
+            })
+            .and_then(|leg| leg.get("quantityRaw"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing shoulder quantity"))?
+            .to_string();
+
+        let max_total_mint_cost_raw =
+            premium_raw.map(|value| ceil_u64_bps(value, args.slippage_bps)).unwrap_or(0);
+        let max_total_mint_cost_raw_str = max_total_mint_cost_raw.to_string();
+
+        let mint_preview = run_self_text([
+            "devinspect-mint-breakout",
+            "--manager-id",
+            args.manager_id.as_str(),
+            "--sender",
+            args.owner.as_str(),
+            "--tail-quantity",
+            tail_quantity.as_str(),
+            "--shoulder-quantity",
+            shoulder_quantity.as_str(),
+            "--max-total-mint-cost-raw",
+            max_total_mint_cost_raw_str.as_str(),
+            "--slippage-bps",
+            slippage_bps.as_str(),
+            "--bucket-step-usd",
+            bucket_step.as_str(),
+            "--levels-each-side",
+            levels_each_side.as_str(),
+            "--max-quote-market-attempts",
+            max_quote_market_attempts.as_str(),
+        ])
+        .await;
+
+        match mint_preview {
+            Ok(stdout) => {
+                let output = serde_json::json!({
+                    "ok": true,
+                    "executable": true,
+                    "network": "sui:testnet",
+                    "owner": args.owner,
+                    "managerId": args.manager_id,
+                    "budgetRaw": budget_raw.to_string(),
+                    "budgetDisplay": asset.format_amount(budget_raw),
+                    "compiled": compiled,
+                    "mintDevInspect": {
+                        "status": "success",
+                        "stdout": stdout
+                    },
+                    "failures": failures.iter().map(MintabilityFailure::json).collect::<Vec<_>>(),
+                    "warnings": [
+                        "Executable means mint devInspect passed at the time of checking; user wallet signing can still fail if market state changes.",
+                        "Quote success alone is not treated as executable."
+                    ]
+                });
+
+                println!("{}", serde_json::to_string_pretty(&output)?);
+                return Ok(());
+            }
+            Err(stderr) => {
+                failures.push(MintabilityFailure {
+                    oracle_id,
+                    stage: "mint_devinspect".to_string(),
+                    reason: classify_devinspect_failure(&stderr),
+                    premium_raw,
+                    premium_display,
+                });
+            }
+        }
+    }
+
+    if let Some(output) =
+        find_fallback_mintable_candidate_json(&args, initial_budget_raw, &asset, &mut failures)
+            .await?
+    {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+        return Ok(());
+    }
+
+    let output = serde_json::json!({
+        "ok": true,
+        "executable": false,
+        "network": "sui:testnet",
+        "owner": args.owner,
+        "managerId": args.manager_id,
+        "message": "No currently mintable breakout candidate found.",
+        "failures": failures.iter().map(MintabilityFailure::json).collect::<Vec<_>>(),
+        "warnings": [
+            "Strategy unavailable right now under current Predict market conditions.",
+            "Quote success does not imply mintability."
+        ]
+    });
+
+    println!("{}", serde_json::to_string_pretty(&output)?);
+    Ok(())
 }
 
 fn advanced_leg_json(
@@ -5259,7 +5553,6 @@ async fn manager_balance_command(
 
     Ok(())
 }
-
 fn print_manager_balance_response(
     response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -5454,34 +5747,6 @@ fn validate_quote_object_refs(
     }
 
     println!("Quote object refs: ok");
-    Ok(())
-}
-
-fn validate_quote_object_refs_quiet(
-    predict: &SuiObjectInfo,
-    oracle: &SuiObjectInfo,
-    clock: &SuiObjectInfo,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let checks = [("predict", predict), ("oracle", oracle), ("clock", clock)];
-
-    for (role, object) in checks {
-        if object.owner_kind != ObjectOwnerKind::Shared {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{role} object is not shared: owner={}", object.owner_kind),
-            )
-            .into());
-        }
-
-        if object.initial_shared_version.is_none() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                format!("{role} object is missing initial_shared_version"),
-            )
-            .into());
-        }
-    }
-
     Ok(())
 }
 
@@ -5879,4 +6144,807 @@ fn format_usable(status: &StructxMarketStatus) -> String {
             }
         }
     }
+}
+
+fn compile_strategy_sender(owner: &str) -> String {
+    if owner.trim().is_empty() {
+        "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
+    } else {
+        owner.to_string()
+    }
+}
+
+fn classify_devinspect_failure(error: &str) -> String {
+    if error.contains("assert_mintable_ask")
+        || error.contains("EAskPriceOutOfBounds")
+        || error.contains("code 7")
+    {
+        return "quoted_but_not_mintable_ask_out_of_bounds".to_string();
+    }
+
+    if error.contains("quote_spread_from_fair_price") {
+        return "pricing_spread_guard_rejected".to_string();
+    }
+
+    if error.contains("exceeds") || error.contains("above") || error.contains("cost") {
+        return "premium_exceeds_cap".to_string();
+    }
+
+    if error.contains("balance") || error.contains("withdraw") {
+        return "insufficient_manager_balance".to_string();
+    }
+
+    "unknown_devinspect_failure".to_string()
+}
+
+async fn find_fallback_mintable_candidate_json(
+    args: &FindMintableBreakoutJsonArgs,
+    budget_raw: u64,
+    asset: &QuoteAssetDisplay,
+    failures: &mut Vec<MintabilityFailure>,
+) -> Result<Option<serde_json::Value>, Box<dyn std::error::Error>> {
+    let client = build_client(args.server_url.clone(), args.predict_id.clone())?;
+    let markets = load_markets_quiet(&client, build_freshness(60, 60, 300, false)).await?;
+    let candidates = select_candidate_markets(&markets, PriceScale::E9);
+
+    if candidates.is_empty() {
+        return Ok(None);
+    }
+
+    let rpc =
+        SuiRpcClient::new(DEFAULT_SUI_TESTNET_RPC_URL.to_string(), StdDuration::from_secs(20))?;
+    let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let manager = resolve_sui_object(&rpc, &args.manager_id).await?;
+    let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
+
+    validate_predict_manager_object(&manager)?;
+
+    let manager_balance_tx = build_manager_balance_tx_kind(&manager, &args.owner)?;
+    let manager_balance_response = rpc
+        .dev_inspect_transaction_kind(&manager_balance_tx.sender, &manager_balance_tx.tx_kind_b64)
+        .await?;
+    let manager_balance_raw = read_manager_balance_from_response(&manager_balance_response)?;
+
+    let max_markets = args.max_quote_market_attempts.max(10).min(candidates.len());
+
+    for selected in candidates.into_iter().take(max_markets) {
+        let oracle = match resolve_sui_object(&rpc, selected.oracle_id).await {
+            Ok(oracle) => oracle,
+            Err(err) => {
+                failures.push(MintabilityFailure {
+                    oracle_id: selected.oracle_id.to_string(),
+                    stage: "fallback_probe".to_string(),
+                    reason: err.to_string(),
+                    premium_raw: None,
+                    premium_display: None,
+                });
+                continue;
+            }
+        };
+
+        if let Err(err) = validate_quote_object_refs(&predict, &oracle, &clock) {
+            failures.push(MintabilityFailure {
+                oracle_id: selected.oracle_id.to_string(),
+                stage: "fallback_probe".to_string(),
+                reason: err.to_string(),
+                premium_raw: None,
+                premium_display: None,
+            });
+            continue;
+        }
+
+        let strikes = match selected.grid.centered_strikes_by_display_step(
+            selected.spot_raw,
+            args.bucket_step,
+            args.levels_each_side,
+        ) {
+            Ok(strikes) => strikes,
+            Err(err) => {
+                failures.push(MintabilityFailure {
+                    oracle_id: selected.oracle_id.to_string(),
+                    stage: "fallback_probe".to_string(),
+                    reason: err.to_string(),
+                    premium_raw: None,
+                    premium_display: None,
+                });
+                continue;
+            }
+        };
+
+        let center = match selected.grid.snap_nearest(selected.spot_raw) {
+            Some(center) => center,
+            None => {
+                failures.push(MintabilityFailure {
+                    oracle_id: selected.oracle_id.to_string(),
+                    stage: "fallback_probe".to_string(),
+                    reason: "spot cannot be snapped".to_string(),
+                    premium_raw: None,
+                    premium_display: None,
+                });
+                continue;
+            }
+        };
+
+        let Some(center_idx) = strikes.iter().position(|strike| strike.raw == center.raw) else {
+            failures.push(MintabilityFailure {
+                oracle_id: selected.oracle_id.to_string(),
+                stage: "fallback_probe".to_string(),
+                reason: "center strike missing".to_string(),
+                premium_raw: None,
+                premium_display: None,
+            });
+            continue;
+        };
+
+        if center_idx == 0 || center_idx + 1 >= strikes.len() {
+            failures.push(MintabilityFailure {
+                oracle_id: selected.oracle_id.to_string(),
+                stage: "fallback_probe".to_string(),
+                reason: "not enough centered strikes".to_string(),
+                premium_raw: None,
+                premium_display: None,
+            });
+            continue;
+        }
+
+        let lower = strikes[center_idx - 1];
+        let upper = strikes[center_idx + 1];
+        let k1 = lower;
+        let k2 = lower;
+        let k3 = upper;
+        let k4 = upper;
+
+        let fallback_scenarios = vec![
+            (
+                "fallback_range_mid",
+                compile_bucket_payoff(&[PayoffBucket::new(Some(lower), Some(upper), 1_000)])?,
+            ),
+            (
+                "fallback_down_binary",
+                compile_bucket_payoff(&[PayoffBucket::new(None, Some(lower), 1_000)])?,
+            ),
+            (
+                "fallback_up_binary",
+                compile_bucket_payoff(&[PayoffBucket::new(Some(upper), None, 1_000)])?,
+            ),
+        ];
+
+        for (scenario_label, compiled) in fallback_scenarios {
+            let plan = match build_quote_plan(&selected, &compiled) {
+                Ok(plan) => plan,
+                Err(err) => {
+                    failures.push(MintabilityFailure {
+                        oracle_id: selected.oracle_id.to_string(),
+                        stage: format!("{scenario_label}_quote_plan"),
+                        reason: err.to_string(),
+                        premium_raw: None,
+                        premium_display: None,
+                    });
+                    continue;
+                }
+            };
+
+            let quote_tx_kind = match build_quote_tx_kind(
+                &plan,
+                QuoteObjectRefs { predict: &predict, oracle: &oracle, clock: &clock },
+                &args.owner,
+            ) {
+                Ok(tx_kind) => tx_kind,
+                Err(err) => {
+                    failures.push(MintabilityFailure {
+                        oracle_id: selected.oracle_id.to_string(),
+                        stage: format!("{scenario_label}_quote_build"),
+                        reason: err.to_string(),
+                        premium_raw: None,
+                        premium_display: None,
+                    });
+                    continue;
+                }
+            };
+
+            let quote_response = match rpc
+                .dev_inspect_transaction_kind(&quote_tx_kind.sender, &quote_tx_kind.tx_kind_b64)
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    failures.push(MintabilityFailure {
+                        oracle_id: selected.oracle_id.to_string(),
+                        stage: format!("{scenario_label}_quote_rpc"),
+                        reason: err.to_string(),
+                        premium_raw: None,
+                        premium_display: None,
+                    });
+                    continue;
+                }
+            };
+
+            let quote_costs = match quote_costs_from_response(&quote_tx_kind, &quote_response) {
+                Ok(costs) => costs,
+                Err(err) => {
+                    let err_text = err.to_string();
+                    failures.push(MintabilityFailure {
+                        oracle_id: selected.oracle_id.to_string(),
+                        stage: format!("{scenario_label}_quote"),
+                        reason: classify_devinspect_failure(&err_text),
+                        premium_raw: None,
+                        premium_display: None,
+                    });
+                    continue;
+                }
+            };
+
+            let total_cost_raw = quote_costs
+                .iter()
+                .try_fold(0u64, |acc, (cost, _)| acc.checked_add(*cost))
+                .ok_or_else(|| io::Error::other("total quote cost overflow"))?;
+
+            if total_cost_raw > manager_balance_raw {
+                failures.push(MintabilityFailure {
+                    oracle_id: selected.oracle_id.to_string(),
+                    stage: format!("{scenario_label}_guard"),
+                    reason: "insufficient_manager_balance".to_string(),
+                    premium_raw: Some(total_cost_raw),
+                    premium_display: Some(asset.format_amount(total_cost_raw)),
+                });
+                continue;
+            }
+
+            if total_cost_raw > budget_raw {
+                failures.push(MintabilityFailure {
+                    oracle_id: selected.oracle_id.to_string(),
+                    stage: format!("{scenario_label}_guard"),
+                    reason: "premium_exceeds_cap".to_string(),
+                    premium_raw: Some(total_cost_raw),
+                    premium_display: Some(asset.format_amount(total_cost_raw)),
+                });
+                continue;
+            }
+
+            let mint_tx_kind = match build_mint_tx_kind(
+                &plan,
+                MintObjectRefs {
+                    predict: &predict,
+                    manager: &manager,
+                    oracle: &oracle,
+                    clock: &clock,
+                },
+                &args.owner,
+            ) {
+                Ok(tx_kind) => tx_kind,
+                Err(err) => {
+                    failures.push(MintabilityFailure {
+                        oracle_id: selected.oracle_id.to_string(),
+                        stage: format!("{scenario_label}_mint_build"),
+                        reason: err.to_string(),
+                        premium_raw: Some(total_cost_raw),
+                        premium_display: Some(asset.format_amount(total_cost_raw)),
+                    });
+                    continue;
+                }
+            };
+
+            let mint_response = match rpc
+                .dev_inspect_transaction_kind(&mint_tx_kind.sender, &mint_tx_kind.tx_kind_b64)
+                .await
+            {
+                Ok(response) => response,
+                Err(err) => {
+                    failures.push(MintabilityFailure {
+                        oracle_id: selected.oracle_id.to_string(),
+                        stage: format!("{scenario_label}_mint_rpc"),
+                        reason: err.to_string(),
+                        premium_raw: Some(total_cost_raw),
+                        premium_display: Some(asset.format_amount(total_cost_raw)),
+                    });
+                    continue;
+                }
+            };
+
+            let mint_status = mint_response
+                .get("effects")
+                .and_then(|effects| effects.get("status"))
+                .and_then(|status| status.get("status"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unknown");
+
+            if mint_status != "success" {
+                let err_text = devinspect_failure_summary(&mint_response);
+                failures.push(MintabilityFailure {
+                    oracle_id: selected.oracle_id.to_string(),
+                    stage: format!("{scenario_label}_mint_devinspect"),
+                    reason: classify_devinspect_failure(&err_text),
+                    premium_raw: Some(total_cost_raw),
+                    premium_display: Some(asset.format_amount(total_cost_raw)),
+                });
+                continue;
+            }
+
+            let preview = QuotePreview::new(
+                QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS },
+                plan.calls
+                    .iter()
+                    .enumerate()
+                    .map(|(idx, call)| {
+                        let (mint_cost_raw, redeem_payout_raw) = quote_costs[idx];
+                        match call {
+                            QuoteCall::Binary { function, direction, strike, quantity, .. } => {
+                                QuotePreviewLeg {
+                                    index: idx,
+                                    function: function.to_string(),
+                                    leg: format!("{direction}_binary"),
+                                    strike_or_lower: selected.grid.display(*strike).to_string(),
+                                    upper: None,
+                                    quantity: *quantity,
+                                    mint_cost_raw,
+                                    redeem_payout_raw,
+                                }
+                            }
+                            QuoteCall::Range { function, lower, upper, quantity, .. } => {
+                                QuotePreviewLeg {
+                                    index: idx,
+                                    function: function.to_string(),
+                                    leg: "range".to_string(),
+                                    strike_or_lower: selected.grid.display(*lower).to_string(),
+                                    upper: Some(selected.grid.display(*upper).to_string()),
+                                    quantity: *quantity,
+                                    mint_cost_raw,
+                                    redeem_payout_raw,
+                                }
+                            }
+                        }
+                    })
+                    .collect(),
+            );
+
+            let output = serde_json::json!({
+                "ok": true,
+                "executable": true,
+                "network": "sui:testnet",
+                "owner": args.owner,
+                "managerId": args.manager_id,
+                "budgetRaw": budget_raw.to_string(),
+                "budgetDisplay": asset.format_amount(budget_raw),
+                "compiled": build_fallback_compiled_json(
+                    args.owner.as_str(),
+                    args.style.as_str(),
+                    scenario_label,
+                    &selected,
+                    &compiled,
+                    &preview,
+                    asset,
+                    k1,
+                    k2,
+                    k3,
+                    k4,
+                    budget_raw,
+                ),
+                "mintDevInspect": {
+                    "status": "success",
+                    "stdout": format!(
+                        "fallback mintable candidate: oracle={} expiry={} scenario={} total_cost_raw={}",
+                        selected.oracle_id,
+                        selected.expiry.to_rfc3339(),
+                        scenario_label,
+                        preview.total_mint_cost_raw
+                    )
+                },
+                "failures": failures.iter().map(MintabilityFailure::json).collect::<Vec<_>>(),
+                "warnings": [
+                    "Fallback executable candidate used because the exact breakout plan was not mintable.",
+                    "This may mint a simpler position than the original optimized breakout request."
+                ]
+            });
+
+            return Ok(Some(output));
+        }
+    }
+
+    Ok(None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_fallback_compiled_json(
+    owner: &str,
+    style: &str,
+    scenario_label: &str,
+    selected: &SelectedMarket<'_>,
+    compiled: &CompiledPayoff,
+    preview: &QuotePreview,
+    asset: &QuoteAssetDisplay,
+    k1: Strike,
+    k2: Strike,
+    k3: Strike,
+    k4: Strike,
+    budget_raw: u64,
+) -> serde_json::Value {
+    let premium_raw = preview.total_mint_cost_raw;
+    let max_gross_payout_raw = compiled.max_payout_quantity;
+    let max_loss_raw = premium_raw;
+    let max_net_payout_raw = max_gross_payout_raw.saturating_sub(premium_raw);
+
+    let legs = compiled
+        .legs
+        .iter()
+        .enumerate()
+        .map(|(idx, leg)| {
+            let premium_for_leg =
+                preview.legs.get(idx).map(|entry| entry.mint_cost_raw).unwrap_or(0);
+            match leg {
+                PredictLeg::Binary { direction: BinaryDirection::Down, strike, quantity } => {
+                    compile_json_leg_down(
+                        strike.raw,
+                        *quantity,
+                        premium_for_leg,
+                        infer_ask_price_raw(premium_for_leg, *quantity),
+                        asset,
+                    )
+                }
+                PredictLeg::Binary { direction: BinaryDirection::Up, strike, quantity } => {
+                    compile_json_leg_up(
+                        strike.raw,
+                        *quantity,
+                        premium_for_leg,
+                        infer_ask_price_raw(premium_for_leg, *quantity),
+                        asset,
+                    )
+                }
+                PredictLeg::Range { lower, upper, quantity } => compile_json_leg_range(
+                    scenario_label,
+                    lower.raw,
+                    upper.raw,
+                    *quantity,
+                    premium_for_leg,
+                    infer_ask_price_raw(premium_for_leg, *quantity),
+                    asset,
+                ),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let payoff_table = compiled
+        .buckets
+        .iter()
+        .map(|bucket| {
+            let condition = match (bucket.lower, bucket.upper) {
+                (None, Some(upper)) => {
+                    format!("BTC settles <= {}", selected.grid.display(upper))
+                }
+                (Some(lower), Some(upper)) => format!(
+                    "{} <= BTC settles < {}",
+                    selected.grid.display(lower),
+                    selected.grid.display(upper)
+                ),
+                (Some(lower), None) => {
+                    format!("BTC settles >= {}", selected.grid.display(lower))
+                }
+                (None, None) => "Open".to_string(),
+            };
+
+            payoff_json(&condition, bucket.payout_quantity, premium_raw, asset)
+        })
+        .collect::<Vec<_>>();
+
+    serde_json::json!({
+        "ok": true,
+        "compiledStrategyId": format!(
+            "fallback:{}:{}:{}:{}:{}",
+            owner,
+            selected.oracle_id,
+            selected.expiry.timestamp_millis(),
+            premium_raw,
+            scenario_label
+        ),
+        "strategy": "BREAKOUT_PROTECTION",
+        "selectionMode": "mintable_probe",
+        "shape": scenario_label,
+        "network": "sui:testnet",
+        "owner": owner,
+        "oracleId": selected.oracle_id,
+        "expiry": selected.expiry.to_rfc3339(),
+        "spot": format_raw_price_e9(selected.spot_raw),
+        "style": style,
+        "styleRatioBps": 0,
+        "slippageBps": 0,
+        "budgetRaw": budget_raw.to_string(),
+        "budgetDisplay": asset.format_amount(budget_raw),
+        "premiumRequiredRaw": premium_raw.to_string(),
+        "premiumRequiredDisplay": asset.format_amount(premium_raw),
+        "maxLossRaw": max_loss_raw.to_string(),
+        "maxLossDisplay": asset.format_amount(max_loss_raw),
+        "maxGrossPayoutRaw": max_gross_payout_raw.to_string(),
+        "maxGrossPayoutDisplay": asset.format_amount(max_gross_payout_raw),
+        "maxNetPayoutRaw": max_net_payout_raw.to_string(),
+        "maxNetPayoutDisplay": asset.format_amount(max_net_payout_raw),
+        "strikes": {
+            "k1": format_raw_price_e9(k1.raw),
+            "k2": format_raw_price_e9(k2.raw),
+            "k3": format_raw_price_e9(k3.raw),
+            "k4": format_raw_price_e9(k4.raw),
+            "k1Raw": k1.raw.to_string(),
+            "k2Raw": k2.raw.to_string(),
+            "k3Raw": k3.raw.to_string(),
+            "k4Raw": k4.raw.to_string()
+        },
+        "legs": legs,
+        "payoffTable": payoff_table,
+        "warnings": [
+            "Fallback mintable candidate selected because the requested breakout plan was not executable.",
+            "This preview represents a simpler executable position, not the original exact breakout shape."
+        ]
+    })
+}
+
+async fn check_any_market_mintable_command(
+    args: CheckAnyMarketMintableArgs,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_sui_address_arg("manager-id", &args.manager_id)?;
+    validate_sui_address_arg("sender", &args.sender)?;
+
+    let client = build_client(args.server_url.clone(), args.predict_id.clone())?;
+    let markets = load_markets(&client, args.freshness).await?;
+    let candidates = select_candidate_markets(&markets, PriceScale::E9);
+
+    if candidates.is_empty() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "no StructX-usable future markets").into()
+        );
+    }
+
+    let rpc = SuiRpcClient::new(args.rpc_url.clone(), StdDuration::from_secs(20))?;
+    let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let manager = resolve_sui_object(&rpc, &args.manager_id).await?;
+    let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
+
+    validate_predict_manager_object(&manager)?;
+
+    let manager_balance_tx = build_manager_balance_tx_kind(&manager, &args.sender)?;
+    let manager_balance_response = rpc
+        .dev_inspect_transaction_kind(&manager_balance_tx.sender, &manager_balance_tx.tx_kind_b64)
+        .await?;
+    let manager_balance_raw = read_manager_balance_from_response(&manager_balance_response)?;
+
+    println!("Scanning usable future markets");
+    println!("manager balance raw: {manager_balance_raw}");
+    println!("probe quantity: {}", args.quantity);
+    println!();
+
+    let max_markets = args.max_markets.min(candidates.len());
+    let mut failures = Vec::new();
+
+    for selected in candidates.into_iter().take(max_markets) {
+        match probe_single_market_mintability(
+            &rpc,
+            &predict,
+            &manager,
+            &clock,
+            &args,
+            &selected,
+            manager_balance_raw,
+        )
+        .await
+        {
+            Ok(message) => {
+                println!("{message}");
+                return Ok(());
+            }
+            Err(message) => {
+                println!("{message}");
+                failures.push(message);
+            }
+        }
+    }
+
+    Err(io::Error::other(format!(
+        "no mintable tiny position found across {max_markets} usable future markets:\n{}",
+        failures.join("\n")
+    ))
+    .into())
+}
+
+async fn probe_single_market_mintability(
+    rpc: &SuiRpcClient,
+    predict: &SuiObjectInfo,
+    manager: &SuiObjectInfo,
+    clock: &SuiObjectInfo,
+    args: &CheckAnyMarketMintableArgs,
+    selected: &SelectedMarket<'_>,
+    manager_balance_raw: u64,
+) -> Result<String, String> {
+    let oracle =
+        resolve_sui_object(rpc, selected.oracle_id).await.map_err(|err| err.to_string())?;
+    validate_quote_object_refs(predict, &oracle, clock).map_err(|err| err.to_string())?;
+
+    let strikes = selected
+        .grid
+        .centered_strikes_by_display_step(
+            selected.spot_raw,
+            args.bucket_step,
+            args.levels_each_side,
+        )
+        .map_err(|err| err.to_string())?;
+
+    let center = selected
+        .grid
+        .snap_nearest(selected.spot_raw)
+        .ok_or_else(|| "spot cannot be snapped".to_string())?;
+
+    let center_idx = strikes
+        .iter()
+        .position(|strike| strike.raw == center.raw)
+        .ok_or_else(|| "center strike missing".to_string())?;
+
+    if center_idx == 0 || center_idx + 1 >= strikes.len() {
+        return Err(format!(
+            "oracle {} expiry {} skipped: not enough centered strikes",
+            selected.oracle_id,
+            selected.expiry.to_rfc3339()
+        ));
+    }
+
+    let lower = strikes[center_idx - 1];
+    let upper = strikes[center_idx + 1];
+
+    let scenarios = vec![
+        (
+            "range_mid".to_string(),
+            compile_bucket_payoff(&[PayoffBucket::new(Some(lower), Some(upper), args.quantity)])
+                .map_err(|err| err.to_string())?,
+        ),
+        (
+            "down_binary_near".to_string(),
+            compile_bucket_payoff(&[PayoffBucket::new(None, Some(lower), args.quantity)])
+                .map_err(|err| err.to_string())?,
+        ),
+        (
+            "up_binary_near".to_string(),
+            compile_bucket_payoff(&[PayoffBucket::new(Some(upper), None, args.quantity)])
+                .map_err(|err| err.to_string())?,
+        ),
+    ];
+
+    for (label, compiled) in scenarios {
+        let plan = build_quote_plan(selected, &compiled).map_err(|err| err.to_string())?;
+        let quote_tx_kind = build_quote_tx_kind(
+            &plan,
+            QuoteObjectRefs { predict, oracle: &oracle, clock },
+            &args.sender,
+        )
+        .map_err(|err| err.to_string())?;
+
+        let quote_response = rpc
+            .dev_inspect_transaction_kind(&quote_tx_kind.sender, &quote_tx_kind.tx_kind_b64)
+            .await
+            .map_err(|err| err.to_string())?;
+
+        let costs = quote_costs_from_response(&quote_tx_kind, &quote_response)
+            .map_err(|err| err.to_string())?;
+        let total_cost_raw = costs
+            .iter()
+            .try_fold(0u64, |acc, (cost, _)| acc.checked_add(*cost))
+            .ok_or_else(|| "total quote cost overflow".to_string())?;
+
+        if total_cost_raw > manager_balance_raw {
+            continue;
+        }
+
+        let mint_tx_kind = build_mint_tx_kind(
+            &plan,
+            MintObjectRefs { predict, manager, oracle: &oracle, clock },
+            &args.sender,
+        )
+        .map_err(|err| err.to_string())?;
+
+        let mint_response = rpc
+            .dev_inspect_transaction_kind(&mint_tx_kind.sender, &mint_tx_kind.tx_kind_b64)
+            .await
+            .map_err(|err| err.to_string())?;
+
+        let status = mint_response
+            .get("effects")
+            .and_then(|effects| effects.get("status"))
+            .and_then(|status| status.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        if status == "success" {
+            return Ok(format!(
+                "FOUND mintable market: oracle={} expiry={} probe={} total_cost_raw={} lower={} upper={}",
+                selected.oracle_id,
+                selected.expiry.to_rfc3339(),
+                label,
+                total_cost_raw,
+                selected.grid.display(lower),
+                selected.grid.display(upper),
+            ));
+        }
+    }
+
+    Err(format!(
+        "oracle {} expiry {}: no tiny probe mintable (range_mid/down_binary_near/up_binary_near)",
+        selected.oracle_id,
+        selected.expiry.to_rfc3339()
+    ))
+}
+
+async fn run_self_json<const N: usize>(args: [&str; N]) -> Result<serde_json::Value, String> {
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let output =
+        std::process::Command::new(exe).args(args).output().map_err(|err| err.to_string())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if !output.status.success() {
+        return Err(stderr);
+    }
+
+    serde_json::from_str(&stdout).map_err(|err| {
+        format!("failed to parse command stdout as JSON: {err}; stdout={stdout}; stderr={stderr}")
+    })
+}
+
+async fn run_self_text<const N: usize>(args: [&str; N]) -> Result<String, String> {
+    let exe = std::env::current_exe().map_err(|err| err.to_string())?;
+    let output =
+        std::process::Command::new(exe).args(args).output().map_err(|err| err.to_string())?;
+
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+
+    if output.status.success() {
+        Ok(stdout)
+    } else {
+        Err(format!("{stdout}\n{stderr}"))
+    }
+}
+
+fn raw_dusdc_to_api_string(raw: u64) -> String {
+    let whole = raw / 1_000_000;
+    let frac = raw % 1_000_000;
+
+    if frac == 0 {
+        return whole.to_string();
+    }
+
+    let mut frac_string = format!("{frac:06}");
+    while frac_string.ends_with('0') {
+        frac_string.pop();
+    }
+
+    format!("{whole}.{frac_string}")
+}
+
+fn ceil_u64_bps(raw: u64, bps: u16) -> u64 {
+    let numerator = (raw as u128).saturating_mul(10_000u128 + bps as u128).saturating_add(9_999);
+
+    (numerator / 10_000).min(u64::MAX as u128) as u64
+}
+
+fn validate_quote_object_refs_quiet(
+    predict: &SuiObjectInfo,
+    oracle: &SuiObjectInfo,
+    clock: &SuiObjectInfo,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let checks = [("predict", predict), ("oracle", oracle), ("clock", clock)];
+
+    for (role, object) in checks {
+        if object.owner_kind != ObjectOwnerKind::Shared {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{role} object is not shared: owner={}", object.owner_kind),
+            )
+            .into());
+        }
+
+        if object.initial_shared_version.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{role} object is missing initial_shared_version"),
+            )
+            .into());
+        }
+    }
+
+    Ok(())
 }
