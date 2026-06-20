@@ -1,6 +1,7 @@
 use serde::{Deserialize, Serialize};
 
-use crate::position_ledger::{LegKind, MintedLeg};
+use crate::position_ledger::{LegKind, MintedLeg, PositionLedger};
+use crate::storage;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
@@ -43,6 +44,253 @@ pub struct OpenExecutionAuditOutcome {
     pub manager_balance_display: Option<String>,
     pub artifact_path: String,
     pub compiled_strategy_id: Option<String>,
+}
+
+pub async fn audit_open_execution(
+    input: OpenExecutionAuditInput,
+) -> anyhow::Result<OpenExecutionAuditOutcome> {
+    validate_open_execution_input(&input)?;
+
+    let artifact = serde_json::json!({
+        "digest": input.tx_digest.clone(),
+        "effects": input.execution_result.get("effects").cloned().unwrap_or(serde_json::Value::Null),
+        "events": extract_events(&input.execution_result),
+        "objectChanges": extract_object_changes(&input.execution_result),
+    });
+
+    let path = std::env::temp_dir().join(format!(
+        "structx_audit_{}.json",
+        artifact.get("digest").and_then(serde_json::Value::as_str).unwrap_or("unknown")
+    ));
+    std::fs::write(&path, serde_json::to_vec_pretty(&artifact)?)?;
+
+    let execution_status = input
+        .execution_result
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown")
+        .to_ascii_lowercase();
+
+    let minted_legs = parse_minted_legs_from_events(&extract_events(&input.execution_result));
+    let total_cost_raw_num: u128 = minted_legs
+        .iter()
+        .filter_map(|leg| {
+            leg.get("costRaw")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|value| value.parse::<u128>().ok())
+        })
+        .sum();
+
+    let compiled_strategy_id = input
+        .raw_compiled_strategy
+        .get("compiledStrategyId")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string());
+
+    let oracle_id = input
+        .raw_compiled_strategy
+        .get("oracleId")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string())
+        .or_else(|| input.intent_proposal.as_ref().map(|p| p.selected_market.oracle_id.clone()))
+        .unwrap_or_else(|| "0x0".to_string());
+
+    let compiled_expiry_ms = input
+        .raw_compiled_strategy
+        .get("expiryMs")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string())
+        .or_else(|| input.intent_proposal.as_ref().map(|p| p.selected_market.expiry_ms.to_string()))
+        .unwrap_or_else(|| "0".to_string());
+
+    let strategy_label = input
+        .raw_compiled_strategy
+        .get("strategy")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string())
+        .or_else(|| input.intent_proposal.as_ref().map(|p| p.backend_strategy_id.clone()));
+
+    let mut warnings = Vec::new();
+    let mut demo_status = serde_json::json!({
+        "ok": false,
+        "warnings": ["manager_id or user_address missing; skipped deep audit service"]
+    });
+
+    if !execution_succeeded(&input.execution_result) {
+        warnings.push(
+            "Transaction did not succeed, so StructX skipped canonical position ledger merge."
+                .to_string(),
+        );
+    } else if minted_legs.is_empty() {
+        warnings.push(
+            "Transaction succeeded but no mint events were decoded, so no open position was merged into the ledger."
+                .to_string(),
+        );
+    } else if let (Some(owner), Some(manager_id)) = (&input.user_address, &input.manager_id) {
+        demo_status = structx_service::position_service::demo_status_json_value(
+            Some(deepbook_client::DEFAULT_SUI_TESTNET_RPC_URL.to_string()),
+            manager_id,
+            owner,
+            &path,
+            false,
+        )
+        .await
+        .map_err(|err| anyhow::anyhow!(err.to_string()))?;
+    } else {
+        warnings.push(
+            "manager_id or user_address missing; skipped deep audit service and canonical ledger verification."
+                .to_string(),
+        );
+    }
+
+    let manager_balance_raw = demo_status
+        .get("managerBalanceRaw")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string());
+    let manager_balance_display = demo_status
+        .get("managerBalanceDisplay")
+        .and_then(serde_json::Value::as_str)
+        .map(|s| s.to_string());
+
+    let position_verification =
+        demo_status.get("positionVerification").cloned().unwrap_or(serde_json::json!({
+            "status": "unknown",
+            "verifiedCount": 0,
+            "mismatchCount": minted_legs.len(),
+            "items": []
+        }));
+
+    if position_verification.get("status").and_then(serde_json::Value::as_str) == Some("partial") {
+        warnings.push(
+            "Position verification is partial. Range legs verified. Binary manager-key verification is a known issue under investigation."
+                .to_string(),
+        );
+    }
+    if let Some(service_warnings) =
+        demo_status.get("warnings").and_then(serde_json::Value::as_array)
+    {
+        for warning in service_warnings {
+            if let Some(text) = warning.as_str() {
+                warnings.push(text.to_string());
+            }
+        }
+    }
+
+    let mut position_ids = Vec::new();
+    let mut ledger_sync_status = if !execution_succeeded(&input.execution_result) {
+        "transaction_failed".to_string()
+    } else if minted_legs.is_empty() {
+        "no_mint_events_found".to_string()
+    } else {
+        "execution_not_merged".to_string()
+    };
+
+    let audit_success = demo_status.get("ok").and_then(serde_json::Value::as_bool).unwrap_or(false)
+        && execution_succeeded(&input.execution_result)
+        && !minted_legs.is_empty();
+
+    if audit_success {
+        if let (Some(owner), Some(manager_id)) = (&input.user_address, &input.manager_id) {
+            let opened_at = storage::unix_now();
+            let mut ledger = match PositionLedger::load(owner, manager_id) {
+                Ok(l) => l,
+                Err(err) => {
+                    warnings.push(format!(
+                        "Could not load existing position ledger: {err}. New positions will start fresh."
+                    ));
+                    PositionLedger::empty(owner, manager_id)
+                }
+            };
+
+            for raw in &minted_legs {
+                if let Some(leg) = minted_leg_from_audit_json(
+                    raw,
+                    &oracle_id,
+                    &compiled_expiry_ms,
+                    &strategy_label,
+                ) {
+                    let position_id = PositionLedger::position_id(owner, manager_id, &leg);
+                    position_ids.push(position_id);
+                    ledger.apply_mint(&leg, &input.tx_digest, opened_at);
+                }
+            }
+
+            if let Err(err) = ledger.save() {
+                warnings.push(format!("Could not persist position ledger to disk: {err}."));
+                ledger_sync_status = "ledger_save_failed".to_string();
+            } else {
+                ledger_sync_status = "merged_into_position_ledger".to_string();
+            }
+
+            let record = serde_json::json!({
+                "schemaVersion": 1,
+                "digest": input.tx_digest,
+                "owner": owner,
+                "managerId": manager_id,
+                "compiledStrategyId": compiled_strategy_id,
+                "oracleId": oracle_id,
+                "expiryMs": compiled_expiry_ms,
+                "strategy": strategy_label,
+                "totalCostRaw": total_cost_raw_num.to_string(),
+                "mintedLegs": minted_legs,
+                "createdAtUnix": opened_at,
+            });
+            let record_path = storage::audit_record_path(&input.tx_digest);
+            if let Err(err) = storage::atomic_write_json(&record_path, &record) {
+                warnings.push(format!("Could not persist audit record to disk: {err}."));
+            }
+        } else {
+            ledger_sync_status = "missing_owner_or_manager".to_string();
+        }
+    }
+
+    Ok(OpenExecutionAuditOutcome {
+        ok: audit_success,
+        tx_digest: input.tx_digest.clone(),
+        user_address: input.user_address,
+        manager_id: input.manager_id,
+        position_ids,
+        ledger_sync_status,
+        warnings,
+        raw_audit_result: serde_json::json!({ "service": demo_status }),
+        execution_status,
+        explorer_url: format!(
+            "https://suiexplorer.com/txblock/{}?network=testnet",
+            input.tx_digest
+        ),
+        total_cost_raw: total_cost_raw_num.to_string(),
+        total_cost_display: format_dusdc_raw_u128(total_cost_raw_num),
+        minted_legs,
+        position_verification,
+        manager_balance_raw,
+        manager_balance_display,
+        artifact_path: path.to_string_lossy().to_string(),
+        compiled_strategy_id,
+    })
+}
+
+fn validate_open_execution_input(input: &OpenExecutionAuditInput) -> anyhow::Result<()> {
+    if input.tx_digest.trim().is_empty() {
+        anyhow::bail!("tx_digest is required");
+    }
+    if input.execution_result.is_null() {
+        anyhow::bail!("execution_result is required");
+    }
+    if input.raw_compiled_strategy.is_null() {
+        anyhow::bail!("raw_compiled_strategy is required");
+    }
+    Ok(())
+}
+
+fn execution_succeeded(raw: &serde_json::Value) -> bool {
+    raw.get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .map(|status| status.eq_ignore_ascii_case("success"))
+        .unwrap_or(false)
 }
 
 pub fn minted_leg_from_audit_json(
@@ -194,6 +442,14 @@ pub fn parse_minted_legs_from_events(events: &[serde_json::Value]) -> Vec<serde_
     legs
 }
 
+fn extract_events(raw: &serde_json::Value) -> Vec<serde_json::Value> {
+    raw.get("events").and_then(|events| events.as_array()).cloned().unwrap_or_default()
+}
+
+fn extract_object_changes(raw: &serde_json::Value) -> Vec<serde_json::Value> {
+    raw.get("objectChanges").and_then(|changes| changes.as_array()).cloned().unwrap_or_default()
+}
+
 fn json_value_as_u128_string(value: &serde_json::Value) -> Option<String> {
     if let Some(s) = value.as_str() {
         Some(s.to_string())
@@ -236,5 +492,56 @@ fn format_raw_price_e9_str(raw: &str) -> String {
             frac_string.pop();
         }
         format!("{whole}.{frac_string}")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sample_input(status: &str) -> OpenExecutionAuditInput {
+        OpenExecutionAuditInput {
+            source: OpenExecutionAuditSource::NormalModeIntent,
+            proposal_id: Some("proposal_test".to_string()),
+            user_address: Some("0xuser".to_string()),
+            manager_id: Some("0xmanager".to_string()),
+            tx_digest: "digest_test".to_string(),
+            execution_result: serde_json::json!({
+                "effects": {
+                    "status": {
+                        "status": status
+                    }
+                },
+                "events": [],
+                "objectChanges": []
+            }),
+            raw_compiled_strategy: serde_json::json!({
+                "strategy": "test"
+            }),
+            intent_proposal: None,
+        }
+    }
+
+    #[test]
+    fn rejects_missing_digest() {
+        let mut input = sample_input("success");
+        input.tx_digest.clear();
+
+        let err = validate_open_execution_input(&input).unwrap_err();
+        assert!(err.to_string().contains("tx_digest"));
+    }
+
+    #[test]
+    fn detects_successful_execution() {
+        assert!(execution_succeeded(&sample_input("success").execution_result));
+        assert!(!execution_succeeded(&sample_input("failure").execution_result));
+    }
+
+    #[tokio::test]
+    async fn failed_transaction_skips_merge() {
+        let outcome = audit_open_execution(sample_input("failure")).await.unwrap();
+
+        assert!(!outcome.ok);
+        assert_eq!(outcome.ledger_sync_status, "transaction_failed");
     }
 }

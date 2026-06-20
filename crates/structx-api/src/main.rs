@@ -1,10 +1,7 @@
-#[allow(dead_code)]
 mod intent_audit;
 mod intent_positions;
-#[allow(dead_code)]
 mod open_execution_audit;
 mod position_ledger;
-#[allow(dead_code)]
 mod proposal_store;
 #[allow(dead_code)]
 mod storage;
@@ -20,10 +17,17 @@ use deepbook_client::{
     DeepBookClient, DeepBookConfig, FreshnessConfig, MarketSnapshot, ObjectOwnerKind,
     SuiObjectInfo, SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_MANAGER_TYPE,
 };
-use intent_audit::DiskIntentAuditStore;
+use intent_audit::{
+    infer_execution_status, infer_manager_id_from_execution, make_audit_id,
+    now_ms as intent_audit_now_ms, DiskIntentAuditStore, IntentExecutionAudit,
+};
 use intent_positions::list_intent_positions;
-use open_execution_audit::minted_leg_from_audit_json;
+use open_execution_audit::{
+    audit_open_execution, minted_leg_from_audit_json, OpenExecutionAuditInput,
+    OpenExecutionAuditSource,
+};
 use position_ledger::{premium_basis_for_slice, LegKind, MintedLeg, PositionLedger, RedeemedLeg};
+use proposal_store::DiskProposalStore;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -35,9 +39,10 @@ use std::{
 };
 use structx_core::{build_redeem_tx_kind, ManagerPositionRead, MintObjectRefs};
 use structx_service::{
-    load_catalog_status, plan_from_intent, refresh_catalog_from_existing_markets_json,
-    DiskMarketStore, ExpiryPreference, MarketCategory, MarketKind, MarketSearchQuery, MarketStatus,
-    MarketStore, RiskStyle, UserIntentRequest,
+    load_catalog_status, plan_from_intent, quote_intent_plan,
+    refresh_catalog_from_existing_markets_json, DiskMarketStore, ExpiryPreference, MarketCategory,
+    MarketKind, MarketSearchQuery, MarketStatus, MarketStore, QuoteIntentPlanRequest, RiskStyle,
+    UserIntentRequest,
 };
 use tokio::{process::Command, sync::Mutex};
 use tower_http::cors::CorsLayer;
@@ -205,6 +210,40 @@ struct IntentPlanApiRequest {
     budget: Option<u64>,
     quote_asset: Option<String>,
     risk_style: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditIntentExecutionRequest {
+    proposal_id: String,
+    tx_digest: String,
+    user_address: Option<String>,
+    manager_id: Option<String>,
+    execution_result: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntentExecutePlanRequest {
+    proposal_id: String,
+    user_address: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct IntentExecutePlanResponse {
+    proposal_id: String,
+    user_address: Option<String>,
+    compiled_strategy_id: Option<String>,
+    raw_compiled_strategy: serde_json::Value,
+    proposal: structx_service::ExecutionProposal,
+    warnings: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct AuditIntentExecutionResponse {
+    ok: bool,
+    audit: IntentExecutionAudit,
+    position_sync_status: String,
+    position_ids: Vec<String>,
+    warnings: Vec<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -599,6 +638,9 @@ async fn main() {
         .route("/health", get(health))
         .route("/api/market/live-price", get(live_price))
         .route("/api/intent/plan", post(plan_intent))
+        .route("/api/intent/quote", post(quote_intent))
+        .route("/api/intent/execute-plan", post(execute_intent_plan))
+        .route("/api/intent/audit-execution", post(audit_intent_execution))
         .route("/api/intent/audits/recent", get(list_recent_intent_audits))
         .route("/api/intent/audits/proposal/{proposal_id}", get(get_intent_audit_by_proposal))
         .route("/api/intent/audits/digest/{digest}", get(get_intent_audit_by_digest))
@@ -689,6 +731,257 @@ async fn plan_intent(Json(req): Json<IntentPlanApiRequest>) -> impl IntoResponse
             })),
         ),
     }
+}
+
+async fn quote_intent(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<QuoteIntentPlanRequest>,
+) -> impl IntoResponse {
+    let store = DiskMarketStore::default_state_dir();
+    if let Err(err) = ensure_market_catalog_ready(&store).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": format!("failed to prepare market catalog for quoting: {err}"),
+            })),
+        );
+    }
+
+    match quote_intent_plan(&store, req).await {
+        Ok(response) => {
+            if let Some(compiled_strategy_id) = response
+                .raw_compiled_strategy
+                .get("compiledStrategyId")
+                .and_then(serde_json::Value::as_str)
+            {
+                state.compiled.lock().await.insert(
+                    compiled_strategy_id.to_string(),
+                    response.raw_compiled_strategy.clone(),
+                );
+            }
+
+            let proposal_store = DiskProposalStore::default_state_dir();
+            match proposal_store.save(response).await {
+                Ok(stored) => (
+                    StatusCode::OK,
+                    Json(serde_json::to_value(stored.proposal).unwrap_or_else(
+                        |_| serde_json::json!({"ok": false, "error": "failed to serialize execution proposal"}),
+                    )),
+                ),
+                Err(err) => (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "message": format!("failed to persist quoted proposal: {err}"),
+                    })),
+                ),
+            }
+        }
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": err.to_string(),
+            })),
+        ),
+    }
+}
+
+async fn execute_intent_plan(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<IntentExecutePlanRequest>,
+) -> impl IntoResponse {
+    if req.proposal_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "message": "proposal_id is required"})),
+        );
+    }
+
+    let proposal_store = DiskProposalStore::default_state_dir();
+    let stored =
+        match proposal_store.require_fresh(&req.proposal_id, proposal_store::now_ms()).await {
+            Ok(stored) => stored,
+            Err(err) => {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(serde_json::json!({
+                        "ok": false,
+                        "message": format!("failed to load fresh proposal: {err}"),
+                    })),
+                );
+            }
+        };
+
+    let compiled_strategy_id = stored
+        .proposal
+        .raw_compiled_strategy
+        .get("compiledStrategyId")
+        .and_then(serde_json::Value::as_str)
+        .map(|value| value.to_string());
+
+    if let Some(ref id) = compiled_strategy_id {
+        state
+            .compiled
+            .lock()
+            .await
+            .insert(id.clone(), stored.proposal.raw_compiled_strategy.clone());
+    }
+
+    let mut warnings = stored.proposal.warnings.clone();
+    warnings.push(
+        "Frontend must build and sign the Sui transaction with the connected wallet. Backend validates and caches the compiled proposal but does not sign."
+            .to_string(),
+    );
+
+    let response = IntentExecutePlanResponse {
+        proposal_id: stored.proposal_id,
+        user_address: req.user_address.or(stored.proposal.user_address.clone()),
+        compiled_strategy_id,
+        raw_compiled_strategy: stored.proposal.raw_compiled_strategy.clone(),
+        proposal: stored.proposal,
+        warnings,
+    };
+
+    (
+        StatusCode::OK,
+        Json(
+            serde_json::to_value(response)
+                .unwrap_or_else(|_| serde_json::json!({"ok": false, "error": "failed to serialize intent execute-plan response"})),
+        ),
+    )
+}
+
+async fn audit_intent_execution(Json(req): Json<AuditIntentExecutionRequest>) -> impl IntoResponse {
+    if req.proposal_id.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "message": "proposal_id is required"})),
+        );
+    }
+    if req.tx_digest.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({"ok": false, "message": "tx_digest is required"})),
+        );
+    }
+
+    let proposal_store = DiskProposalStore::default_state_dir();
+    let stored = match proposal_store.load(&req.proposal_id).await {
+        Ok(Some(stored)) => stored,
+        Ok(None) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "message": format!("proposal not found: {}", req.proposal_id),
+                })),
+            );
+        }
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "message": format!("failed to load proposal: {err}"),
+                })),
+            );
+        }
+    };
+
+    let raw_execution_result = req.execution_result.unwrap_or_else(|| {
+        serde_json::json!({
+            "digest": req.tx_digest,
+            "source": "frontend_wallet_execution"
+        })
+    });
+
+    let now = intent_audit_now_ms();
+    let mut warnings = stored.proposal.warnings.clone();
+    let inferred_status = infer_execution_status(&raw_execution_result);
+    let inferred_manager_id =
+        req.manager_id.or_else(|| infer_manager_id_from_execution(&raw_execution_result));
+
+    if inferred_manager_id.is_none() {
+        warnings.push(
+            "manager_id was not provided; canonical ledger merge may be skipped until chain sync or richer execution metadata is available."
+                .to_string(),
+        );
+    }
+
+    let audit = IntentExecutionAudit {
+        schema_version: 1,
+        audit_id: make_audit_id(&req.proposal_id, &req.tx_digest),
+        proposal_id: req.proposal_id.clone(),
+        user_address: req.user_address.or(stored.proposal.user_address.clone()),
+        manager_id: inferred_manager_id.clone(),
+        tx_digest: req.tx_digest.clone(),
+        status: inferred_status,
+        market_id: stored.proposal.selected_market.market_id.clone(),
+        oracle_id: stored.proposal.selected_market.oracle_id.clone(),
+        underlying: stored.proposal.selected_market.underlying.clone(),
+        strategy_template: format!("{:?}", stored.proposal.strategy_template),
+        backend_strategy_id: stored.proposal.backend_strategy_id.clone(),
+        total_premium: stored.proposal.total_premium,
+        max_loss: stored.proposal.max_loss,
+        max_payout: stored.proposal.max_payout,
+        created_at_ms: now,
+        updated_at_ms: now,
+        warnings: warnings.clone(),
+        raw_execution_result: raw_execution_result.clone(),
+        proposal: stored.proposal.clone(),
+    };
+
+    let audit_store = DiskIntentAuditStore::default_state_dir();
+    if let Err(err) = audit_store.save(&audit).await {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": format!("failed to persist intent audit: {err}"),
+            })),
+        );
+    }
+
+    let mut position_ids = Vec::new();
+    let position_sync_status = match audit_open_execution(OpenExecutionAuditInput {
+        source: OpenExecutionAuditSource::NormalModeIntent,
+        proposal_id: Some(audit.proposal_id.clone()),
+        user_address: audit.user_address.clone(),
+        manager_id: audit.manager_id.clone(),
+        tx_digest: audit.tx_digest.clone(),
+        execution_result: audit.raw_execution_result.clone(),
+        raw_compiled_strategy: audit.proposal.raw_compiled_strategy.clone(),
+        intent_proposal: Some(audit.proposal.clone()),
+    })
+    .await
+    {
+        Ok(outcome) => {
+            warnings.extend(outcome.warnings.clone());
+            position_ids = outcome.position_ids;
+            outcome.ledger_sync_status
+        }
+        Err(err) => {
+            warnings.push(format!("intent audit saved, but canonical open audit failed: {err}"));
+            "intent_audit_saved_open_audit_failed".to_string()
+        }
+    };
+
+    let response = AuditIntentExecutionResponse {
+        ok: true,
+        audit,
+        position_sync_status,
+        position_ids,
+        warnings,
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(response).unwrap_or_else(
+            |_| serde_json::json!({"ok": false, "error": "failed to serialize intent audit response"}),
+        )),
+    )
 }
 
 async fn get_intent_audit_by_proposal(Path(proposal_id): Path<String>) -> impl IntoResponse {
