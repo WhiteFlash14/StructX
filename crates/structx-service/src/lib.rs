@@ -5,6 +5,22 @@ pub mod market_catalog;
 pub mod market_refresh;
 pub mod market_store;
 
+use std::io;
+use std::path::PathBuf;
+use std::str::FromStr;
+use std::time::Duration as StdDuration;
+
+use chrono::Duration;
+use deepbook_client::{
+    FreshnessConfig, ObjectOwnerKind, SuiObjectInfo, SuiRpcClient, DUSDC_DECIMALS,
+    PREDICT_OBJECT_ID, SUI_CLOCK_OBJECT_ID,
+};
+use structx_core::{
+    build_manager_balance_tx_kind, build_redeem_tx_kind, DisplayPrice, ManagerPositionRead,
+    MintObjectRefs, QuoteAssetDisplay,
+};
+use sui_sdk_types::Address;
+
 pub use intent::{
     Direction, ExpiryPreferenceOverride, IntentConfidence, IntentPlan, RangeIntent, RiskStyle,
     StrategyTemplateId, UserIntentRequest,
@@ -21,3 +37,1057 @@ pub use market_refresh::{
     CatalogStatus,
 };
 pub use market_store::{DiskMarketStore, MarketStore};
+
+pub struct CompileStrategyJsonArgs {
+    pub server_url: String,
+    pub predict_id: String,
+    pub rpc_url: String,
+    pub owner: String,
+    pub strategy: String,
+    pub budget_dusdc: String,
+    pub style: String,
+    pub expiry_preference: String,
+    pub slippage_bps: u16,
+    pub bucket_step: DisplayPrice,
+    pub custom_k1_price: Option<DisplayPrice>,
+    pub custom_k2_price: Option<DisplayPrice>,
+    pub custom_k3_price: Option<DisplayPrice>,
+    pub custom_k4_price: Option<DisplayPrice>,
+    pub levels_each_side: u32,
+    pub max_quote_market_attempts: usize,
+    pub portfolio_exposure_dusdc: f64,
+    pub over_hedge_cap_bps: u16,
+    pub convex_gamma_bps: u16,
+    pub dead_zone_bps: u16,
+    pub moonshot_range_weight_bps: u16,
+    pub moonshot_tail_gamma_bps: u16,
+    pub downside_range_weight_bps: u16,
+    pub downside_tail_gamma_bps: u16,
+    pub upside_near_range_weight_bps: u16,
+    pub upside_upper_range_weight_bps: u16,
+    pub upside_tail_gamma_bps: u16,
+    pub downside_near_range_weight_bps: u16,
+    pub downside_lower_range_weight_bps: u16,
+    pub downside_step_tail_gamma_bps: u16,
+    pub condor_center_weight_bps: u16,
+    pub barrier_side: String,
+    pub barrier_near_range_weight_bps: u16,
+    pub barrier_tail_gamma_bps: u16,
+    pub exclude_oracle_ids: Vec<String>,
+}
+
+pub fn build_freshness(
+    max_price_age_secs: i64,
+    max_svi_age_secs: i64,
+    min_time_to_expiry_secs: i64,
+    strict_freshness: bool,
+) -> FreshnessConfig {
+    FreshnessConfig {
+        max_price_age: Duration::seconds(max_price_age_secs),
+        max_svi_age: Duration::seconds(max_svi_age_secs),
+        min_time_to_expiry: Duration::seconds(min_time_to_expiry_secs),
+        require_price_timestamp: strict_freshness,
+        require_svi_timestamp: strict_freshness,
+    }
+}
+
+pub struct DevinspectRedeemBreakoutJsonArgs {
+    pub rpc_url: String,
+    pub manager_id: String,
+    pub sender: String,
+    pub from_execution_json: PathBuf,
+    pub auto_size_down: bool,
+    pub write_execute_script: bool,
+    pub allow_zero_payout_script: bool,
+}
+
+fn validate_sui_address_arg(name: &str, value: &str) -> Result<(), Box<dyn std::error::Error>> {
+    let value = value.trim();
+    if value.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`--{name}` is empty. Make sure the variable is set."),
+        )
+        .into());
+    }
+    Address::from_str(value).map_err(|err| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("`--{name}` is not a valid Sui address `{value}`: {err}"),
+        )
+    })?;
+    Ok(())
+}
+
+pub async fn manager_balance_json_value(
+    rpc_url: String,
+    manager_id: String,
+    sender: String,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    validate_sui_address_arg("manager-id", &manager_id)?;
+    validate_sui_address_arg("sender", &sender)?;
+
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+    let manager = position_service::resolve_sui_object(&rpc, &manager_id).await?;
+    position_service::validate_predict_manager_object(&manager)?;
+
+    let tx_kind = build_manager_balance_tx_kind(&manager, &sender)?;
+    let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+    let balance_raw = read_manager_balance_from_response(&response)?;
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "balanceRaw": balance_raw.to_string(),
+        "balanceDisplay": asset.format_amount(balance_raw),
+        "stdout": format!(
+            "Built manager-balance TransactionKind\nsender: {}\ntx_kind_b64_len: {}\n\nmanager balance raw: {}\nmanager balance: {}\n",
+            tx_kind.sender,
+            tx_kind.tx_kind_b64.len(),
+            balance_raw,
+            asset.format_amount(balance_raw),
+        )
+    }))
+}
+
+fn read_manager_balance_from_response(
+    response: &serde_json::Value,
+) -> Result<u64, Box<dyn std::error::Error>> {
+    let status = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if status != "success" {
+        let status_error = response
+            .get("effects")
+            .and_then(|effects| effects.get("status"))
+            .and_then(|status| status.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown error");
+        return Err(io::Error::other(format!("devInspect failed: {status_error}")).into());
+    }
+    let results =
+        response.get("results").and_then(serde_json::Value::as_array).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing manager balance results")
+        })?;
+    let return_values = results
+        .first()
+        .and_then(|result| result.get("returnValues"))
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing manager balance returnValues")
+        })?;
+    if return_values.len() != 1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "expected 1 manager balance return",
+        )
+        .into());
+    }
+    position_service::decode_devinspect_u64(&return_values[0])
+}
+
+pub async fn devinspect_redeem_breakout_json_value(
+    args: DevinspectRedeemBreakoutJsonArgs,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    validate_sui_address_arg("manager-id", &args.manager_id)?;
+    validate_sui_address_arg("sender", &args.sender)?;
+
+    let base_reads = position_service::load_position_reads_from_execution_json(
+        args.from_execution_json.as_path(),
+    )?;
+
+    if base_reads.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no PositionMinted or RangeMinted events found",
+        )
+        .into());
+    }
+
+    let oracle_id = first_oracle_id(&base_reads)?;
+    let rpc = SuiRpcClient::new(args.rpc_url.clone(), StdDuration::from_secs(20))?;
+    let predict = position_service::resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let manager = position_service::resolve_sui_object(&rpc, &args.manager_id).await?;
+    let oracle = position_service::resolve_sui_object(&rpc, &oracle_id).await?;
+    let clock = position_service::resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
+
+    position_service::validate_predict_manager_object(&manager)?;
+    validate_quote_object_refs_quiet(&predict, &oracle, &clock)?;
+
+    let candidates = redeem_bps_candidates(10_000, args.auto_size_down);
+    let mut failures = Vec::new();
+
+    for bps in candidates {
+        let reads = scale_position_reads(&base_reads, bps)?;
+        let tx_kind = build_redeem_tx_kind(
+            &reads,
+            MintObjectRefs { predict: &predict, manager: &manager, oracle: &oracle, clock: &clock },
+            &args.sender,
+        )?;
+
+        let response =
+            rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+
+        match redeem_preview_from_response(&response) {
+            Ok((total_payout_raw, events)) => {
+                let asset =
+                    QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+                let mut warnings = Vec::new();
+                if args.write_execute_script {
+                    warnings.push(
+                        "write_execute_script was requested, but direct API preview mode does not emit helper scripts.".to_string(),
+                    );
+                }
+                if args.allow_zero_payout_script {
+                    warnings.push(
+                        "allow_zero_payout_script is ignored unless script generation is enabled."
+                            .to_string(),
+                    );
+                }
+
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "managerId": args.manager_id,
+                    "oracleId": oracle_id,
+                    "fromExecutionJson": args.from_execution_json.to_string_lossy(),
+                    "requestedRedeemBps": 10_000,
+                    "selectedRedeemBps": bps,
+                    "autoSizeDown": args.auto_size_down,
+                    "legs": serialize_manager_position_reads(&reads),
+                    "totalPayoutRaw": total_payout_raw.to_string(),
+                    "totalPayoutDisplay": asset.format_amount(total_payout_raw),
+                    "eventCount": events.len(),
+                    "events": events,
+                    "failures": failures,
+                    "warnings": warnings,
+                }));
+            }
+            Err(err) => failures.push(serde_json::json!({
+                "redeemBps": bps,
+                "reason": err.to_string(),
+            })),
+        }
+    }
+
+    Err(io::Error::other(format!(
+        "all redeem preview attempts failed: {}",
+        serde_json::to_string(&failures)?
+    ))
+    .into())
+}
+
+fn validate_quote_object_refs_quiet(
+    predict: &SuiObjectInfo,
+    oracle: &SuiObjectInfo,
+    clock: &SuiObjectInfo,
+) -> Result<(), Box<dyn std::error::Error>> {
+    for (role, object) in [("predict", predict), ("oracle", oracle), ("clock", clock)] {
+        if object.owner_kind != ObjectOwnerKind::Shared {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{role} object is not shared: owner={}", object.owner_kind),
+            )
+            .into());
+        }
+        if object.initial_shared_version.is_none() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("{role} object is missing initial_shared_version"),
+            )
+            .into());
+        }
+    }
+    Ok(())
+}
+
+fn redeem_bps_candidates(requested: u16, auto_size_down: bool) -> Vec<u16> {
+    if !auto_size_down {
+        return vec![requested];
+    }
+    let ladder = [10_000u16, 7_500, 5_000, 2_500, 1_000, 500, 250, 100, 50, 10, 1];
+    let mut candidates = vec![requested];
+    for bps in ladder {
+        if bps <= requested && !candidates.contains(&bps) {
+            candidates.push(bps);
+        }
+    }
+    candidates
+}
+
+fn scale_position_reads(
+    reads: &[ManagerPositionRead],
+    bps: u16,
+) -> Result<Vec<ManagerPositionRead>, Box<dyn std::error::Error>> {
+    if bps == 0 || bps > 10_000 {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidInput, "redeem bps must be in 1..=10000").into()
+        );
+    }
+    reads
+        .iter()
+        .map(|read| match read {
+            ManagerPositionRead::Binary {
+                oracle_id,
+                expiry_ms,
+                strike_raw,
+                is_up,
+                expected_quantity,
+            } => Ok(ManagerPositionRead::Binary {
+                oracle_id: oracle_id.clone(),
+                expiry_ms: *expiry_ms,
+                strike_raw: *strike_raw,
+                is_up: *is_up,
+                expected_quantity: scale_quantity_bps(*expected_quantity, bps),
+            }),
+            ManagerPositionRead::Range {
+                oracle_id,
+                expiry_ms,
+                lower_raw,
+                upper_raw,
+                expected_quantity,
+            } => Ok(ManagerPositionRead::Range {
+                oracle_id: oracle_id.clone(),
+                expiry_ms: *expiry_ms,
+                lower_raw: *lower_raw,
+                upper_raw: *upper_raw,
+                expected_quantity: scale_quantity_bps(*expected_quantity, bps),
+            }),
+        })
+        .collect()
+}
+
+fn scale_quantity_bps(quantity: u64, bps: u16) -> u64 {
+    let scaled = quantity.saturating_mul(bps as u64) / 10_000;
+    scaled.max(1).min(quantity)
+}
+
+fn serialize_manager_position_reads(reads: &[ManagerPositionRead]) -> Vec<serde_json::Value> {
+    reads
+        .iter()
+        .map(|read| match read {
+            ManagerPositionRead::Binary {
+                oracle_id,
+                expiry_ms,
+                strike_raw,
+                is_up,
+                expected_quantity,
+            } => serde_json::json!({
+                "kind": "binary",
+                "oracleId": oracle_id,
+                "expiryMs": expiry_ms,
+                "strikeRaw": strike_raw.to_string(),
+                "strike": position_service::format_raw_price_e9(*strike_raw),
+                "direction": if *is_up { "up" } else { "down" },
+                "quantity": expected_quantity.to_string(),
+            }),
+            ManagerPositionRead::Range {
+                oracle_id,
+                expiry_ms,
+                lower_raw,
+                upper_raw,
+                expected_quantity,
+            } => serde_json::json!({
+                "kind": "range",
+                "oracleId": oracle_id,
+                "expiryMs": expiry_ms,
+                "lowerRaw": lower_raw.to_string(),
+                "upperRaw": upper_raw.to_string(),
+                "lower": position_service::format_raw_price_e9(*lower_raw),
+                "upper": position_service::format_raw_price_e9(*upper_raw),
+                "quantity": expected_quantity.to_string(),
+            }),
+        })
+        .collect()
+}
+
+fn first_oracle_id(reads: &[ManagerPositionRead]) -> Result<String, Box<dyn std::error::Error>> {
+    let first = reads
+        .first()
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "empty position reads"))?;
+    let oracle_id = match first {
+        ManagerPositionRead::Binary { oracle_id, .. }
+        | ManagerPositionRead::Range { oracle_id, .. } => oracle_id,
+    };
+    for read in reads {
+        let current = match read {
+            ManagerPositionRead::Binary { oracle_id, .. }
+            | ManagerPositionRead::Range { oracle_id, .. } => oracle_id,
+        };
+        if current != oracle_id {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "execution JSON contains multiple oracle IDs; split redemption per oracle",
+            )
+            .into());
+        }
+    }
+    Ok(oracle_id.clone())
+}
+
+fn redeem_preview_from_response(
+    response: &serde_json::Value,
+) -> Result<(u64, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
+    let status = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+    let events =
+        response.get("events").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+    let mut total_payout_raw = 0u64;
+    let mut items = Vec::new();
+
+    for event in events {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+        let parsed = event.get("parsedJson").unwrap_or(&serde_json::Value::Null);
+        if event_type.ends_with("::predict::PositionRedeemed") {
+            let payout = position_service::json_required_u64(parsed, "payout")?;
+            total_payout_raw = total_payout_raw
+                .checked_add(payout)
+                .ok_or_else(|| io::Error::other("total payout overflow"))?;
+            items.push(serde_json::json!({
+                "event": "PositionRedeemed",
+                "direction": if position_service::json_required_bool(parsed, "is_up")? { "up" } else { "down" },
+                "strike": position_service::format_raw_price_e9(position_service::json_required_u64(parsed, "strike")?),
+                "upper": serde_json::Value::Null,
+                "quantity": position_service::json_required_u64(parsed, "quantity")?.to_string(),
+                "payoutRaw": payout.to_string(),
+                "bidPrice": position_service::json_required_string(parsed, "bid_price")?,
+                "isSettled": position_service::json_required_bool(parsed, "is_settled")?,
+            }));
+        } else if event_type.ends_with("::predict::RangeRedeemed") {
+            let payout = position_service::json_required_u64(parsed, "payout")?;
+            total_payout_raw = total_payout_raw
+                .checked_add(payout)
+                .ok_or_else(|| io::Error::other("total payout overflow"))?;
+            items.push(serde_json::json!({
+                "event": "RangeRedeemed",
+                "direction": serde_json::Value::Null,
+                "strike": position_service::format_raw_price_e9(position_service::json_required_u64(parsed, "lower_strike")?),
+                "upper": position_service::format_raw_price_e9(position_service::json_required_u64(parsed, "higher_strike")?),
+                "quantity": position_service::json_required_u64(parsed, "quantity")?.to_string(),
+                "payoutRaw": payout.to_string(),
+                "bidPrice": position_service::json_required_string(parsed, "bid_price")?,
+                "isSettled": position_service::json_required_bool(parsed, "is_settled")?,
+            }));
+        }
+    }
+    Ok((total_payout_raw, items))
+}
+
+fn devinspect_failure_summary(response: &serde_json::Value) -> String {
+    let status_error = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("error"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown error");
+    format!("devInspect failed: {status_error}")
+}
+
+pub mod position_service {
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+    use std::time::Duration as StdDuration;
+
+    use deepbook_client::{
+        ObjectOwnerKind, SuiObjectInfo, SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL,
+        PREDICT_MANAGER_TYPE,
+    };
+    use structx_core::{build_manager_positions_tx_kind, ManagerPositionRead, QuoteTxKind};
+
+    pub async fn manager_positions_json_value(
+        rpc_url: Option<String>,
+        manager_id: &str,
+        from_execution_json: &Path,
+        sender: &str,
+        expect_exact: bool,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let reads = load_position_reads_from_execution_json(from_execution_json)?;
+
+        if reads.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no PositionMinted or RangeMinted events found",
+            )
+            .into());
+        }
+
+        let rpc = SuiRpcClient::new(
+            rpc_url.unwrap_or_else(|| DEFAULT_SUI_TESTNET_RPC_URL.to_string()),
+            StdDuration::from_secs(20),
+        )?;
+
+        let manager = resolve_sui_object(&rpc, manager_id).await?;
+        validate_predict_manager_object(&manager)?;
+
+        let tx_kind = build_manager_positions_tx_kind(&reads, &manager, sender)?;
+        let response =
+            rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+
+        summarize_manager_positions_response(&reads, &tx_kind, &response, expect_exact)
+    }
+
+    pub async fn demo_status_json_value(
+        rpc_url: Option<String>,
+        manager_id: &str,
+        sender: &str,
+        from_execution_json: &Path,
+        expect_exact: bool,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let execution_json: serde_json::Value =
+            serde_json::from_slice(&fs::read(from_execution_json)?)?;
+
+        let digest =
+            execution_json.get("digest").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+
+        let execution_status = execution_json
+            .get("effects")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|effects| effects.get("status"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|status| status.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        if execution_status != "success" {
+            return Err(io::Error::other("execution JSON status is not success").into());
+        }
+
+        let manager_positions = manager_positions_json_value(
+            rpc_url.clone(),
+            manager_id,
+            from_execution_json,
+            sender,
+            expect_exact,
+        )
+        .await?;
+
+        let manager_balance = super::manager_balance_json_value(
+            rpc_url.unwrap_or_else(|| DEFAULT_SUI_TESTNET_RPC_URL.to_string()),
+            manager_id.to_string(),
+            sender.to_string(),
+        )
+        .await?;
+
+        let verification_status = manager_positions
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        let ok = verification_status == "ok" || verification_status == "partial";
+
+        Ok(serde_json::json!({
+            "ok": ok,
+            "digest": digest,
+            "executionStatus": execution_status,
+            "managerBalanceRaw": manager_balance.get("balanceRaw").cloned().unwrap_or(serde_json::Value::Null),
+            "managerBalanceDisplay": manager_balance.get("balanceDisplay").cloned().unwrap_or(serde_json::Value::Null),
+            "positionVerification": manager_positions,
+            "warnings": if verification_status == "partial" {
+                vec!["Position verification is partial. Range legs verified. Binary manager-key verification is a known issue under investigation."]
+            } else {
+                Vec::<&str>::new()
+            },
+        }))
+    }
+
+    fn summarize_manager_positions_response(
+        reads: &[ManagerPositionRead],
+        tx_kind: &QuoteTxKind,
+        response: &serde_json::Value,
+        expect_exact: bool,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let status = response
+            .get("effects")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|effects| effects.get("status"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|status| status.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        if status != "success" {
+            return Err(io::Error::other(devinspect_failure_summary(response)).into());
+        }
+
+        let results =
+            response.get("results").and_then(serde_json::Value::as_array).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing devInspect results")
+            })?;
+
+        let mut items = Vec::new();
+        let mut ok_count = 0usize;
+        let mut bad_count = 0usize;
+
+        for (idx, read) in reads.iter().enumerate() {
+            let command_idx = tx_kind.quote_result_command_indices.get(idx).ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, "missing command index")
+            })?;
+
+            let result = results.get(*command_idx).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing result for command {command_idx}"),
+                )
+            })?;
+
+            let return_values = result
+                .get("returnValues")
+                .and_then(serde_json::Value::as_array)
+                .ok_or_else(|| {
+                    io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("missing returnValues for command {command_idx}"),
+                    )
+                })?;
+
+            if return_values.len() != 1 {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("expected 1 position return, got {}", return_values.len()),
+                )
+                .into());
+            }
+
+            let actual_quantity = decode_devinspect_u64(&return_values[0])?;
+            let expected_quantity = position_expected_quantity(read);
+            let accepted = if expect_exact {
+                actual_quantity == expected_quantity
+            } else {
+                actual_quantity >= expected_quantity
+            };
+
+            if accepted {
+                ok_count += 1;
+            } else {
+                bad_count += 1;
+            }
+
+            match read {
+                ManagerPositionRead::Binary { strike_raw, is_up, .. } => {
+                    items.push(serde_json::json!({
+                        "index": idx,
+                        "kind": "binary",
+                        "direction": if *is_up { "up" } else { "down" },
+                        "strike": format_raw_price_e9(*strike_raw),
+                        "upper": serde_json::Value::Null,
+                        "mintedQuantity": expected_quantity.to_string(),
+                        "managerQuantity": actual_quantity.to_string(),
+                        "check": if accepted { "ok" } else { "mismatch" }
+                    }))
+                }
+                ManagerPositionRead::Range { lower_raw, upper_raw, .. } => {
+                    items.push(serde_json::json!({
+                        "index": idx,
+                        "kind": "range",
+                        "direction": serde_json::Value::Null,
+                        "strike": format_raw_price_e9(*lower_raw),
+                        "upper": format_raw_price_e9(*upper_raw),
+                        "mintedQuantity": expected_quantity.to_string(),
+                        "managerQuantity": actual_quantity.to_string(),
+                        "check": if accepted { "ok" } else { "mismatch" }
+                    }))
+                }
+            }
+        }
+
+        let summary_status = if bad_count == 0 { "ok" } else { "partial" };
+
+        Ok(serde_json::json!({
+            "status": summary_status,
+            "verifiedCount": ok_count,
+            "mismatchCount": bad_count,
+            "mode": if expect_exact { "exact" } else { "actual >= minted" },
+            "items": items,
+        }))
+    }
+
+    pub fn load_position_reads_from_execution_json(
+        path: &Path,
+    ) -> Result<Vec<ManagerPositionRead>, Box<dyn std::error::Error>> {
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(path)?)?;
+
+        let events = value
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing events array"))?;
+
+        let mut reads = Vec::new();
+
+        for event in events {
+            let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+
+            let parsed = event.get("parsedJson").unwrap_or(&serde_json::Value::Null);
+
+            if event_type.ends_with("::predict::PositionMinted") {
+                reads.push(ManagerPositionRead::Binary {
+                    oracle_id: json_required_string(parsed, "oracle_id")?,
+                    expiry_ms: json_required_u64(parsed, "expiry")?,
+                    strike_raw: json_required_u64(parsed, "strike")?,
+                    is_up: json_required_bool(parsed, "is_up")?,
+                    expected_quantity: json_required_u64(parsed, "quantity")?,
+                });
+            } else if event_type.ends_with("::predict::RangeMinted") {
+                reads.push(ManagerPositionRead::Range {
+                    oracle_id: json_required_string(parsed, "oracle_id")?,
+                    expiry_ms: json_required_u64(parsed, "expiry")?,
+                    lower_raw: json_required_u64(parsed, "lower_strike")?,
+                    upper_raw: json_required_u64(parsed, "higher_strike")?,
+                    expected_quantity: json_required_u64(parsed, "quantity")?,
+                });
+            }
+        }
+
+        Ok(reads)
+    }
+
+    pub(crate) async fn resolve_sui_object(
+        rpc: &SuiRpcClient,
+        object_id: &str,
+    ) -> Result<SuiObjectInfo, Box<dyn std::error::Error>> {
+        let value = rpc.get_object(object_id).await?;
+        Ok(SuiObjectInfo::from_get_object_result(object_id, value)?)
+    }
+
+    pub(crate) fn validate_predict_manager_object(
+        manager: &SuiObjectInfo,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        match manager.owner_kind {
+            ObjectOwnerKind::AddressOwner | ObjectOwnerKind::Shared => {}
+            _ => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!(
+                        "manager object has unsupported ownership kind: owner={}",
+                        manager.owner_kind
+                    ),
+                )
+                .into())
+            }
+        }
+
+        let object_type = manager
+            .object_type
+            .as_deref()
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "manager missing type"))?;
+
+        if !object_type.contains(PREDICT_MANAGER_TYPE) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "manager type mismatch: expected substring `{PREDICT_MANAGER_TYPE}`, got `{object_type}`"
+                ),
+            )
+            .into());
+        }
+
+        Ok(())
+    }
+
+    fn position_expected_quantity(read: &ManagerPositionRead) -> u64 {
+        match read {
+            ManagerPositionRead::Binary { expected_quantity, .. }
+            | ManagerPositionRead::Range { expected_quantity, .. } => *expected_quantity,
+        }
+    }
+
+    pub(crate) fn decode_devinspect_u64(
+        value: &serde_json::Value,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let arr = value.as_array().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("return value is not array: {value}"),
+            )
+        })?;
+
+        let bytes_value = arr.first().ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "return value missing bytes")
+        })?;
+
+        let bytes_array = bytes_value.as_array().ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("return bytes are not array: {bytes_value}"),
+            )
+        })?;
+
+        if bytes_array.len() < 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("u64 return needs at least 8 bytes, got {}", bytes_array.len()),
+            )
+            .into());
+        }
+
+        let mut raw = 0u128;
+
+        for (idx, byte_value) in bytes_array.iter().take(8).enumerate() {
+            let byte = byte_value.as_u64().ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("invalid byte value: {byte_value}"),
+                )
+            })?;
+
+            let byte = u8::try_from(byte)?;
+            raw |= (byte as u128) << (idx * 8);
+        }
+
+        Ok(raw as u64)
+    }
+
+    fn devinspect_failure_summary(response: &serde_json::Value) -> String {
+        let status_error = response
+            .get("effects")
+            .and_then(|effects| effects.get("status"))
+            .and_then(|status| status.get("error"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown error");
+
+        format!("devInspect failed: {status_error}")
+    }
+
+    pub(crate) fn json_required_string(
+        value: &serde_json::Value,
+        key: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        value.get(key).and_then(serde_json::Value::as_str).map(ToString::to_string).ok_or_else(
+            || {
+                io::Error::new(io::ErrorKind::InvalidData, format!("missing string field `{key}`"))
+                    .into()
+            },
+        )
+    }
+
+    pub(crate) fn json_required_u64(
+        value: &serde_json::Value,
+        key: &str,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let item = value.get(key).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("missing u64 field `{key}`"))
+        })?;
+
+        match item {
+            serde_json::Value::String(s) => Ok(s.parse::<u64>()?),
+            serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("invalid u64 field `{key}`"))
+                    .into()
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid u64 field `{key}`"),
+            )
+            .into()),
+        }
+    }
+
+    pub(crate) fn json_required_bool(
+        value: &serde_json::Value,
+        key: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let item = value.get(key).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("missing bool field `{key}`"))
+        })?;
+
+        match item {
+            serde_json::Value::Bool(value) => Ok(*value),
+            serde_json::Value::String(s) if s == "true" => Ok(true),
+            serde_json::Value::String(s) if s == "false" => Ok(false),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid bool field `{key}`"),
+            )
+            .into()),
+        }
+    }
+
+    pub(crate) fn format_raw_price_e9(raw: u64) -> String {
+        let whole = raw / 1_000_000_000;
+        let frac = raw % 1_000_000_000;
+
+        if frac == 0 {
+            return whole.to_string();
+        }
+
+        let mut frac_string = format!("{frac:09}");
+        while frac_string.ends_with('0') {
+            frac_string.pop();
+        }
+
+        format!("{whole}.{frac_string}")
+    }
+}
+
+pub mod audit_service {
+    use std::fs;
+    use std::io;
+    use std::path::Path;
+
+    use deepbook_client::DUSDC_DECIMALS;
+    use structx_core::QuoteAssetDisplay;
+
+    pub fn audit_execution_json_value(
+        from_execution_json: &Path,
+    ) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+        let value: serde_json::Value = serde_json::from_slice(&fs::read(from_execution_json)?)?;
+
+        let status = value
+            .get("effects")
+            .and_then(serde_json::Value::as_object)
+            .and_then(|effects| effects.get("status"))
+            .and_then(serde_json::Value::as_object)
+            .and_then(|status| status.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        let digest = value
+            .get("digest")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown / recovered artifact");
+
+        if status != "success" {
+            return Err(io::Error::other("execution was not successful").into());
+        }
+
+        let events = value
+            .get("events")
+            .and_then(serde_json::Value::as_array)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing events array"))?;
+
+        let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+        let mut total_cost_raw = 0u64;
+        let mut minted_legs = Vec::new();
+
+        for event in events {
+            let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+            let parsed = event.get("parsedJson").unwrap_or(&serde_json::Value::Null);
+
+            if event_type.ends_with("::predict::PositionMinted") {
+                let cost = json_required_u64(parsed, "cost")?;
+                total_cost_raw = total_cost_raw
+                    .checked_add(cost)
+                    .ok_or_else(|| io::Error::other("total cost overflow"))?;
+                minted_legs.push(serde_json::json!({
+                    "kind": "binary",
+                    "direction": if json_required_bool(parsed, "is_up")? { "up" } else { "down" },
+                    "strike": format_raw_price_e9(json_required_u64(parsed, "strike")?),
+                    "upper": serde_json::Value::Null,
+                    "quantity": json_required_u64(parsed, "quantity")?,
+                    "costRaw": cost.to_string(),
+                    "costDisplay": asset.format_amount(cost),
+                    "askPrice": json_required_string(parsed, "ask_price")?,
+                }));
+            } else if event_type.ends_with("::predict::RangeMinted") {
+                let cost = json_required_u64(parsed, "cost")?;
+                total_cost_raw = total_cost_raw
+                    .checked_add(cost)
+                    .ok_or_else(|| io::Error::other("total cost overflow"))?;
+                minted_legs.push(serde_json::json!({
+                    "kind": "range",
+                    "direction": serde_json::Value::Null,
+                    "strike": format_raw_price_e9(json_required_u64(parsed, "lower_strike")?),
+                    "upper": format_raw_price_e9(json_required_u64(parsed, "higher_strike")?),
+                    "quantity": json_required_u64(parsed, "quantity")?,
+                    "costRaw": cost.to_string(),
+                    "costDisplay": asset.format_amount(cost),
+                    "askPrice": json_required_string(parsed, "ask_price")?,
+                }));
+            }
+        }
+
+        if minted_legs.is_empty() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "no PositionMinted or RangeMinted events found",
+            )
+            .into());
+        }
+
+        Ok(serde_json::json!({
+            "ok": true,
+            "source": from_execution_json.to_string_lossy(),
+            "digest": digest,
+            "status": status,
+            "mintedCount": minted_legs.len(),
+            "totalCostRaw": total_cost_raw.to_string(),
+            "totalCostDisplay": asset.format_amount(total_cost_raw),
+            "mintedLegs": minted_legs,
+        }))
+    }
+
+    fn json_required_string(
+        value: &serde_json::Value,
+        key: &str,
+    ) -> Result<String, Box<dyn std::error::Error>> {
+        value.get(key).and_then(serde_json::Value::as_str).map(ToString::to_string).ok_or_else(
+            || {
+                io::Error::new(io::ErrorKind::InvalidData, format!("missing string field `{key}`"))
+                    .into()
+            },
+        )
+    }
+
+    fn json_required_u64(
+        value: &serde_json::Value,
+        key: &str,
+    ) -> Result<u64, Box<dyn std::error::Error>> {
+        let item = value.get(key).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("missing u64 field `{key}`"))
+        })?;
+        match item {
+            serde_json::Value::String(s) => Ok(s.parse::<u64>()?),
+            serde_json::Value::Number(n) => n.as_u64().ok_or_else(|| {
+                io::Error::new(io::ErrorKind::InvalidData, format!("invalid u64 field `{key}`"))
+                    .into()
+            }),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid u64 field `{key}`"),
+            )
+            .into()),
+        }
+    }
+
+    fn json_required_bool(
+        value: &serde_json::Value,
+        key: &str,
+    ) -> Result<bool, Box<dyn std::error::Error>> {
+        let item = value.get(key).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, format!("missing bool field `{key}`"))
+        })?;
+        match item {
+            serde_json::Value::Bool(value) => Ok(*value),
+            serde_json::Value::String(s) if s == "true" => Ok(true),
+            serde_json::Value::String(s) if s == "false" => Ok(false),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("invalid bool field `{key}`"),
+            )
+            .into()),
+        }
+    }
+
+    fn format_raw_price_e9(raw: u64) -> String {
+        let whole = raw / 1_000_000_000;
+        let frac = raw % 1_000_000_000;
+        if frac == 0 {
+            return whole.to_string();
+        }
+        let mut frac_string = format!("{frac:09}");
+        while frac_string.ends_with('0') {
+            frac_string.pop();
+        }
+        format!("{whole}.{frac_string}")
+    }
+}
