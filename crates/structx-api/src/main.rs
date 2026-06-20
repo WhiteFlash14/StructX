@@ -4,6 +4,10 @@ mod intent_audit;
 mod intent_positions;
 #[allow(dead_code)]
 mod proposal_store;
+#[allow(dead_code)]
+mod position_ledger;
+#[allow(dead_code)]
+mod storage;
 
 use axum::{
     extract::{Path, Query, State},
