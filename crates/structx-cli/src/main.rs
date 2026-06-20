@@ -161,6 +161,18 @@ pub struct FindMintableBreakoutJsonArgs {
     pub max_quote_market_attempts: usize,
     pub max_budget_steps: usize,
 }
+
+pub struct DevinspectMintBreakoutJsonArgs {
+    pub server_url: String,
+    pub predict_id: String,
+    pub rpc_url: String,
+    pub manager_id: String,
+    pub sender: String,
+    pub max_total_mint_cost_raw: u64,
+    pub slippage_bps: u16,
+    pub max_quote_market_attempts: usize,
+    pub write_execute_script: bool,
+}
 struct CheckAnyMarketMintableArgs {
     server_url: String,
     predict_id: String,
@@ -551,6 +563,19 @@ enum Command {
 
         #[arg(long, default_value = "/tmp/structx_execute_mint_breakout_plan.json")]
         execute_plan_json_path: PathBuf,
+    },
+    ListMarketsJson {
+        #[arg(long, default_value_t = 60)]
+        max_price_age_secs: i64,
+
+        #[arg(long, default_value_t = 60)]
+        max_svi_age_secs: i64,
+
+        #[arg(long, default_value_t = 300)]
+        min_time_to_expiry_secs: i64,
+
+        #[arg(long, default_value_t = false)]
+        strict_freshness: bool,
     },
     FindMintableBreakoutJson {
         #[arg(long)]
@@ -946,6 +971,21 @@ async fn main() -> std::process::ExitCode {
             })
             .await
         }
+        Command::ListMarketsJson {
+            max_price_age_secs,
+            max_svi_age_secs,
+            min_time_to_expiry_secs,
+            strict_freshness,
+        } => {
+            let freshness = build_freshness(
+                max_price_age_secs,
+                max_svi_age_secs,
+                min_time_to_expiry_secs,
+                strict_freshness,
+            );
+
+            list_markets_json_command(cli.server_url, cli.predict_id, freshness).await
+        }
         Command::FindMintableBreakoutJson {
             owner,
             manager_id,
@@ -1124,6 +1164,57 @@ async fn list_markets(
 
     Ok(())
 }
+
+async fn list_markets_json_command(
+    server_url: String,
+    predict_id: String,
+    freshness: FreshnessConfig,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let envelope = list_markets_json_value(server_url, predict_id, freshness).await?;
+    println!("{}", serde_json::to_string(&envelope)?);
+    Ok(())
+}
+
+pub async fn list_markets_json_value(
+    server_url: String,
+    predict_id: String,
+    freshness: FreshnessConfig,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let client = build_client(server_url, predict_id)?;
+    let markets_result = client.load_structx_markets(freshness).await;
+
+    Ok(match markets_result {
+        Ok(markets) => {
+            let usable = markets.iter().filter(|m| m.structx_status.is_usable()).count();
+
+            let warnings = markets
+                .iter()
+                .filter(|m| matches!(m.structx_status, StructxMarketStatus::UsableWithWarnings(_)))
+                .count();
+
+            serde_json::json!({
+                "ok": true,
+                "asset": "BTC",
+                "network": "sui:testnet",
+                "totalCount": markets.len(),
+                "usableCount": usable,
+                "warningsCount": warnings,
+                "markets": markets,
+            })
+        }
+        Err(err) => serde_json::json!({
+            "ok": false,
+            "asset": "BTC",
+            "network": "sui:testnet",
+            "totalCount": 0,
+            "usableCount": 0,
+            "warningsCount": 0,
+            "markets": [],
+            "error": err.to_string(),
+        }),
+    })
+}
+
 async fn select_market(
     server_url: String,
     predict_id: String,
@@ -5553,6 +5644,82 @@ async fn manager_balance_command(
 
     Ok(())
 }
+
+pub async fn manager_balance_json_value(
+    rpc_url: String,
+    manager_id: String,
+    sender: String,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    validate_sui_address_arg("manager-id", &manager_id)?;
+    validate_sui_address_arg("sender", &sender)?;
+
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+
+    let manager = resolve_sui_object(&rpc, &manager_id).await?;
+    validate_predict_manager_object(&manager)?;
+
+    let tx_kind = build_manager_balance_tx_kind(&manager, &sender)?;
+    let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+    let balance_raw = read_manager_balance_from_response(&response)?;
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+    Ok(serde_json::json!({
+        "ok": true,
+        "balanceRaw": balance_raw.to_string(),
+        "balanceDisplay": asset.format_amount(balance_raw),
+        "stdout": format!(
+            "Built manager-balance TransactionKind\nsender: {}\ntx_kind_b64_len: {}\n\nmanager balance raw: {}\nmanager balance: {}\n",
+            tx_kind.sender,
+            tx_kind.tx_kind_b64.len(),
+            balance_raw,
+            asset.format_amount(balance_raw),
+        )
+    }))
+}
+
+pub async fn devinspect_mint_breakout_json_value(
+    args: DevinspectMintBreakoutJsonArgs,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    validate_sui_address_arg("manager-id", &args.manager_id)?;
+    validate_sui_address_arg("sender", &args.sender)?;
+
+    let client = build_client(args.server_url.clone(), args.predict_id.clone())?;
+    let markets = load_markets(&client, build_freshness(60, 60, 300, false)).await?;
+    let candidates = select_candidate_markets(&markets, PriceScale::E9);
+
+    if candidates.is_empty() {
+        return Err(
+            io::Error::new(io::ErrorKind::InvalidData, "no quoteable market candidates").into()
+        );
+    }
+
+    let max_attempts = args.max_quote_market_attempts.min(candidates.len());
+    let mut failures = Vec::new();
+
+    for selected in candidates.into_iter().take(max_attempts) {
+        match devinspect_mint_for_selected_market_json(&args, &selected).await {
+            Ok(value) => {
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "attemptCount": failures.len() + 1,
+                    "failures": failures,
+                    "result": value,
+                }));
+            }
+            Err(err) => failures.push(serde_json::json!({
+                "oracleId": selected.oracle_id,
+                "expiry": selected.expiry.to_rfc3339(),
+                "reason": err.to_string(),
+            })),
+        }
+    }
+
+    Err(io::Error::other(format!(
+        "all mint attempts failed: {}",
+        serde_json::to_string(&failures)?
+    ))
+    .into())
+}
 fn print_manager_balance_response(
     response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -6145,7 +6312,6 @@ fn format_usable(status: &StructxMarketStatus) -> String {
         }
     }
 }
-
 fn compile_strategy_sender(owner: &str) -> String {
     if owner.trim().is_empty() {
         "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
@@ -6947,4 +7113,261 @@ fn validate_quote_object_refs_quiet(
     }
 
     Ok(())
+}
+
+fn quote_preview_from_response(
+    selected: &SelectedMarket<'_>,
+    plan: &QuotePlan,
+    tx_kind: &QuoteTxKind,
+    response: &serde_json::Value,
+) -> Result<QuotePreview, Box<dyn std::error::Error>> {
+    let status = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+
+    let results = response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing devInspect results"))?;
+
+    let asset = QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+    let mut preview_legs = Vec::new();
+
+    for (quote_idx, call) in plan.calls.iter().enumerate() {
+        let command_idx = tx_kind.quote_result_command_indices.get(quote_idx).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::InvalidData, "missing quote command index")
+        })?;
+
+        let result = results.get(*command_idx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing devInspect result for command {command_idx}"),
+            )
+        })?;
+
+        let return_values =
+            result.get("returnValues").and_then(serde_json::Value::as_array).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing returnValues for command {command_idx}"),
+                )
+            })?;
+
+        if return_values.len() != 2 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "expected 2 return values for command {command_idx}, got {}",
+                    return_values.len()
+                ),
+            )
+            .into());
+        }
+
+        let mint_cost_raw = decode_devinspect_u64(&return_values[0])?;
+        let redeem_payout_raw = decode_devinspect_u64(&return_values[1])?;
+
+        match call {
+            QuoteCall::Binary { function, direction, strike, quantity, .. } => {
+                preview_legs.push(QuotePreviewLeg {
+                    index: quote_idx,
+                    function: function.to_string(),
+                    leg: format!("{direction}_binary"),
+                    strike_or_lower: selected.grid.display(*strike).to_string(),
+                    upper: None,
+                    quantity: *quantity,
+                    mint_cost_raw,
+                    redeem_payout_raw,
+                })
+            }
+            QuoteCall::Range { function, lower, upper, quantity, .. } => {
+                preview_legs.push(QuotePreviewLeg {
+                    index: quote_idx,
+                    function: function.to_string(),
+                    leg: "range".to_string(),
+                    strike_or_lower: selected.grid.display(*lower).to_string(),
+                    upper: Some(selected.grid.display(*upper).to_string()),
+                    quantity: *quantity,
+                    mint_cost_raw,
+                    redeem_payout_raw,
+                })
+            }
+        }
+    }
+
+    Ok(QuotePreview::new(asset, preview_legs))
+}
+
+fn serialize_quote_preview(preview: &QuotePreview) -> serde_json::Value {
+    serde_json::json!({
+        "legs": preview.legs.iter().map(|leg| serde_json::json!({
+            "index": leg.index,
+            "function": leg.function,
+            "leg": leg.leg,
+            "strikeOrLower": leg.strike_or_lower,
+            "upper": leg.upper,
+            "quantity": leg.quantity.to_string(),
+            "mintCostRaw": leg.mint_cost_raw.to_string(),
+            "mintCostDisplay": preview.asset.format_amount(leg.mint_cost_raw),
+            "redeemPayoutRaw": leg.redeem_payout_raw.to_string(),
+            "redeemPayoutDisplay": preview.asset.format_amount(leg.redeem_payout_raw),
+        })).collect::<Vec<_>>(),
+        "totalMintCostRaw": preview.total_mint_cost_raw.to_string(),
+        "totalMintCostDisplay": preview.total_mint_cost_display(),
+        "totalRedeemPayoutRaw": preview.total_redeem_payout_raw.to_string(),
+        "totalRedeemPayoutDisplay": preview.total_redeem_payout_display(),
+    })
+}
+
+async fn devinspect_mint_for_selected_market_json(
+    args: &DevinspectMintBreakoutJsonArgs,
+    selected: &SelectedMarket<'_>,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    let strikes = selected.grid.centered_strikes_by_display_step(
+        selected.spot_raw,
+        DisplayPrice(250.0),
+        4,
+    )?;
+
+    let center = selected
+        .grid
+        .snap_nearest(selected.spot_raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "spot cannot be snapped"))?;
+
+    let center_idx = strikes
+        .iter()
+        .position(|strike| strike.raw == center.raw)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "center strike missing"))?;
+
+    if center_idx < 2 || center_idx + 2 >= strikes.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "not enough strikes around spot for default breakout preview",
+        )
+        .into());
+    }
+
+    let k1 = strikes[center_idx - 2];
+    let k2 = strikes[center_idx - 1];
+    let k3 = strikes[center_idx + 1];
+    let k4 = strikes[center_idx + 2];
+
+    let compiled = compile_breakout(k1, k2, k3, k4, 1_000, 400)?;
+    let plan = build_quote_plan(selected, &compiled)?;
+
+    let rpc = SuiRpcClient::new(args.rpc_url.clone(), StdDuration::from_secs(20))?;
+    let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let manager = resolve_sui_object(&rpc, &args.manager_id).await?;
+    let oracle = resolve_sui_object(&rpc, selected.oracle_id).await?;
+    let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
+
+    validate_predict_manager_object(&manager)?;
+    validate_quote_object_refs_quiet(&predict, &oracle, &clock)?;
+
+    let quote_tx_kind = build_quote_tx_kind(
+        &plan,
+        QuoteObjectRefs { predict: &predict, oracle: &oracle, clock: &clock },
+        &args.sender,
+    )?;
+
+    let quote_response =
+        rpc.dev_inspect_transaction_kind(&quote_tx_kind.sender, &quote_tx_kind.tx_kind_b64).await?;
+
+    let preview = quote_preview_from_response(selected, &plan, &quote_tx_kind, &quote_response)?;
+    let guarded = guard_quote_preview(
+        &preview,
+        QuoteCostGuard {
+            max_total_mint_cost_raw: args.max_total_mint_cost_raw,
+            slippage_bps: args.slippage_bps,
+        },
+    )?;
+
+    let manager_balance_tx = build_manager_balance_tx_kind(&manager, &args.sender)?;
+    let manager_balance_response = rpc
+        .dev_inspect_transaction_kind(&manager_balance_tx.sender, &manager_balance_tx.tx_kind_b64)
+        .await?;
+    let manager_balance_raw = read_manager_balance_from_response(&manager_balance_response)?;
+
+    if manager_balance_raw < preview.total_mint_cost_raw {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!(
+                "manager balance {} is below required mint cost {}",
+                manager_balance_raw, preview.total_mint_cost_raw
+            ),
+        )
+        .into());
+    }
+
+    let mint_tx_kind = build_mint_tx_kind(
+        &plan,
+        MintObjectRefs { predict: &predict, manager: &manager, oracle: &oracle, clock: &clock },
+        &args.sender,
+    )?;
+
+    let mint_response =
+        rpc.dev_inspect_transaction_kind(&mint_tx_kind.sender, &mint_tx_kind.tx_kind_b64).await?;
+
+    let mint_status = mint_response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    if mint_status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(&mint_response)).into());
+    }
+
+    let mut warnings = Vec::new();
+    if args.write_execute_script {
+        warnings.push(
+            "write_execute_script was requested, but direct API preview mode does not emit helper scripts."
+                .to_string(),
+        );
+    }
+
+    Ok(serde_json::json!({
+        "oracleId": selected.oracle_id,
+        "expiry": selected.expiry.to_rfc3339(),
+        "spotRaw": selected.spot_raw.to_string(),
+        "spotDisplay": format_raw_price_e9(selected.spot_raw),
+        "strikes": {
+            "k1": format_raw_price_e9(k1.raw),
+            "k2": format_raw_price_e9(k2.raw),
+            "k3": format_raw_price_e9(k3.raw),
+            "k4": format_raw_price_e9(k4.raw),
+            "k1Raw": k1.raw.to_string(),
+            "k2Raw": k2.raw.to_string(),
+            "k3Raw": k3.raw.to_string(),
+            "k4Raw": k4.raw.to_string(),
+        },
+        "quotePreview": serialize_quote_preview(&preview),
+        "quoteGuard": {
+            "maxTotalMintCostRaw": guarded.max_total_mint_cost_raw.to_string(),
+            "maxAllowedAfterSlippageRaw": guarded.max_allowed_after_slippage_raw.to_string(),
+            "totalMintCostRaw": guarded.total_mint_cost_raw.to_string(),
+            "slippageBps": guarded.slippage_bps,
+        },
+        "managerBalanceRaw": manager_balance_raw.to_string(),
+        "managerBalanceDisplay": preview.asset.format_amount(manager_balance_raw),
+        "mintPreview": {
+            "status": mint_status,
+            "eventCount": mint_response
+                .get("events")
+                .and_then(serde_json::Value::as_array)
+                .map(|events| events.len())
+                .unwrap_or(0),
+            "events": mint_response.get("events").cloned().unwrap_or(serde_json::Value::Array(Vec::new())),
+        },
+        "warnings": warnings,
+    }))
 }
