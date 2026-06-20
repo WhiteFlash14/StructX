@@ -29,9 +29,7 @@ pub struct DiskMarketStore {
 
 impl DiskMarketStore {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            root_dir: root_dir.into(),
-        }
+        Self { root_dir: root_dir.into() }
     }
 
     pub fn default_state_dir() -> Self {
@@ -47,8 +45,7 @@ impl DiskMarketStore {
     }
 
     fn snapshot_path(&self, refreshed_at_ms: u64) -> PathBuf {
-        self.snapshots_dir()
-            .join(format!("catalog_{refreshed_at_ms}.json"))
+        self.snapshots_dir().join(format!("catalog_{refreshed_at_ms}.json"))
     }
 
     async fn ensure_dirs(&self) -> anyhow::Result<()> {
@@ -66,9 +63,8 @@ impl DiskMarketStore {
         path: &Path,
         value: &T,
     ) -> anyhow::Result<()> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+        let parent =
+            path.parent().ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
         fs::create_dir_all(parent).await?;
 
         let tmp_path = path.with_extension("json.tmp");
@@ -85,11 +81,7 @@ impl DiskMarketStore {
             .with_context(|| format!("failed to fsync temp file {}", tmp_path.display()))?;
 
         fs::rename(&tmp_path, path).await.with_context(|| {
-            format!(
-                "failed to rename {} -> {}",
-                tmp_path.display(),
-                path.display()
-            )
+            format!("failed to rename {} -> {}", tmp_path.display(), path.display())
         })?;
         Ok(())
     }
@@ -234,10 +226,7 @@ fn score_market(market: &CatalogMarketSnapshot, query: &MarketSearchQuery) -> i6
 }
 
 fn normalize_query(input: &str) -> String {
-    input
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', '_', '/'], " ")
+    input.trim().to_ascii_lowercase().replace(['-', '_', '/'], " ")
 }
 
 fn aliases_for(query: &str) -> Vec<&'static str> {
@@ -253,7 +242,9 @@ fn aliases_for(query: &str) -> Vec<&'static str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::market_catalog::{now_ms, MarketCatalogSource, MarketCategory, MarketKind, MarketStatus};
+    use crate::market_catalog::{
+        now_ms, MarketCatalogSource, MarketCategory, MarketKind, MarketStatus,
+    };
 
     fn btc_market() -> CatalogMarketSnapshot {
         CatalogMarketSnapshot {

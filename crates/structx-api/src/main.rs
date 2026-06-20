@@ -1,10 +1,9 @@
 #[allow(dead_code)]
 mod intent_audit;
 mod intent_positions;
+mod position_ledger;
 #[allow(dead_code)]
 mod proposal_store;
-#[allow(dead_code)]
-mod position_ledger;
 #[allow(dead_code)]
 mod storage;
 
@@ -15,9 +14,13 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use deepbook_client::{DeepBookClient, DeepBookConfig, FreshnessConfig, MarketSnapshot};
+use deepbook_client::{
+    DeepBookClient, DeepBookConfig, FreshnessConfig, MarketSnapshot, ObjectOwnerKind,
+    SuiObjectInfo, SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_MANAGER_TYPE,
+};
 use intent_audit::DiskIntentAuditStore;
 use intent_positions::list_intent_positions;
+use position_ledger::{premium_basis_for_slice, LegKind, MintedLeg, PositionLedger, RedeemedLeg};
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -27,13 +30,14 @@ use std::{
     sync::Arc,
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
-use tokio::{process::Command, sync::Mutex};
-use tower_http::cors::CorsLayer;
+use structx_core::{build_redeem_tx_kind, ManagerPositionRead, MintObjectRefs};
 use structx_service::{
     load_catalog_status, plan_from_intent, refresh_catalog_from_existing_markets_json,
     DiskMarketStore, ExpiryPreference, MarketCategory, MarketKind, MarketSearchQuery, MarketStatus,
     MarketStore, RiskStyle, UserIntentRequest,
 };
+use tokio::{process::Command, sync::Mutex};
+use tower_http::cors::CorsLayer;
 
 const DEFAULT_PREDICT_SERVER_URL: &str = "https://predict-server.testnet.mystenlabs.com";
 
@@ -227,6 +231,72 @@ struct MarketCatalogRefreshResponse {
     market_count: usize,
     active_market_count: usize,
     report: structx_service::CatalogBuildReport,
+}
+
+#[derive(Debug, Deserialize)]
+struct ListPositionsQuery {
+    owner: String,
+    #[serde(rename = "managerId")]
+    manager_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncFromChainRequest {
+    owner: String,
+    #[serde(rename = "managerId")]
+    manager_id: String,
+    #[serde(default, rename = "mintedLegs")]
+    minted_legs: Vec<SyncMintedLeg>,
+    #[serde(default, rename = "redeemedLegs")]
+    redeemed_legs: Vec<SyncRedeemedLeg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncMintedLeg {
+    kind: String,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(rename = "oracleId")]
+    oracle_id: String,
+    #[serde(rename = "expiryMs")]
+    expiry_ms: String,
+    #[serde(default, rename = "strikeRaw")]
+    strike_raw: Option<String>,
+    #[serde(default, rename = "lowerRaw")]
+    lower_raw: Option<String>,
+    #[serde(default, rename = "upperRaw")]
+    upper_raw: Option<String>,
+    #[serde(rename = "quantityRaw")]
+    quantity_raw: String,
+    #[serde(rename = "costRaw")]
+    cost_raw: String,
+    #[serde(rename = "sourceDigest")]
+    source_digest: String,
+    #[serde(default, rename = "openedAtUnix")]
+    opened_at_unix: Option<i64>,
+    #[serde(default)]
+    strategy: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncRedeemedLeg {
+    kind: String,
+    #[serde(rename = "oracleId")]
+    oracle_id: String,
+    #[serde(rename = "expiryMs")]
+    expiry_ms: String,
+    #[serde(default, rename = "strikeRaw")]
+    strike_raw: Option<String>,
+    #[serde(default, rename = "lowerRaw")]
+    lower_raw: Option<String>,
+    #[serde(default, rename = "upperRaw")]
+    upper_raw: Option<String>,
+    #[serde(rename = "quantityRaw")]
+    quantity_raw: String,
+    #[serde(rename = "payoutRaw")]
+    payout_raw: String,
+    #[serde(rename = "sourceDigest")]
+    source_digest: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -504,14 +574,8 @@ async fn main() {
         .route("/api/market/live-price", get(live_price))
         .route("/api/intent/plan", post(plan_intent))
         .route("/api/intent/audits/recent", get(list_recent_intent_audits))
-        .route(
-            "/api/intent/audits/proposal/{proposal_id}",
-            get(get_intent_audit_by_proposal),
-        )
-        .route(
-            "/api/intent/audits/digest/{digest}",
-            get(get_intent_audit_by_digest),
-        )
+        .route("/api/intent/audits/proposal/{proposal_id}", get(get_intent_audit_by_proposal))
+        .route("/api/intent/audits/digest/{digest}", get(get_intent_audit_by_digest))
         .route("/api/intent/positions", get(list_intent_position_overlays))
         .route("/api/intent/parse", post(parse_intent))
         .route("/api/markets/catalog/status", get(get_market_catalog_status))
@@ -519,6 +583,8 @@ async fn main() {
         .route("/api/markets/search", get(search_market_catalog))
         .route("/api/markets/catalog/{market_id}", get(get_catalog_market))
         .route("/api/markets", get(list_markets))
+        .route("/api/positions", get(list_positions))
+        .route("/api/positions/sync-from-chain", post(sync_positions_from_chain))
         .route(
             "/api/managers/{address}",
             get(get_manager_for_address).post(put_manager_for_address),
@@ -600,10 +666,7 @@ async fn plan_intent(Json(req): Json<IntentPlanApiRequest>) -> impl IntoResponse
 async fn get_intent_audit_by_proposal(Path(proposal_id): Path<String>) -> impl IntoResponse {
     let store = DiskIntentAuditStore::default_state_dir();
     match store.load_by_proposal(&proposal_id).await {
-        Ok(Some(audit)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(audit).unwrap_or_default()),
-        ),
+        Ok(Some(audit)) => (StatusCode::OK, Json(serde_json::to_value(audit).unwrap_or_default())),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(
@@ -622,10 +685,7 @@ async fn get_intent_audit_by_proposal(Path(proposal_id): Path<String>) -> impl I
 async fn get_intent_audit_by_digest(Path(digest): Path<String>) -> impl IntoResponse {
     let store = DiskIntentAuditStore::default_state_dir();
     match store.load_by_digest(&digest).await {
-        Ok(Some(audit)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(audit).unwrap_or_default()),
-        ),
+        Ok(Some(audit)) => (StatusCode::OK, Json(serde_json::to_value(audit).unwrap_or_default())),
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(
@@ -646,10 +706,7 @@ async fn list_recent_intent_audits(
 ) -> impl IntoResponse {
     let store = DiskIntentAuditStore::default_state_dir();
     match store.list_recent(query.max.unwrap_or(25).min(100)).await {
-        Ok(audits) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(audits).unwrap_or_default()),
-        ),
+        Ok(audits) => (StatusCode::OK, Json(serde_json::to_value(audits).unwrap_or_default())),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(
@@ -663,10 +720,9 @@ async fn list_intent_position_overlays(
     Query(query): Query<IntentPositionsQuery>,
 ) -> impl IntoResponse {
     match list_intent_positions(query.user_address, query.max.unwrap_or(50).min(200)).await {
-        Ok(positions) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(positions).unwrap_or_default()),
-        ),
+        Ok(positions) => {
+            (StatusCode::OK, Json(serde_json::to_value(positions).unwrap_or_default()))
+        }
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(
@@ -704,17 +760,11 @@ async fn list_markets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
 
     if let Some(record) = &cached {
         if markets_cache_is_fresh(record) {
-            return (
-                StatusCode::OK,
-                Json(markets_cache_response(record, "disk", false)),
-            );
+            return (StatusCode::OK, Json(markets_cache_response(record, "disk", false)));
         }
 
         if markets_refresh_in_flight(&state).await {
-            return (
-                StatusCode::OK,
-                Json(markets_cache_response(record, "disk_refreshing", true)),
-            );
+            return (StatusCode::OK, Json(markets_cache_response(record, "disk_refreshing", true)));
         }
 
         match refresh_markets_snapshot(state.clone()).await {
@@ -722,10 +772,7 @@ async fn list_markets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             Err(err) => {
                 eprintln!("warning: synchronous markets refresh failed: {err}");
                 maybe_spawn_markets_refresh(state.clone()).await;
-                return (
-                    StatusCode::OK,
-                    Json(markets_cache_response(record, "disk_stale", true)),
-                );
+                return (StatusCode::OK, Json(markets_cache_response(record, "disk_stale", true)));
             }
         }
     }
@@ -762,10 +809,7 @@ fn markets_cache_response(
 ) -> serde_json::Value {
     let mut envelope = record.envelope.clone();
     if let Some(obj) = envelope.as_object_mut() {
-        obj.insert(
-            "cachedAtUnix".to_string(),
-            serde_json::Value::from(record.refreshed_at_unix),
-        );
+        obj.insert("cachedAtUnix".to_string(), serde_json::Value::from(record.refreshed_at_unix));
         obj.insert(
             "cacheAgeSeconds".to_string(),
             serde_json::Value::from(markets_cache_age(record).as_secs()),
@@ -817,19 +861,13 @@ async fn refresh_markets_snapshot(state: Arc<AppState>) -> Result<serde_json::Va
         Err(err) => return Err(format!("could not initialize DeepBook client: {err}")),
     };
 
-    match client
-        .load_market_directory(FreshnessConfig::default())
-        .await
-    {
+    match client.load_market_directory(FreshnessConfig::default()).await {
         Ok(markets) => {
             let mut envelope = build_markets_envelope(&markets);
             let now = storage::unix_now();
             if let Some(obj) = envelope.as_object_mut() {
                 obj.insert("cachedAtUnix".to_string(), serde_json::Value::from(now));
-                obj.insert(
-                    "cacheSource".to_string(),
-                    serde_json::Value::from("deepbook_refresh"),
-                );
+                obj.insert("cacheSource".to_string(), serde_json::Value::from("deepbook_refresh"));
                 obj.insert("stale".to_string(), serde_json::Value::from(false));
             }
 
@@ -854,9 +892,7 @@ async fn refresh_markets_snapshot(state: Arc<AppState>) -> Result<serde_json::Va
         Err(err) => {
             let mut refresh = state.markets_refresh.lock().await;
             refresh.in_flight = false;
-            Err(format!(
-                "could not load markets from DeepBook Predict: {err}"
-            ))
+            Err(format!("could not load markets from DeepBook Predict: {err}"))
         }
     }
 }
@@ -894,10 +930,7 @@ async fn get_market_catalog_status() -> impl IntoResponse {
     let store = DiskMarketStore::default_state_dir();
 
     match load_catalog_status(&store).await {
-        Ok(status) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(status).unwrap_or_default()),
-        ),
+        Ok(status) => (StatusCode::OK, Json(serde_json::to_value(status).unwrap_or_default())),
         Err(err) => (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(serde_json::json!({
@@ -939,10 +972,9 @@ async fn get_catalog_market(Path(market_id): Path<String>) -> impl IntoResponse 
     let store = DiskMarketStore::default_state_dir();
 
     match store.get_market(&market_id).await {
-        Ok(Some(market)) => (
-            StatusCode::OK,
-            Json(serde_json::to_value(market).unwrap_or_default()),
-        ),
+        Ok(Some(market)) => {
+            (StatusCode::OK, Json(serde_json::to_value(market).unwrap_or_default()))
+        }
         Ok(None) => (
             StatusCode::NOT_FOUND,
             Json(serde_json::json!({
@@ -978,11 +1010,8 @@ async fn refresh_market_catalog() -> impl IntoResponse {
 
     match refresh_catalog_from_existing_markets_json(&store, raw_markets_json).await {
         Ok((catalog, report)) => {
-            let active_market_count = catalog
-                .markets
-                .iter()
-                .filter(|m| m.status == MarketStatus::Active)
-                .count();
+            let active_market_count =
+                catalog.markets.iter().filter(|m| m.status == MarketStatus::Active).count();
 
             (
                 StatusCode::OK,
@@ -1020,10 +1049,7 @@ async fn load_existing_markets_json() -> Result<serde_json::Value, String> {
 }
 
 fn build_markets_envelope(markets: &[MarketSnapshot]) -> serde_json::Value {
-    let usable = markets
-        .iter()
-        .filter(|market| market.structx_status.is_usable())
-        .count();
+    let usable = markets.iter().filter(|market| market.structx_status.is_usable()).count();
     let deepbook_only = markets
         .iter()
         .filter(|market| match &market.structx_status {
@@ -1064,6 +1090,430 @@ fn build_markets_envelope(markets: &[MarketSnapshot]) -> serde_json::Value {
         "structxSupportedAsset": "BTC",
         "markets": markets,
     })
+}
+
+async fn list_positions(Query(q): Query<ListPositionsQuery>) -> impl IntoResponse {
+    let mut ledger = match PositionLedger::load(&q.owner, &q.manager_id) {
+        Ok(l) => l,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("could not load position ledger: {err}"),
+                })),
+            );
+        }
+    };
+    let mut warnings: Vec<String> = Vec::new();
+
+    if let Err(errs) = refresh_position_previews(&q.owner, &q.manager_id, &mut ledger).await {
+        warnings.extend(errs);
+    } else if let Err(err) = ledger.save() {
+        warnings.push(format!("Could not persist refreshed position previews: {err}"));
+    }
+
+    let summary = ledger.summary();
+    let body = serde_json::json!({
+        "ok": true,
+        "owner": ledger.owner,
+        "managerId": ledger.manager_id,
+        "positions": ledger.positions,
+        "summary": summary,
+        "auditDigests": ledger.audit_digests,
+        "redeemDigests": ledger.redeem_digests,
+        "updatedAtUnix": ledger.updated_at_unix,
+        "warnings": warnings,
+    });
+    (StatusCode::OK, Json(body))
+}
+
+async fn refresh_position_previews(
+    owner: &str,
+    manager_id: &str,
+    ledger: &mut PositionLedger,
+) -> Result<(), Vec<String>> {
+    if !ledger.positions.iter().any(|p| matches!(p.status, position_ledger::PositionStatus::Open)) {
+        return Ok(());
+    }
+
+    let rpc = match SuiRpcClient::new(DEFAULT_SUI_TESTNET_RPC_URL, Duration::from_secs(20)) {
+        Ok(rpc) => rpc,
+        Err(err) => {
+            return Err(vec![format!(
+                "Could not initialize Sui RPC client for position previews: {err}"
+            )]);
+        }
+    };
+
+    let predict = match resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await {
+        Ok(obj) => obj,
+        Err((_, value)) => {
+            return Err(vec![format!(
+                "Could not fetch predict object for previews: {}",
+                value.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error")
+            )]);
+        }
+    };
+    let manager = match resolve_sui_object(&rpc, manager_id).await {
+        Ok(obj) => obj,
+        Err((_, value)) => {
+            return Err(vec![format!(
+                "Could not fetch manager object for previews: {}",
+                value.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error")
+            )]);
+        }
+    };
+    let clock = match resolve_sui_object(&rpc, CLOCK_OBJECT_ID).await {
+        Ok(obj) => obj,
+        Err((_, value)) => {
+            return Err(vec![format!(
+                "Could not fetch clock object for previews: {}",
+                value.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error")
+            )]);
+        }
+    };
+
+    if let Err((_, value)) = validate_predict_manager_object(&manager) {
+        return Err(vec![format!(
+            "Manager object is invalid for previews: {}",
+            value.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error")
+        )]);
+    }
+
+    let mut warnings = Vec::new();
+    let open_positions = ledger
+        .positions
+        .iter()
+        .filter(|p| matches!(p.status, position_ledger::PositionStatus::Open))
+        .cloned()
+        .collect::<Vec<_>>();
+
+    for position in open_positions {
+        let Some(read) = position_to_redeem_read(&position) else {
+            warnings.push(format!(
+                "Skipping preview refresh for {} because its strike/range key is incomplete.",
+                position.position_id
+            ));
+            continue;
+        };
+
+        let oracle = match resolve_sui_object(&rpc, &position.oracle_id).await {
+            Ok(obj) => obj,
+            Err((_, value)) => {
+                warnings.push(format!(
+                    "Could not fetch oracle {} for {}: {}",
+                    position.oracle_id,
+                    position.position_id,
+                    value
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown error")
+                ));
+                continue;
+            }
+        };
+
+        if let Err((_, value)) = validate_quote_object_refs(&predict, &oracle, &clock) {
+            warnings.push(format!(
+                "Object validation failed for {}: {}",
+                position.position_id,
+                value.get("error").and_then(serde_json::Value::as_str).unwrap_or("unknown error")
+            ));
+            continue;
+        }
+
+        let tx_kind = match build_redeem_tx_kind(
+            &[read],
+            MintObjectRefs { predict: &predict, manager: &manager, oracle: &oracle, clock: &clock },
+            owner,
+        ) {
+            Ok(tx_kind) => tx_kind,
+            Err(err) => {
+                warnings.push(format!(
+                    "Could not build preview redeem tx for {}: {err}",
+                    position.position_id
+                ));
+                continue;
+            }
+        };
+
+        let response =
+            match rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await {
+                Ok(response) => response,
+                Err(err) => {
+                    warnings.push(format!("devInspect failed for {}: {err}", position.position_id));
+                    continue;
+                }
+            };
+
+        let execution_status = response
+            .get("effects")
+            .and_then(|effects| effects.get("status"))
+            .and_then(|status| status.get("status"))
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("unknown");
+
+        if execution_status != "success" {
+            warnings.push(format!(
+                "Preview devInspect did not succeed for {}: {}",
+                position.position_id,
+                response
+                    .get("effects")
+                    .and_then(|effects| effects.get("status"))
+                    .and_then(|status| status.get("error"))
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("unknown error")
+            ));
+            continue;
+        }
+
+        let redeemed = parse_redeemed_legs_from_events(
+            response
+                .get("events")
+                .and_then(serde_json::Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or(&[]),
+        );
+        let payout_raw = redeemed.first().map(|leg| leg.payout_raw).unwrap_or(0);
+        let premium_paid_raw = position.premium_paid_raw.parse::<u128>().unwrap_or(0);
+        let original_quantity_raw = position.original_quantity_raw.parse::<u128>().unwrap_or(0);
+        let redeem_quantity_raw = position.remaining_quantity_raw.parse::<u128>().unwrap_or(0);
+        let basis =
+            premium_basis_for_slice(premium_paid_raw, original_quantity_raw, redeem_quantity_raw);
+        let pnl_raw = (payout_raw as i128).saturating_sub(basis as i128);
+
+        ledger.apply_preview(&position.position_id, payout_raw, pnl_raw, storage::unix_now());
+    }
+
+    if warnings.is_empty() {
+        Ok(())
+    } else {
+        Err(warnings)
+    }
+}
+
+fn position_to_redeem_read(
+    position: &position_ledger::PositionRecord,
+) -> Option<ManagerPositionRead> {
+    let expected_quantity = position.remaining_quantity_raw.parse::<u64>().ok()?;
+    let expiry_ms = position.expiry_ms.parse::<u64>().ok()?;
+
+    match position.kind {
+        LegKind::Down | LegKind::Up => {
+            let strike_raw = position.strike_raw.as_ref()?.parse::<u64>().ok()?;
+            Some(ManagerPositionRead::Binary {
+                oracle_id: position.oracle_id.clone(),
+                expiry_ms,
+                strike_raw,
+                is_up: matches!(position.kind, LegKind::Up),
+                expected_quantity,
+            })
+        }
+        LegKind::Range => {
+            let lower_raw = position.lower_raw.as_ref()?.parse::<u64>().ok()?;
+            let upper_raw = position.upper_raw.as_ref()?.parse::<u64>().ok()?;
+            Some(ManagerPositionRead::Range {
+                oracle_id: position.oracle_id.clone(),
+                expiry_ms,
+                lower_raw,
+                upper_raw,
+                expected_quantity,
+            })
+        }
+    }
+}
+
+fn parse_leg_kind(s: &str) -> Option<LegKind> {
+    match s {
+        "UP" => Some(LegKind::Up),
+        "DOWN" => Some(LegKind::Down),
+        "RANGE" => Some(LegKind::Range),
+        _ => None,
+    }
+}
+
+async fn sync_positions_from_chain(Json(req): Json<SyncFromChainRequest>) -> impl IntoResponse {
+    let mut ledger = match PositionLedger::load(&req.owner, &req.manager_id) {
+        Ok(l) => l,
+        Err(err) => {
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("could not load ledger: {err}"),
+                })),
+            );
+        }
+    };
+
+    let mut applied_mints = 0usize;
+    let mut applied_redeems = 0usize;
+    let mut warnings: Vec<String> = Vec::new();
+
+    let known_mint_digests: std::collections::HashSet<String> =
+        ledger.audit_digests.iter().cloned().collect();
+    let known_redeem_digests: std::collections::HashSet<String> =
+        ledger.redeem_digests.iter().cloned().collect();
+
+    for leg in &req.minted_legs {
+        if known_mint_digests.contains(&leg.source_digest) {
+            continue;
+        }
+        let Some(kind) = parse_leg_kind(&leg.kind) else {
+            warnings.push(format!("Skipping mint leg with unknown kind {}", leg.kind));
+            continue;
+        };
+        let Ok(quantity_raw) = leg.quantity_raw.parse::<u128>() else {
+            warnings.push(format!(
+                "Skipping mint leg with non-numeric quantityRaw {}",
+                leg.quantity_raw
+            ));
+            continue;
+        };
+        let cost_raw = leg.cost_raw.parse::<u128>().unwrap_or(0);
+        let minted = MintedLeg {
+            kind,
+            direction: leg.direction.clone(),
+            oracle_id: leg.oracle_id.clone(),
+            expiry_ms: leg.expiry_ms.clone(),
+            strike_raw: leg.strike_raw.clone(),
+            lower_raw: leg.lower_raw.clone(),
+            upper_raw: leg.upper_raw.clone(),
+            quantity_raw,
+            cost_raw,
+            role: None,
+            strategy: leg.strategy.clone(),
+        };
+        ledger.apply_mint(
+            &minted,
+            &leg.source_digest,
+            leg.opened_at_unix.unwrap_or_else(storage::unix_now),
+        );
+        applied_mints += 1;
+    }
+
+    for leg in &req.redeemed_legs {
+        if known_redeem_digests.contains(&leg.source_digest) {
+            continue;
+        }
+        let Some(kind) = parse_leg_kind(&leg.kind) else {
+            warnings.push(format!("Skipping redeem leg with unknown kind {}", leg.kind));
+            continue;
+        };
+        let Ok(quantity_raw) = leg.quantity_raw.parse::<u128>() else {
+            warnings.push(format!(
+                "Skipping redeem leg with non-numeric quantityRaw {}",
+                leg.quantity_raw
+            ));
+            continue;
+        };
+        let payout_raw = leg.payout_raw.parse::<u128>().unwrap_or(0);
+        let redeemed = RedeemedLeg {
+            kind,
+            oracle_id: leg.oracle_id.clone(),
+            expiry_ms: leg.expiry_ms.clone(),
+            strike_raw: leg.strike_raw.clone(),
+            lower_raw: leg.lower_raw.clone(),
+            upper_raw: leg.upper_raw.clone(),
+            quantity_raw,
+            payout_raw,
+        };
+        ledger.apply_redeem(&redeemed, &leg.source_digest);
+        applied_redeems += 1;
+    }
+
+    if let Err(errs) = refresh_position_previews(&req.owner, &req.manager_id, &mut ledger).await {
+        warnings.extend(errs);
+    }
+
+    if let Err(err) = ledger.save() {
+        warnings.push(format!("Could not persist ledger: {err}"));
+    }
+
+    let summary = ledger.summary();
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "owner": ledger.owner,
+            "managerId": ledger.manager_id,
+            "appliedMints": applied_mints,
+            "appliedRedeems": applied_redeems,
+            "positions": ledger.positions,
+            "summary": summary,
+            "warnings": warnings,
+        })),
+    )
+}
+
+fn parse_redeemed_legs_from_events(events: &[serde_json::Value]) -> Vec<RedeemedLeg> {
+    let mut out = Vec::new();
+    for event in events {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+        let parsed = event.get("parsedJson").cloned().unwrap_or(serde_json::Value::Null);
+
+        let oracle_id = parsed
+            .get("oracle_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("0x0")
+            .to_string();
+        let expiry_ms = parsed
+            .get("expiry")
+            .and_then(json_value_as_u128_string)
+            .unwrap_or_else(|| "0".to_string());
+        let quantity_raw = parsed
+            .get("quantity")
+            .and_then(json_value_as_u128_string)
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+        let payout_raw = parsed
+            .get("payout")
+            .and_then(json_value_as_u128_string)
+            .and_then(|s| s.parse::<u128>().ok())
+            .unwrap_or(0);
+
+        if event_type.ends_with("::predict::PositionRedeemed") {
+            let is_up = parsed.get("is_up").and_then(serde_json::Value::as_bool).unwrap_or(false);
+            let strike_raw = parsed.get("strike").and_then(json_value_as_u128_string);
+            out.push(RedeemedLeg {
+                kind: if is_up { LegKind::Up } else { LegKind::Down },
+                oracle_id,
+                expiry_ms,
+                strike_raw,
+                lower_raw: None,
+                upper_raw: None,
+                quantity_raw,
+                payout_raw,
+            });
+        } else if event_type.ends_with("::predict::RangeRedeemed") {
+            let lower_raw = parsed.get("lower_strike").and_then(json_value_as_u128_string);
+            let upper_raw = parsed.get("higher_strike").and_then(json_value_as_u128_string);
+            out.push(RedeemedLeg {
+                kind: LegKind::Range,
+                oracle_id,
+                expiry_ms,
+                strike_raw: None,
+                lower_raw,
+                upper_raw,
+                quantity_raw,
+                payout_raw,
+            });
+        }
+    }
+    out
+}
+
+fn json_value_as_u128_string(value: &serde_json::Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        Some(s.to_string())
+    } else if let Some(n) = value.as_u64() {
+        Some(n.to_string())
+    } else if let Some(n) = value.as_i64() {
+        u128::try_from(n).ok().map(|v| v.to_string())
+    } else {
+        None
+    }
 }
 
 async fn compile_from_intent(
@@ -2577,26 +3027,15 @@ async fn get_manager_for_address(
         map.get(&key).cloned()
     };
     let elapsed_us = started.elapsed().as_micros();
-    println!(
-        "managers GET address={} hit={} elapsed_us={}",
-        key,
-        manager_id.is_some(),
-        elapsed_us
-    );
+    println!("managers GET address={} hit={} elapsed_us={}", key, manager_id.is_some(), elapsed_us);
 
-    let body = Json(ManagerLookupResponse {
-        ok: true,
-        address: key,
-        manager_id,
-    });
+    let body = Json(ManagerLookupResponse { ok: true, address: key, manager_id });
     let headers = [(header::CACHE_CONTROL, "private, max-age=30")];
     (headers, body)
 }
 
 /// POST /api/managers/:address — persists the given PredictManager id for
-/// this wallet. Body: `{ "managerId": "0x..." }`. Idempotent — re-posting the
-/// same id is a no-op. Re-posting a different id overwrites (we trust the
-/// caller to send the freshly created/discovered manager).
+/// this wallet. Body: `{ "managerId": "0x..." }`
 async fn put_manager_for_address(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
@@ -2620,9 +3059,8 @@ async fn put_manager_for_address(
         let mut map = state.managers.lock().await;
         prior = map.insert(key.clone(), manager_id.clone());
         if let Err(err) = save_managers(&state.managers_path, &map) {
-            // Roll back the in-memory insert so the in-memory map stays in
-            // sync with what's on disk (otherwise a restart would lose the
-            // entry and the client would think it was stored).
+            // Roll back the in memory insert so the in memory map stays in
+            // sync with what's on disk
             match prior {
                 Some(ref old) => {
                     map.insert(key.clone(), old.clone());
@@ -2652,13 +3090,113 @@ async fn put_manager_for_address(
 
     // Explicitly tell the browser not to cache the POST response. The GET
     // cache is invalidated client-side by the seed() call in lib/api.ts.
-    let body = Json(ManagerLookupResponse {
-        ok: true,
-        address: key,
-        manager_id: Some(manager_id),
-    });
+    let body = Json(ManagerLookupResponse { ok: true, address: key, manager_id: Some(manager_id) });
     let headers = [(header::CACHE_CONTROL, "no-store")];
     Ok((headers, body))
+}
+
+async fn resolve_sui_object(
+    rpc: &SuiRpcClient,
+    object_id: &str,
+) -> Result<SuiObjectInfo, (StatusCode, serde_json::Value)> {
+    let value = rpc.get_object(object_id).await.map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("failed to fetch object {object_id}: {err}")
+            }),
+        )
+    })?;
+
+    SuiObjectInfo::from_get_object_result(object_id, value).map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("failed to parse object {object_id}: {err}")
+            }),
+        )
+    })
+}
+
+fn validate_quote_object_refs(
+    predict: &SuiObjectInfo,
+    oracle: &SuiObjectInfo,
+    clock: &SuiObjectInfo,
+) -> Result<(), (StatusCode, serde_json::Value)> {
+    for (role, object) in [("predict", predict), ("oracle", oracle), ("clock", clock)] {
+        if object.owner_kind != ObjectOwnerKind::Shared {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("{role} object is not shared: owner={}", object.owner_kind)
+                }),
+            ));
+        }
+
+        if object.initial_shared_version.is_none() {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("{role} object is missing initial_shared_version")
+                }),
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn validate_predict_manager_object(
+    manager: &SuiObjectInfo,
+) -> Result<(), (StatusCode, serde_json::Value)> {
+    if manager.owner_kind != ObjectOwnerKind::Shared {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("PredictManager is not shared: owner={}", manager.owner_kind)
+            }),
+        ));
+    }
+
+    if manager.initial_shared_version.is_none() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": "PredictManager is missing initial_shared_version"
+            }),
+        ));
+    }
+
+    let actual_type = manager.object_type.as_deref().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": "PredictManager object is missing type"
+            }),
+        )
+    })?;
+
+    if actual_type != PREDICT_MANAGER_TYPE {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "unexpected PredictManager type: expected {}, got {}",
+                    PREDICT_MANAGER_TYPE, actual_type
+                )
+            }),
+        ));
+    }
+
+    Ok(())
 }
 
 async fn run_cli_value(

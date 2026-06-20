@@ -37,9 +37,7 @@ pub fn btc_markets_cache_path() -> PathBuf {
 pub fn positions_path(owner: &str, manager_id: &str) -> PathBuf {
     let owner = owner.to_lowercase();
     let manager = manager_id.to_lowercase();
-    positions_dir()
-        .join(owner)
-        .join(format!("{manager}.positions.json"))
+    positions_dir().join(owner).join(format!("{manager}.positions.json"))
 }
 
 pub fn audit_record_path(digest: &str) -> PathBuf {
@@ -100,9 +98,7 @@ pub fn read_json<T: DeserializeOwned>(path: &Path) -> io::Result<Option<T>> {
 /// List paths in a directory. Returns empty list if directory doesn't exist.
 pub fn list_dir(path: &Path) -> io::Result<Vec<PathBuf>> {
     match fs::read_dir(path) {
-        Ok(iter) => iter
-            .map(|entry| entry.map(|e| e.path()))
-            .collect::<io::Result<Vec<_>>>(),
+        Ok(iter) => iter.map(|entry| entry.map(|e| e.path())).collect::<io::Result<Vec<_>>>(),
         Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(Vec::new()),
         Err(err) => Err(err),
     }
@@ -110,10 +106,7 @@ pub fn list_dir(path: &Path) -> io::Result<Vec<PathBuf>> {
 
 pub fn unix_now() -> i64 {
     use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs() as i64)
-        .unwrap_or(0)
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_secs() as i64).unwrap_or(0)
 }
 
 #[cfg(test)]
@@ -132,10 +125,7 @@ mod tests {
     fn atomic_write_then_read_roundtrips() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("sample.json");
-        let value = Sample {
-            x: 42,
-            s: "hello".to_string(),
-        };
+        let value = Sample { x: 42, s: "hello".to_string() };
         atomic_write_json(&path, &value).unwrap();
         let read: Sample = read_json(&path).unwrap().unwrap();
         assert_eq!(read, value);
@@ -162,14 +152,7 @@ mod tests {
     fn atomic_write_creates_parent_dirs() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("a").join("b").join("c.json");
-        atomic_write_json(
-            &path,
-            &Sample {
-                x: 1,
-                s: "x".into(),
-            },
-        )
-        .unwrap();
+        atomic_write_json(&path, &Sample { x: 1, s: "x".into() }).unwrap();
         assert!(path.exists());
     }
 }

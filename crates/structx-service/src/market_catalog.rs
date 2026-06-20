@@ -137,9 +137,7 @@ impl CatalogMarketSnapshot {
     }
 
     pub fn supports_quote_asset(&self, quote_asset: &str) -> bool {
-        self.quote_assets
-            .iter()
-            .any(|asset| asset.eq_ignore_ascii_case(quote_asset))
+        self.quote_assets.iter().any(|asset| asset.eq_ignore_ascii_case(quote_asset))
     }
 
     pub fn searchable_text(&self) -> String {
@@ -151,18 +149,12 @@ impl CatalogMarketSnapshot {
             self.preferred_quote_asset.clone(),
         ];
         parts.extend(self.tags.clone());
-        parts
-            .join(" ")
-            .to_ascii_lowercase()
-            .replace(['-', '_', '/'], " ")
+        parts.join(" ").to_ascii_lowercase().replace(['-', '_', '/'], " ")
     }
 }
 
 pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }

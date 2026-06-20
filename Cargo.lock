@@ -1614,6 +1614,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "structx-core",
  "structx-service",
  "tempfile",
  "tokio",

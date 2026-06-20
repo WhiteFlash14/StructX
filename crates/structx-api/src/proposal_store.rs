@@ -19,9 +19,7 @@ pub struct DiskProposalStore {
 
 impl DiskProposalStore {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            root_dir: root_dir.into(),
-        }
+        Self { root_dir: root_dir.into() }
     }
 
     pub fn default_state_dir() -> Self {
@@ -51,8 +49,7 @@ impl DiskProposalStore {
             proposal,
         };
 
-        self.atomic_write_json(&self.proposal_path(&stored.proposal_id), &stored)
-            .await?;
+        self.atomic_write_json(&self.proposal_path(&stored.proposal_id), &stored).await?;
 
         Ok(stored)
     }
@@ -107,9 +104,8 @@ impl DiskProposalStore {
         path: &Path,
         value: &T,
     ) -> anyhow::Result<()> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+        let parent =
+            path.parent().ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
         fs::create_dir_all(parent).await?;
 
         let tmp_path = path.with_extension("json.tmp");
@@ -137,10 +133,7 @@ impl DiskProposalStore {
 pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 #[cfg(test)]

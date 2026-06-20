@@ -105,11 +105,7 @@ pub async fn load_catalog_status<S: MarketStore + ?Sized>(
         });
     };
 
-    let active_count = catalog
-        .markets
-        .iter()
-        .filter(|m| m.status == MarketStatus::Active)
-        .count();
+    let active_count = catalog.markets.iter().filter(|m| m.status == MarketStatus::Active).count();
 
     Ok(CatalogStatus {
         exists: true,
@@ -128,10 +124,7 @@ pub async fn refresh_catalog_from_existing_markets_json<S: MarketStore + ?Sized>
     raw_markets_json: Value,
 ) -> anyhow::Result<(MarketCatalog, CatalogBuildReport)> {
     let (catalog, report) = build_catalog_from_markets_json(&raw_markets_json)?;
-    store
-        .save_catalog(&catalog)
-        .await
-        .context("failed to persist refreshed market catalog")?;
+    store.save_catalog(&catalog).await.context("failed to persist refreshed market catalog")?;
     Ok((catalog, report))
 }
 
@@ -175,14 +168,7 @@ pub fn normalize_market_json(
 
     let display_name = first_string(
         raw,
-        &[
-            "display_name",
-            "displayName",
-            "name",
-            "title",
-            "market_name",
-            "marketName",
-        ],
+        &["display_name", "displayName", "name", "title", "market_name", "marketName"],
     )
     .unwrap_or_else(|| format!("{} Predict Market", underlying.to_uppercase()));
 
@@ -290,19 +276,9 @@ pub fn normalize_market_json(
 
     let preferred_quote_asset = first_string(
         raw,
-        &[
-            "preferred_quote_asset",
-            "preferredQuoteAsset",
-            "quote_asset",
-            "quoteAsset",
-        ],
+        &["preferred_quote_asset", "preferredQuoteAsset", "quote_asset", "quoteAsset"],
     )
-    .unwrap_or_else(|| {
-        quote_assets
-            .first()
-            .cloned()
-            .unwrap_or_else(|| "DUSDC".to_string())
-    });
+    .unwrap_or_else(|| quote_assets.first().cloned().unwrap_or_else(|| "DUSDC".to_string()));
 
     let latest_price_updated_at_ms = first_u64(
         raw,
@@ -390,9 +366,7 @@ fn extract_market_items(raw: &Value) -> anyhow::Result<Vec<Value>> {
         }
     }
 
-    Err(anyhow!(
-        "could not find market array in JSON; expected one of markets/oracles/data/result"
-    ))
+    Err(anyhow!("could not find market array in JSON; expected one of markets/oracles/data/result"))
 }
 
 fn infer_status(
@@ -443,10 +417,7 @@ fn infer_status(
 
 fn infer_category(underlying: &str, display_name: &str) -> MarketCategory {
     let text = format!("{} {}", underlying, display_name).to_ascii_lowercase();
-    if contains_any(
-        &text,
-        &["btc", "bitcoin", "eth", "ethereum", "sui", "sol", "crypto"],
-    ) {
+    if contains_any(&text, &["btc", "bitcoin", "eth", "ethereum", "sui", "sol", "crypto"]) {
         return MarketCategory::Crypto;
     }
     if contains_any(&text, &["cpi", "inflation", "fed", "rate", "macro"]) {
@@ -455,10 +426,7 @@ fn infer_category(underlying: &str, display_name: &str) -> MarketCategory {
     if contains_any(&text, &["election", "president", "senate", "politic"]) {
         return MarketCategory::Politics;
     }
-    if contains_any(
-        &text,
-        &["nba", "nfl", "cricket", "football", "tennis", "sport"],
-    ) {
+    if contains_any(&text, &["nba", "nfl", "cricket", "football", "tennis", "sport"]) {
         return MarketCategory::Sports;
     }
     if contains_any(&text, &["nasdaq", "spx", "s&p", "stock", "gold", "oil"]) {
@@ -474,12 +442,8 @@ fn infer_market_kind(underlying: &str, display_name: &str, valid_strikes: &[u64]
         return MarketKind::BinaryEvent;
     }
 
-    if contains_any(
-        &text,
-        &[
-            "btc", "bitcoin", "eth", "ethereum", "sui", "sol", "solana", "price",
-        ],
-    ) {
+    if contains_any(&text, &["btc", "bitcoin", "eth", "ethereum", "sui", "sol", "solana", "price"])
+    {
         return MarketKind::ScalarPrice;
     }
 
@@ -524,15 +488,11 @@ fn first_string(raw: &Value, paths: &[&str]) -> Option<String> {
 }
 
 fn first_u64(raw: &Value, paths: &[&str]) -> Option<u64> {
-    paths
-        .iter()
-        .find_map(|path| parse_u64_value(get_path(raw, path)?))
+    paths.iter().find_map(|path| parse_u64_value(get_path(raw, path)?))
 }
 
 fn first_f64(raw: &Value, paths: &[&str]) -> Option<f64> {
-    paths
-        .iter()
-        .find_map(|path| parse_f64_value(get_path(raw, path)?))
+    paths.iter().find_map(|path| parse_f64_value(get_path(raw, path)?))
 }
 
 fn first_u64_array(raw: &Value, paths: &[&str]) -> Option<Vec<u64>> {

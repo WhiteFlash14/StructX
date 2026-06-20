@@ -87,16 +87,12 @@ pub fn parse_intent_deterministic(request: UserIntentRequest) -> anyhow::Result<
     let direction = infer_direction(&normalized);
     let range = infer_range(&normalized);
     let strategy_template = infer_strategy_template(&normalized, &direction, &range);
-    let budget = request
-        .budget
-        .or_else(|| infer_budget_from_prompt(&normalized));
+    let budget = request.budget.or_else(|| infer_budget_from_prompt(&normalized));
     let quote_asset = request
         .quote_asset
         .filter(|asset| !asset.trim().is_empty())
         .unwrap_or_else(|| "DUSDC".to_string());
-    let risk_style = request
-        .risk_style
-        .unwrap_or_else(|| infer_risk_style(&normalized));
+    let risk_style = request.risk_style.unwrap_or_else(|| infer_risk_style(&normalized));
     let expiry_preference = infer_expiry_preference(&normalized);
 
     let mut needs_clarification = false;
@@ -104,10 +100,7 @@ pub fn parse_intent_deterministic(request: UserIntentRequest) -> anyhow::Result<
 
     if budget.is_none() {
         needs_clarification = true;
-        set_clarification_once(
-            &mut clarification_question,
-            "How much dUSDC do you want to spend?",
-        );
+        set_clarification_once(&mut clarification_question, "How much dUSDC do you want to spend?");
     }
 
     if market_query.trim().is_empty() {
@@ -133,13 +126,8 @@ pub fn parse_intent_deterministic(request: UserIntentRequest) -> anyhow::Result<
         );
     }
 
-    let confidence = infer_confidence(
-        &market_query,
-        budget,
-        &strategy_template,
-        needs_clarification,
-        &warnings,
-    );
+    let confidence =
+        infer_confidence(&market_query, budget, &strategy_template, needs_clarification, &warnings);
 
     Ok(IntentPlan {
         raw_prompt,
@@ -196,10 +184,7 @@ async fn search_candidate_markets<S: MarketStore + ?Sized>(
 
     if intent_plan.market_kind_hint.is_some() {
         let relaxed_kind = store
-            .search_markets(MarketSearchQuery {
-                market_kind_hint: None,
-                ..base_query.clone()
-            })
+            .search_markets(MarketSearchQuery { market_kind_hint: None, ..base_query.clone() })
             .await
             .context("failed to retry market search without market kind hint")?;
         if !relaxed_kind.is_empty() {
@@ -276,12 +261,7 @@ fn infer_market_query(text: &str) -> Option<String> {
 
 fn infer_category_hint(text: &str, market_query: &str) -> Option<MarketCategory> {
     let combined = format!("{} {}", text, market_query).to_ascii_lowercase();
-    if contains_any(
-        &combined,
-        &[
-            "btc", "bitcoin", "eth", "ethereum", "sui", "crypto", "solana",
-        ],
-    ) {
+    if contains_any(&combined, &["btc", "bitcoin", "eth", "ethereum", "sui", "crypto", "solana"]) {
         return Some(MarketCategory::Crypto);
     }
     if contains_any(&combined, &["election", "president", "senate", "politic"]) {
@@ -298,48 +278,28 @@ fn infer_category_hint(text: &str, market_query: &str) -> Option<MarketCategory>
 
 fn infer_market_kind_hint(text: &str, market_query: &str) -> Option<MarketKind> {
     let combined = format!("{} {}", text, market_query).to_ascii_lowercase();
-    if contains_any(
-        &combined,
-        &["btc", "bitcoin", "eth", "ethereum", "sui", "sol", "price"],
-    ) {
+    if contains_any(&combined, &["btc", "bitcoin", "eth", "ethereum", "sui", "sol", "price"]) {
         return Some(MarketKind::ScalarPrice);
     }
-    if contains_any(
-        &combined,
-        &["above", "below", "between", "range", "score", "vote share"],
-    ) {
+    if contains_any(&combined, &["above", "below", "between", "range", "score", "vote share"]) {
         return Some(MarketKind::ScalarEvent);
     }
     None
 }
 
 fn infer_direction(text: &str) -> Direction {
-    if contains_any(
-        text,
-        &[
-            "either side",
-            "big move",
-            "breakout",
-            "volatile",
-            "volatility",
-        ],
-    ) {
+    if contains_any(text, &["either side", "big move", "breakout", "volatile", "volatility"]) {
         return Direction::EitherSide;
     }
     if contains_any(text, &["between", "range", "sideways", "inside"]) {
         return Direction::InsideRange;
     }
-    if contains_any(
-        text,
-        &["pump", "moon", "up", "above", "higher", "bullish", "rally"],
-    ) {
+    if contains_any(text, &["pump", "moon", "up", "above", "higher", "bullish", "rally"]) {
         return Direction::Up;
     }
     if contains_any(
         text,
-        &[
-            "dump", "crash", "down", "below", "lower", "bearish", "protect", "hedge",
-        ],
+        &["dump", "crash", "down", "below", "lower", "bearish", "protect", "hedge"],
     ) {
         return Direction::Down;
     }
@@ -351,22 +311,10 @@ fn infer_strategy_template(
     direction: &Direction,
     range: &Option<RangeIntent>,
 ) -> StrategyTemplateId {
-    if contains_any(
-        text,
-        &[
-            "choose for me",
-            "best thing",
-            "find best",
-            "smart",
-            "optimize",
-        ],
-    ) {
+    if contains_any(text, &["choose for me", "best thing", "find best", "smart", "optimize"]) {
         return StrategyTemplateId::SmartBudget;
     }
-    if contains_any(
-        text,
-        &["custom payoff", "piecewise", "payoff shape", "buckets"],
-    ) {
+    if contains_any(text, &["custom payoff", "piecewise", "payoff shape", "buckets"]) {
         return StrategyTemplateId::CustomPiecewise;
     }
     if range.is_some() || matches!(direction, Direction::InsideRange) {
@@ -403,16 +351,10 @@ fn infer_range(text: &str) -> Option<RangeIntent> {
         if a > b {
             std::mem::swap(&mut a, &mut b);
         }
-        return Some(RangeIntent {
-            lower: Some(a),
-            upper: Some(b),
-        });
+        return Some(RangeIntent { lower: Some(a), upper: Some(b) });
     }
 
-    Some(RangeIntent {
-        lower: None,
-        upper: None,
-    })
+    Some(RangeIntent { lower: None, upper: None })
 }
 
 fn infer_budget_from_prompt(text: &str) -> Option<u64> {
@@ -426,15 +368,9 @@ fn infer_budget_from_prompt(text: &str) -> Option<u64> {
             continue;
         };
 
-        let next = tokens
-            .get(idx + 1)
-            .map(|s| s.to_ascii_lowercase())
-            .unwrap_or_default();
+        let next = tokens.get(idx + 1).map(|s| s.to_ascii_lowercase()).unwrap_or_default();
         let prev = if idx > 0 {
-            tokens
-                .get(idx - 1)
-                .map(|s| s.to_ascii_lowercase())
-                .unwrap_or_default()
+            tokens.get(idx - 1).map(|s| s.to_ascii_lowercase()).unwrap_or_default()
         } else {
             String::new()
         };
@@ -540,10 +476,7 @@ fn parse_human_number(input: &str) -> Option<f64> {
 }
 
 fn normalize(input: &str) -> String {
-    input
-        .trim()
-        .to_ascii_lowercase()
-        .replace(['-', '_', '/'], " ")
+    input.trim().to_ascii_lowercase().replace(['-', '_', '/'], " ")
 }
 
 fn contains_any(text: &str, needles: &[&str]) -> bool {

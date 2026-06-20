@@ -44,9 +44,7 @@ pub struct DiskIntentAuditStore {
 
 impl DiskIntentAuditStore {
     pub fn new(root_dir: impl Into<PathBuf>) -> Self {
-        Self {
-            root_dir: root_dir.into(),
-        }
+        Self { root_dir: root_dir.into() }
     }
 
     pub fn default_state_dir() -> Self {
@@ -75,12 +73,9 @@ impl DiskIntentAuditStore {
 
     pub async fn save(&self, audit: &IntentExecutionAudit) -> anyhow::Result<()> {
         self.ensure_dirs().await?;
-        self.atomic_write_json(&self.audit_path(&audit.audit_id), audit)
-            .await?;
-        self.atomic_write_json(&self.by_proposal_path(&audit.proposal_id), audit)
-            .await?;
-        self.atomic_write_json(&self.by_digest_path(&audit.tx_digest), audit)
-            .await?;
+        self.atomic_write_json(&self.audit_path(&audit.audit_id), audit).await?;
+        self.atomic_write_json(&self.by_proposal_path(&audit.proposal_id), audit).await?;
+        self.atomic_write_json(&self.by_digest_path(&audit.tx_digest), audit).await?;
         Ok(())
     }
 
@@ -147,9 +142,8 @@ impl DiskIntentAuditStore {
         path: &Path,
         value: &T,
     ) -> anyhow::Result<()> {
-        let parent = path
-            .parent()
-            .ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
+        let parent =
+            path.parent().ok_or_else(|| anyhow!("path has no parent: {}", path.display()))?;
         fs::create_dir_all(parent).await?;
 
         let tmp_path = path.with_extension("json.tmp");
@@ -176,10 +170,7 @@ impl DiskIntentAuditStore {
 pub fn now_ms() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as u64
+    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_millis() as u64
 }
 
 pub fn make_audit_id(proposal_id: &str, tx_digest: &str) -> String {
@@ -218,10 +209,8 @@ pub fn infer_manager_id_from_execution(raw: &serde_json::Value) -> Option<String
             continue;
         }
 
-        if let Some(object_id) = change
-            .get("objectId")
-            .or_else(|| change.get("object_id"))
-            .and_then(|v| v.as_str())
+        if let Some(object_id) =
+            change.get("objectId").or_else(|| change.get("object_id")).and_then(|v| v.as_str())
         {
             return Some(object_id.to_string());
         }

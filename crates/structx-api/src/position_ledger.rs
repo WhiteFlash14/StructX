@@ -199,11 +199,7 @@ impl PositionLedger {
     /// Apply a mint event. Same-key mints merge (sum quantity + premium).
     pub fn apply_mint(&mut self, leg: &MintedLeg, source_digest: &str, opened_at_unix: i64) {
         let position_id = Self::position_id(&self.owner, &self.manager_id, leg);
-        if let Some(existing) = self
-            .positions
-            .iter_mut()
-            .find(|p| p.position_id == position_id)
-        {
+        if let Some(existing) = self.positions.iter_mut().find(|p| p.position_id == position_id) {
             let q = existing
                 .original_quantity_raw
                 .parse::<u128>()
@@ -218,18 +214,12 @@ impl PositionLedger {
                 .saturating_add(leg.quantity_raw);
             existing.remaining_quantity_raw = remaining.to_string();
 
-            let premium = existing
-                .premium_paid_raw
-                .parse::<u128>()
-                .unwrap_or(0)
-                .saturating_add(leg.cost_raw);
+            let premium =
+                existing.premium_paid_raw.parse::<u128>().unwrap_or(0).saturating_add(leg.cost_raw);
             existing.premium_paid_raw = premium.to_string();
 
-            existing.status = if remaining == 0 {
-                PositionStatus::Closed
-            } else {
-                PositionStatus::Open
-            };
+            existing.status =
+                if remaining == 0 { PositionStatus::Closed } else { PositionStatus::Open };
         } else {
             self.positions.push(PositionRecord {
                 position_id,
@@ -286,11 +276,7 @@ impl PositionLedger {
             Self::position_id(&self.owner, &self.manager_id, &proxy)
         };
 
-        if let Some(existing) = self
-            .positions
-            .iter_mut()
-            .find(|p| p.position_id == position_id)
-        {
+        if let Some(existing) = self.positions.iter_mut().find(|p| p.position_id == position_id) {
             let original = existing.original_quantity_raw.parse::<u128>().unwrap_or(0);
             let premium = existing.premium_paid_raw.parse::<u128>().unwrap_or(0);
             let remaining = existing.remaining_quantity_raw.parse::<u128>().unwrap_or(0);
@@ -299,10 +285,7 @@ impl PositionLedger {
 
             // Pro-rata premium basis for the redeemed slice.
             let premium_basis_redeemed = if original > 0 {
-                premium
-                    .saturating_mul(redeem_qty)
-                    .checked_div(original)
-                    .unwrap_or(0)
+                premium.saturating_mul(redeem_qty).checked_div(original).unwrap_or(0)
             } else {
                 0
             };
@@ -319,11 +302,8 @@ impl PositionLedger {
             existing.remaining_quantity_raw = new_remaining.to_string();
             existing.realized_payout_raw = realized_payout.to_string();
             existing.realized_pnl_raw = realized_pnl.to_string();
-            existing.status = if new_remaining == 0 {
-                PositionStatus::Closed
-            } else {
-                PositionStatus::Open
-            };
+            existing.status =
+                if new_remaining == 0 { PositionStatus::Closed } else { PositionStatus::Open };
             // A redeem invalidates the prior preview — quote refresh required.
             existing.last_preview_payout_raw = "0".to_string();
             existing.last_preview_pnl_raw = "0".to_string();
@@ -343,11 +323,7 @@ impl PositionLedger {
         pnl_raw: i128,
         previewed_at_unix: i64,
     ) {
-        if let Some(existing) = self
-            .positions
-            .iter_mut()
-            .find(|p| p.position_id == position_id)
-        {
+        if let Some(existing) = self.positions.iter_mut().find(|p| p.position_id == position_id) {
             existing.last_preview_payout_raw = payout_raw.to_string();
             existing.last_preview_pnl_raw = pnl_raw.to_string();
             existing.last_preview_at_unix = previewed_at_unix;
