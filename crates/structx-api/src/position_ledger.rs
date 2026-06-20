@@ -511,4 +511,102 @@ mod tests {
         assert_eq!(l.positions[0].realized_pnl_raw, "500");
         assert_eq!(l.positions[0].status, PositionStatus::Open);
     }
+
+    #[test]
+    fn apply_redeem_full_closes() {
+        let mut l = PositionLedger::empty("0xOWNER", "0xMANAGER");
+        l.apply_mint(&sample_mint(LegKind::Up, 1000, 600), "0xDIGEST_OPEN", 1);
+        l.apply_redeem(
+            &RedeemedLeg {
+                kind: LegKind::Up,
+                oracle_id: "0xORACLE".to_string(),
+                expiry_ms: "1781289000000".to_string(),
+                strike_raw: Some("64475000000000".to_string()),
+                lower_raw: None,
+                upper_raw: None,
+                quantity_raw: 1000,
+                payout_raw: 300,
+            },
+            "0xDIGEST_REDEEM",
+        );
+        assert_eq!(l.positions[0].remaining_quantity_raw, "0");
+        assert_eq!(l.positions[0].realized_payout_raw, "300");
+        // pnl_delta = 300 - 600 = -300
+        assert_eq!(l.positions[0].realized_pnl_raw, "-300");
+        assert_eq!(l.positions[0].status, PositionStatus::Closed);
+    }
+
+    #[test]
+    fn redeem_more_than_remaining_is_capped() {
+        let mut l = PositionLedger::empty("0xOWNER", "0xMANAGER");
+        l.apply_mint(&sample_mint(LegKind::Up, 1000, 600), "0xDIGEST_OPEN", 1);
+        l.apply_redeem(
+            &RedeemedLeg {
+                kind: LegKind::Up,
+                oracle_id: "0xORACLE".to_string(),
+                expiry_ms: "1781289000000".to_string(),
+                strike_raw: Some("64475000000000".to_string()),
+                lower_raw: None,
+                upper_raw: None,
+                quantity_raw: 5000, // > remaining
+                payout_raw: 100,
+            },
+            "0xDIGEST_REDEEM",
+        );
+        assert_eq!(l.positions[0].remaining_quantity_raw, "0");
+        assert_eq!(l.positions[0].status, PositionStatus::Closed);
+    }
+
+    #[test]
+    fn apply_preview_updates_latest_unrealized_snapshot() {
+        let mut l = PositionLedger::empty("0xOWNER", "0xMANAGER");
+        l.apply_mint(&sample_mint(LegKind::Up, 1000, 600), "0xDIGEST_OPEN", 1);
+        let position_id = l.positions[0].position_id.clone();
+
+        l.apply_preview(&position_id, 700, 100, 123);
+
+        assert_eq!(l.positions[0].last_preview_payout_raw, "700");
+        assert_eq!(l.positions[0].last_preview_pnl_raw, "100");
+        assert_eq!(l.positions[0].last_preview_at_unix, 123);
+    }
+
+    #[test]
+    fn premium_basis_math_zero_quantity() {
+        assert_eq!(premium_basis_for_slice(100, 0, 10), 0);
+    }
+
+    #[test]
+    fn premium_basis_math_half() {
+        assert_eq!(premium_basis_for_slice(600, 1000, 500), 300);
+    }
+
+    #[test]
+    fn premium_basis_math_full() {
+        assert_eq!(premium_basis_for_slice(600, 1000, 1000), 600);
+    }
+
+    #[test]
+    fn summary_aggregates_open_and_closed() {
+        let mut l = PositionLedger::empty("0xOWNER", "0xMANAGER");
+        l.apply_mint(&sample_mint(LegKind::Up, 1000, 600), "0xDIGEST1", 1);
+        l.apply_mint(&sample_mint(LegKind::Range, 2000, 400), "0xDIGEST2", 2);
+        l.apply_redeem(
+            &RedeemedLeg {
+                kind: LegKind::Up,
+                oracle_id: "0xORACLE".to_string(),
+                expiry_ms: "1781289000000".to_string(),
+                strike_raw: Some("64475000000000".to_string()),
+                lower_raw: None,
+                upper_raw: None,
+                quantity_raw: 1000,
+                payout_raw: 700,
+            },
+            "0xDIGEST_REDEEM",
+        );
+        let s = l.summary();
+        assert_eq!(s.open_count, 1, "range still open");
+        assert_eq!(s.closed_count, 1, "up fully redeemed");
+        assert_eq!(s.total_premium_paid_raw, "1000");
+        assert_eq!(s.total_realized_pnl_raw, "100");
+    }
 }

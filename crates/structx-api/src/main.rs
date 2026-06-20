@@ -1,6 +1,5 @@
 #[allow(dead_code)]
 mod intent_audit;
-#[allow(dead_code)]
 mod intent_positions;
 #[allow(dead_code)]
 mod proposal_store;
@@ -16,6 +15,9 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+use deepbook_client::{DeepBookClient, DeepBookConfig, FreshnessConfig, MarketSnapshot};
+use intent_audit::DiskIntentAuditStore;
+use intent_positions::list_intent_positions;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
@@ -27,6 +29,11 @@ use std::{
 };
 use tokio::{process::Command, sync::Mutex};
 use tower_http::cors::CorsLayer;
+use structx_service::{
+    load_catalog_status, plan_from_intent, refresh_catalog_from_existing_markets_json,
+    DiskMarketStore, ExpiryPreference, MarketCategory, MarketKind, MarketSearchQuery, MarketStatus,
+    MarketStore, RiskStyle, UserIntentRequest,
+};
 
 const DEFAULT_PREDICT_SERVER_URL: &str = "https://predict-server.testnet.mystenlabs.com";
 
@@ -98,6 +105,44 @@ struct ParseIntentRequest {
     risk_preference: Option<String>,
     #[serde(rename = "timePreference")]
     time_preference: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntentPlanApiRequest {
+    user_address: Option<String>,
+    prompt: String,
+    budget: Option<u64>,
+    quote_asset: Option<String>,
+    risk_style: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RecentIntentAuditsQuery {
+    max: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct IntentPositionsQuery {
+    user_address: Option<String>,
+    max: Option<usize>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarketSearchParams {
+    q: Option<String>,
+    quote_asset: Option<String>,
+    require_active: Option<bool>,
+    category: Option<String>,
+    kind: Option<String>,
+    expiry: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MarketCatalogRefreshResponse {
+    ok: bool,
+    market_count: usize,
+    active_market_count: usize,
+    report: structx_service::CatalogBuildReport,
 }
 
 #[derive(Debug, Deserialize)]
@@ -283,6 +328,52 @@ fn default_max_quote_market_attempts() -> usize {
     5
 }
 
+fn parse_market_category(input: Option<String>) -> Option<MarketCategory> {
+    match input?.trim().to_ascii_lowercase().as_str() {
+        "crypto" => Some(MarketCategory::Crypto),
+        "finance" => Some(MarketCategory::Finance),
+        "sports" => Some(MarketCategory::Sports),
+        "politics" => Some(MarketCategory::Politics),
+        "macro" => Some(MarketCategory::Macro),
+        "weather" => Some(MarketCategory::Weather),
+        "other" => Some(MarketCategory::Other),
+        "unknown" => Some(MarketCategory::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_market_kind(input: Option<String>) -> Option<MarketKind> {
+    match input?.trim().to_ascii_lowercase().as_str() {
+        "scalar_price" | "price" => Some(MarketKind::ScalarPrice),
+        "scalar_event" | "scalar" => Some(MarketKind::ScalarEvent),
+        "binary_event" | "binary" => Some(MarketKind::BinaryEvent),
+        "categorical_event" | "categorical" => Some(MarketKind::CategoricalEvent),
+        "unknown" => Some(MarketKind::Unknown),
+        _ => None,
+    }
+}
+
+fn parse_expiry_preference(input: Option<String>) -> Option<ExpiryPreference> {
+    match input?.trim().to_ascii_lowercase().as_str() {
+        "nearest" | "nearest_active" => Some(ExpiryPreference::NearestActive),
+        "soonest" => Some(ExpiryPreference::Soonest),
+        "latest" => Some(ExpiryPreference::Latest),
+        "any" => Some(ExpiryPreference::Any),
+        _ => None,
+    }
+}
+
+fn parse_risk_style(input: Option<String>) -> Option<RiskStyle> {
+    match input?.trim().to_ascii_lowercase().as_str() {
+        "conservative" => Some(RiskStyle::Conservative),
+        "balanced" => Some(RiskStyle::Balanced),
+        "aggressive" => Some(RiskStyle::Aggressive),
+        "tail_heavy" | "tail-heavy" => Some(RiskStyle::TailHeavy),
+        "higher_hit_rate" | "higher-hit-rate" => Some(RiskStyle::HigherHitRate),
+        _ => None,
+    }
+}
+
 #[tokio::main]
 async fn main() {
     let cli_bin = env::var("STRUCTX_CLI_BIN")
@@ -305,7 +396,22 @@ async fn main() {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/market/live-price", get(live_price))
+        .route("/api/intent/plan", post(plan_intent))
+        .route("/api/intent/audits/recent", get(list_recent_intent_audits))
+        .route(
+            "/api/intent/audits/proposal/{proposal_id}",
+            get(get_intent_audit_by_proposal),
+        )
+        .route(
+            "/api/intent/audits/digest/{digest}",
+            get(get_intent_audit_by_digest),
+        )
+        .route("/api/intent/positions", get(list_intent_position_overlays))
         .route("/api/intent/parse", post(parse_intent))
+        .route("/api/markets/catalog/status", get(get_market_catalog_status))
+        .route("/api/markets/catalog/refresh", post(refresh_market_catalog))
+        .route("/api/markets/search", get(search_market_catalog))
+        .route("/api/markets/catalog/{market_id}", get(get_catalog_market))
         .route("/api/strategies/compile-from-intent", post(compile_from_intent))
         .route("/api/strategies/compile", post(compile_strategy))
         .route("/api/tx/build-open-strategy", post(build_open_strategy))
@@ -331,6 +437,326 @@ async fn main() {
     axum::serve(tokio::net::TcpListener::bind(addr).await.expect("bind API listener"), app)
         .await
         .expect("serve API");
+}
+
+async fn plan_intent(Json(req): Json<IntentPlanApiRequest>) -> impl IntoResponse {
+    if req.prompt.trim().is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": "prompt cannot be empty",
+            })),
+        );
+    }
+
+    let store = DiskMarketStore::default_state_dir();
+    if let Err(err) = ensure_market_catalog_ready(&store).await {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": format!("failed to prepare market catalog for intent planning: {err}"),
+            })),
+        );
+    }
+
+    let service_request = UserIntentRequest {
+        user_address: req.user_address,
+        prompt: req.prompt,
+        budget: req.budget,
+        quote_asset: req.quote_asset,
+        risk_style: parse_risk_style(req.risk_style),
+    };
+
+    match plan_from_intent(&store, service_request).await {
+        Ok(response) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(response).unwrap_or_else(
+                |_| serde_json::json!({"ok": false, "error": "failed to serialize intent plan"}),
+            )),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "message": err.to_string(),
+            })),
+        ),
+    }
+}
+
+async fn get_intent_audit_by_proposal(Path(proposal_id): Path<String>) -> impl IntoResponse {
+    let store = DiskIntentAuditStore::default_state_dir();
+    match store.load_by_proposal(&proposal_id).await {
+        Ok(Some(audit)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(audit).unwrap_or_default()),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(
+                serde_json::json!({"ok": false, "message": format!("intent audit not found for proposal: {proposal_id}")}),
+            ),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({"ok": false, "message": format!("failed to load intent audit: {err}")}),
+            ),
+        ),
+    }
+}
+
+async fn get_intent_audit_by_digest(Path(digest): Path<String>) -> impl IntoResponse {
+    let store = DiskIntentAuditStore::default_state_dir();
+    match store.load_by_digest(&digest).await {
+        Ok(Some(audit)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(audit).unwrap_or_default()),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(
+                serde_json::json!({"ok": false, "message": format!("intent audit not found for digest: {digest}")}),
+            ),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({"ok": false, "message": format!("failed to load intent audit: {err}")}),
+            ),
+        ),
+    }
+}
+
+async fn list_recent_intent_audits(
+    Query(query): Query<RecentIntentAuditsQuery>,
+) -> impl IntoResponse {
+    let store = DiskIntentAuditStore::default_state_dir();
+    match store.list_recent(query.max.unwrap_or(25).min(100)).await {
+        Ok(audits) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(audits).unwrap_or_default()),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({"ok": false, "message": format!("failed to list intent audits: {err}")}),
+            ),
+        ),
+    }
+}
+
+async fn list_intent_position_overlays(
+    Query(query): Query<IntentPositionsQuery>,
+) -> impl IntoResponse {
+    match list_intent_positions(query.user_address, query.max.unwrap_or(50).min(200)).await {
+        Ok(positions) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(positions).unwrap_or_default()),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(
+                serde_json::json!({"ok": false, "message": format!("failed to list intent positions: {err}")}),
+            ),
+        ),
+    }
+}
+
+async fn ensure_market_catalog_ready(store: &DiskMarketStore) -> Result<(), String> {
+    let needs_refresh = match store.load_latest_catalog().await {
+        Ok(Some(catalog)) => catalog.markets.is_empty(),
+        Ok(None) => true,
+        Err(err) => return Err(format!("failed to inspect existing market catalog: {err}")),
+    };
+
+    if !needs_refresh {
+        return Ok(());
+    }
+
+    let raw_markets_json = load_existing_markets_json().await?;
+    refresh_catalog_from_existing_markets_json(store, raw_markets_json)
+        .await
+        .map(|_| ())
+        .map_err(|err| format!("failed to refresh market catalog from live markets: {err}"))
+}
+
+async fn get_market_catalog_status() -> impl IntoResponse {
+    let store = DiskMarketStore::default_state_dir();
+
+    match load_catalog_status(&store).await {
+        Ok(status) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(status).unwrap_or_default()),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("failed to load market catalog status: {err}")
+            })),
+        ),
+    }
+}
+
+async fn search_market_catalog(Query(params): Query<MarketSearchParams>) -> impl IntoResponse {
+    let store = DiskMarketStore::default_state_dir();
+    let query = MarketSearchQuery {
+        text: params.q.unwrap_or_default(),
+        category_hint: parse_market_category(params.category),
+        market_kind_hint: parse_market_kind(params.kind),
+        require_active: params.require_active.unwrap_or(true),
+        quote_asset: params.quote_asset.or_else(|| Some("DUSDC".to_string())),
+        expiry_preference: parse_expiry_preference(params.expiry)
+            .or(Some(ExpiryPreference::NearestActive)),
+    };
+
+    match store.search_markets(query).await {
+        Ok(markets) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(markets).unwrap_or_else(|_| serde_json::json!([]))),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("failed to search market catalog: {err}")
+            })),
+        ),
+    }
+}
+
+async fn get_catalog_market(Path(market_id): Path<String>) -> impl IntoResponse {
+    let store = DiskMarketStore::default_state_dir();
+
+    match store.get_market(&market_id).await {
+        Ok(Some(market)) => (
+            StatusCode::OK,
+            Json(serde_json::to_value(market).unwrap_or_default()),
+        ),
+        Ok(None) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("market not found: {market_id}")
+            })),
+        ),
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("failed to load catalog market: {err}")
+            })),
+        ),
+    }
+}
+
+async fn refresh_market_catalog() -> impl IntoResponse {
+    let store = DiskMarketStore::default_state_dir();
+
+    let raw_markets_json = match load_existing_markets_json().await {
+        Ok(value) => value,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to load live markets for catalog refresh: {err}")
+                })),
+            );
+        }
+    };
+
+    match refresh_catalog_from_existing_markets_json(&store, raw_markets_json).await {
+        Ok((catalog, report)) => {
+            let active_market_count = catalog
+                .markets
+                .iter()
+                .filter(|m| m.status == MarketStatus::Active)
+                .count();
+
+            (
+                StatusCode::OK,
+                Json(
+                    serde_json::to_value(MarketCatalogRefreshResponse {
+                        ok: true,
+                        market_count: catalog.markets.len(),
+                        active_market_count,
+                        report,
+                    })
+                    .unwrap_or_default(),
+                ),
+            )
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": format!("failed to refresh market catalog: {err}")
+            })),
+        ),
+    }
+}
+
+async fn load_existing_markets_json() -> Result<serde_json::Value, String> {
+    let client = DeepBookClient::new(DeepBookConfig::default())
+        .map_err(|err| format!("could not initialize DeepBook client: {err}"))?;
+
+    let markets = client
+        .load_market_directory(FreshnessConfig::default())
+        .await
+        .map_err(|err| format!("could not load market directory: {err}"))?;
+
+    Ok(build_markets_envelope(&markets))
+}
+
+fn build_markets_envelope(markets: &[MarketSnapshot]) -> serde_json::Value {
+    let usable = markets
+        .iter()
+        .filter(|market| market.structx_status.is_usable())
+        .count();
+    let deepbook_only = markets
+        .iter()
+        .filter(|market| match &market.structx_status {
+            deepbook_client::StructxMarketStatus::Rejected { reasons, .. } => {
+                !reasons.is_empty()
+                    && reasons.iter().all(|reason| {
+                        matches!(reason, deepbook_client::MarketRejectionReason::NonBtc)
+                    })
+            }
+            _ => false,
+        })
+        .count();
+    let warnings = markets
+        .iter()
+        .filter(|market| {
+            matches!(
+                market.structx_status,
+                deepbook_client::StructxMarketStatus::UsableWithWarnings(_)
+            )
+        })
+        .count();
+    let asset_count = markets
+        .iter()
+        .filter_map(|market| market.underlying())
+        .map(|asset| asset.to_ascii_uppercase())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+
+    serde_json::json!({
+        "ok": true,
+        "asset": "ALL",
+        "network": "sui:testnet",
+        "totalCount": markets.len(),
+        "usableCount": usable,
+        "deepbookOnlyCount": deepbook_only,
+        "warningsCount": warnings,
+        "assetCount": asset_count,
+        "structxSupportedAsset": "BTC",
+        "markets": markets,
+    })
 }
 
 async fn compile_from_intent(

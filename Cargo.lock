@@ -1609,6 +1609,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "axum",
+ "deepbook-client",
  "reqwest",
  "serde",
  "serde_json",

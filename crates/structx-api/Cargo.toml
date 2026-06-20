@@ -6,6 +6,7 @@ edition = "2021"
 [dependencies]
 anyhow = "1"
 axum = "0.8"
+deepbook-client = { path = "../deepbook-client" }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
