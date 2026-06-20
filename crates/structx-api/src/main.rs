@@ -10,7 +10,7 @@ mod storage;
 
 use axum::{
     extract::{Path, Query, State},
-    http::StatusCode,
+    http::{header, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -25,7 +25,7 @@ use std::{
     net::SocketAddr,
     path::{Path as StdPath, PathBuf},
     sync::Arc,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 use tokio::{process::Command, sync::Mutex};
 use tower_http::cors::CorsLayer;
@@ -51,6 +51,90 @@ struct AppState {
     compiled: Arc<Mutex<HashMap<String, serde_json::Value>>>,
     audits_dir: PathBuf,
     audit_lock: Arc<Mutex<()>>,
+    managers: Arc<Mutex<HashMap<String, String>>>,
+    managers_path: PathBuf,
+    markets_refresh: Arc<Mutex<MarketsRefreshState>>,
+}
+
+#[derive(Debug, Default)]
+struct MarketsRefreshState {
+    in_flight: bool,
+    last_started_at: Option<Instant>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone)]
+struct MarketsCacheRecord {
+    #[serde(rename = "schemaVersion")]
+    schema_version: u8,
+    #[serde(rename = "refreshedAtUnix")]
+    refreshed_at_unix: i64,
+    envelope: serde_json::Value,
+}
+
+const MARKETS_REFRESH_THROTTLE: Duration = Duration::from_secs(20);
+const MARKETS_CACHE_FRESH_FOR: Duration = Duration::from_secs(75);
+const MARKETS_CACHE_WARM_INTERVAL: Duration = Duration::from_secs(30);
+
+#[derive(Debug, Deserialize)]
+struct SaveManagerRequest {
+    #[serde(rename = "managerId")]
+    manager_id: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ManagerLookupResponse {
+    ok: bool,
+    address: String,
+    #[serde(rename = "managerId", skip_serializing_if = "Option::is_none")]
+    manager_id: Option<String>,
+}
+
+fn normalize_address(address: &str) -> String {
+    let trimmed = address.trim();
+    let lower = trimmed.to_lowercase();
+    if lower.starts_with("0x") {
+        lower
+    } else {
+        format!("0x{lower}")
+    }
+}
+
+fn load_managers(path: &std::path::Path) -> HashMap<String, String> {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            serde_json::from_str::<HashMap<String, String>>(&contents).unwrap_or_else(|err| {
+                eprintln!(
+                    "warning: managers store {} is not valid JSON ({err}); starting empty",
+                    path.display()
+                );
+                HashMap::new()
+            })
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
+        Err(err) => {
+            eprintln!(
+                "warning: failed to read managers store {} ({err}); starting empty",
+                path.display()
+            );
+            HashMap::new()
+        }
+    }
+}
+
+fn save_managers(path: &std::path::Path, map: &HashMap<String, String>) -> std::io::Result<()> {
+    if let Some(parent) = path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    // Atomic write via a sibling tmp file + rename so a crash mid-write can
+    // never leave a half-written managers.json behind.
+    let tmp = path.with_extension("json.tmp");
+    let json = serde_json::to_string_pretty(map)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    std::fs::write(&tmp, json)?;
+    std::fs::rename(&tmp, path)?;
+    Ok(())
 }
 
 #[derive(Debug, Serialize)]
@@ -376,6 +460,13 @@ fn parse_risk_style(input: Option<String>) -> Option<RiskStyle> {
 
 #[tokio::main]
 async fn main() {
+    if let Err(err) = std::fs::create_dir_all(storage::markets_dir()) {
+        eprintln!(
+            "warning: could not create markets cache dir {} ({err})",
+            storage::markets_dir().display()
+        );
+    }
+
     let cli_bin = env::var("STRUCTX_CLI_BIN")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("target/debug/structx-cli"));
@@ -386,12 +477,27 @@ async fn main() {
 
     fs::create_dir_all(&audits_dir).expect("create audits dir");
 
+    let managers_path = env::var("STRUCTX_MANAGERS_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("data/managers.json"));
+    let managers_initial = load_managers(&managers_path);
+    println!(
+        "Loaded {} stored PredictManager(s) from {}",
+        managers_initial.len(),
+        managers_path.display()
+    );
+
     let state = Arc::new(AppState {
         cli_bin,
         compiled: Arc::new(Mutex::new(HashMap::new())),
         audits_dir,
         audit_lock: Arc::new(Mutex::new(())),
+        managers: Arc::new(Mutex::new(managers_initial)),
+        managers_path,
+        markets_refresh: Arc::new(Mutex::new(MarketsRefreshState::default())),
     });
+
+    spawn_markets_cache_warmer(state.clone());
 
     let app = Router::new()
         .route("/health", get(health))
@@ -412,6 +518,11 @@ async fn main() {
         .route("/api/markets/catalog/refresh", post(refresh_market_catalog))
         .route("/api/markets/search", get(search_market_catalog))
         .route("/api/markets/catalog/{market_id}", get(get_catalog_market))
+        .route("/api/markets", get(list_markets))
+        .route(
+            "/api/managers/{address}",
+            get(get_manager_for_address).post(put_manager_for_address),
+        )
         .route("/api/strategies/compile-from-intent", post(compile_from_intent))
         .route("/api/strategies/compile", post(compile_strategy))
         .route("/api/tx/build-open-strategy", post(build_open_strategy))
@@ -581,6 +692,202 @@ async fn ensure_market_catalog_ready(store: &DiskMarketStore) -> Result<(), Stri
         .await
         .map(|_| ())
         .map_err(|err| format!("failed to refresh market catalog from live markets: {err}"))
+}
+
+/// GET /api/markets — fetch the active DeepBook Predict market directory.
+///
+/// This intentionally does not shell out to the CLI. The API persists the last
+/// good snapshot to disk and serves it immediately on subsequent requests,
+/// while revalidating against DeepBook Predict in the background when stale.
+async fn list_markets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
+    let cached = read_cached_markets();
+
+    if let Some(record) = &cached {
+        if markets_cache_is_fresh(record) {
+            return (
+                StatusCode::OK,
+                Json(markets_cache_response(record, "disk", false)),
+            );
+        }
+
+        if markets_refresh_in_flight(&state).await {
+            return (
+                StatusCode::OK,
+                Json(markets_cache_response(record, "disk_refreshing", true)),
+            );
+        }
+
+        match refresh_markets_snapshot(state.clone()).await {
+            Ok(envelope) => return (StatusCode::OK, Json(envelope)),
+            Err(err) => {
+                eprintln!("warning: synchronous markets refresh failed: {err}");
+                maybe_spawn_markets_refresh(state.clone()).await;
+                return (
+                    StatusCode::OK,
+                    Json(markets_cache_response(record, "disk_stale", true)),
+                );
+            }
+        }
+    }
+
+    match refresh_markets_snapshot(state).await {
+        Ok(envelope) => (StatusCode::OK, Json(envelope)),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": err,
+            })),
+        ),
+    }
+}
+
+fn markets_cache_age(record: &MarketsCacheRecord) -> Duration {
+    let now = storage::unix_now();
+    if record.refreshed_at_unix >= now {
+        Duration::from_secs(0)
+    } else {
+        Duration::from_secs((now - record.refreshed_at_unix) as u64)
+    }
+}
+
+fn markets_cache_is_fresh(record: &MarketsCacheRecord) -> bool {
+    markets_cache_age(record) <= MARKETS_CACHE_FRESH_FOR
+}
+
+fn markets_cache_response(
+    record: &MarketsCacheRecord,
+    source: &str,
+    stale: bool,
+) -> serde_json::Value {
+    let mut envelope = record.envelope.clone();
+    if let Some(obj) = envelope.as_object_mut() {
+        obj.insert(
+            "cachedAtUnix".to_string(),
+            serde_json::Value::from(record.refreshed_at_unix),
+        );
+        obj.insert(
+            "cacheAgeSeconds".to_string(),
+            serde_json::Value::from(markets_cache_age(record).as_secs()),
+        );
+        obj.insert("cacheSource".to_string(), serde_json::Value::from(source));
+        obj.insert("stale".to_string(), serde_json::Value::from(stale));
+    }
+    envelope
+}
+
+fn read_cached_markets() -> Option<MarketsCacheRecord> {
+    match storage::read_json::<MarketsCacheRecord>(&storage::all_markets_cache_path()) {
+        Ok(record) => record,
+        Err(err) => {
+            eprintln!(
+                "warning: could not read markets cache {} ({err})",
+                storage::all_markets_cache_path().display()
+            );
+            None
+        }
+    }
+    .or_else(|| {
+        match storage::read_json::<MarketsCacheRecord>(&storage::btc_markets_cache_path()) {
+            Ok(record) => record,
+            Err(err) => {
+                eprintln!(
+                    "warning: could not read legacy BTC markets cache {} ({err})",
+                    storage::btc_markets_cache_path().display()
+                );
+                None
+            }
+        }
+    })
+}
+
+async fn markets_refresh_in_flight(state: &Arc<AppState>) -> bool {
+    state.markets_refresh.lock().await.in_flight
+}
+
+async fn refresh_markets_snapshot(state: Arc<AppState>) -> Result<serde_json::Value, String> {
+    {
+        let mut refresh = state.markets_refresh.lock().await;
+        refresh.in_flight = true;
+        refresh.last_started_at = Some(Instant::now());
+    }
+
+    let client = match DeepBookClient::new(DeepBookConfig::default()) {
+        Ok(client) => client,
+        Err(err) => return Err(format!("could not initialize DeepBook client: {err}")),
+    };
+
+    match client
+        .load_market_directory(FreshnessConfig::default())
+        .await
+    {
+        Ok(markets) => {
+            let mut envelope = build_markets_envelope(&markets);
+            let now = storage::unix_now();
+            if let Some(obj) = envelope.as_object_mut() {
+                obj.insert("cachedAtUnix".to_string(), serde_json::Value::from(now));
+                obj.insert(
+                    "cacheSource".to_string(),
+                    serde_json::Value::from("deepbook_refresh"),
+                );
+                obj.insert("stale".to_string(), serde_json::Value::from(false));
+            }
+
+            let record = MarketsCacheRecord {
+                schema_version: 1,
+                refreshed_at_unix: now,
+                envelope: envelope.clone(),
+            };
+            if let Err(err) =
+                storage::atomic_write_json(&storage::all_markets_cache_path(), &record)
+            {
+                eprintln!(
+                    "warning: could not persist markets cache {} ({err})",
+                    storage::all_markets_cache_path().display()
+                );
+            }
+
+            let mut refresh = state.markets_refresh.lock().await;
+            refresh.in_flight = false;
+            Ok(envelope)
+        }
+        Err(err) => {
+            let mut refresh = state.markets_refresh.lock().await;
+            refresh.in_flight = false;
+            Err(format!(
+                "could not load markets from DeepBook Predict: {err}"
+            ))
+        }
+    }
+}
+
+async fn maybe_spawn_markets_refresh(state: Arc<AppState>) {
+    let mut refresh = state.markets_refresh.lock().await;
+    if refresh.in_flight {
+        return;
+    }
+    if let Some(last_started_at) = refresh.last_started_at {
+        if last_started_at.elapsed() < MARKETS_REFRESH_THROTTLE {
+            return;
+        }
+    }
+    refresh.in_flight = true;
+    refresh.last_started_at = Some(Instant::now());
+    drop(refresh);
+
+    tokio::spawn(async move {
+        let _ = refresh_markets_snapshot(state).await;
+    });
+}
+
+fn spawn_markets_cache_warmer(state: Arc<AppState>) {
+    tokio::spawn(async move {
+        let mut interval = tokio::time::interval(MARKETS_CACHE_WARM_INTERVAL);
+        loop {
+            interval.tick().await;
+            maybe_spawn_markets_refresh(state.clone()).await;
+        }
+    });
 }
 
 async fn get_market_catalog_status() -> impl IntoResponse {
@@ -2257,6 +2564,101 @@ fn stable_intent_id(owner: &str, message: &str) -> String {
     }
 
     format!("{hash:x}")
+}
+
+async fn get_manager_for_address(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+) -> impl IntoResponse {
+    let started = Instant::now();
+    let key = normalize_address(&address);
+    let manager_id = {
+        let map = state.managers.lock().await;
+        map.get(&key).cloned()
+    };
+    let elapsed_us = started.elapsed().as_micros();
+    println!(
+        "managers GET address={} hit={} elapsed_us={}",
+        key,
+        manager_id.is_some(),
+        elapsed_us
+    );
+
+    let body = Json(ManagerLookupResponse {
+        ok: true,
+        address: key,
+        manager_id,
+    });
+    let headers = [(header::CACHE_CONTROL, "private, max-age=30")];
+    (headers, body)
+}
+
+/// POST /api/managers/:address — persists the given PredictManager id for
+/// this wallet. Body: `{ "managerId": "0x..." }`. Idempotent — re-posting the
+/// same id is a no-op. Re-posting a different id overwrites (we trust the
+/// caller to send the freshly created/discovered manager).
+async fn put_manager_for_address(
+    State(state): State<Arc<AppState>>,
+    Path(address): Path<String>,
+    Json(body): Json<SaveManagerRequest>,
+) -> Result<impl IntoResponse, (StatusCode, Json<serde_json::Value>)> {
+    let started = Instant::now();
+    let key = normalize_address(&address);
+    let manager_id = body.manager_id.trim().to_string();
+    if !manager_id.starts_with("0x") || manager_id.len() < 4 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "managerId must be a 0x-prefixed object id"
+            })),
+        ));
+    }
+
+    let prior;
+    {
+        let mut map = state.managers.lock().await;
+        prior = map.insert(key.clone(), manager_id.clone());
+        if let Err(err) = save_managers(&state.managers_path, &map) {
+            // Roll back the in-memory insert so the in-memory map stays in
+            // sync with what's on disk (otherwise a restart would lose the
+            // entry and the client would think it was stored).
+            match prior {
+                Some(ref old) => {
+                    map.insert(key.clone(), old.clone());
+                }
+                None => {
+                    map.remove(&key);
+                }
+            }
+            return Err((
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to persist managers store: {err}")
+                })),
+            ));
+        }
+    }
+
+    let elapsed_us = started.elapsed().as_micros();
+    println!(
+        "managers POST address={} manager_id={} replaced_prior={} elapsed_us={}",
+        key,
+        manager_id,
+        prior.is_some(),
+        elapsed_us
+    );
+
+    // Explicitly tell the browser not to cache the POST response. The GET
+    // cache is invalidated client-side by the seed() call in lib/api.ts.
+    let body = Json(ManagerLookupResponse {
+        ok: true,
+        address: key,
+        manager_id: Some(manager_id),
+    });
+    let headers = [(header::CACHE_CONTROL, "no-store")];
+    Ok((headers, body))
 }
 
 async fn run_cli_value(
