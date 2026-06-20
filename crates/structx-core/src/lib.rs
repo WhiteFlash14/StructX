@@ -36,8 +36,8 @@ pub use quote_plan::{
 pub use quote_preview::{format_quote_amount, QuoteAssetDisplay, QuotePreview, QuotePreviewLeg};
 pub use quote_tx::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
-    build_mint_tx_kind, build_quote_tx_kind, build_redeem_tx_kind, ManagerPositionRead,
-    MintObjectRefs, QuoteObjectRefs, QuoteTxBuildError, QuoteTxKind,
+    build_mint_tx_kind, build_quote_tx_kind, build_redeem_precheck_tx_kind, build_redeem_tx_kind,
+    ManagerPositionRead, MintObjectRefs, QuoteObjectRefs, QuoteTxBuildError, QuoteTxKind,
 };
 pub use selector::{
     select_best_market, select_candidate_markets, MarketSelectionError, SelectedMarket,

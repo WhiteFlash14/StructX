@@ -16,7 +16,8 @@ use deepbook_client::{
 };
 use structx_core::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
-    build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_tx_kind, compile_breakout, compile_bucket_payoff, compile_center_band_condor,
+    build_mint_tx_kind, build_quote_plan, build_quote_tx_kind, build_redeem_precheck_tx_kind,
+    build_redeem_tx_kind, compile_breakout, compile_bucket_payoff, compile_center_band_condor,
     compile_convex_tail_ladder, compile_downside_convexity, compile_downside_step_ladder,
     compile_expiry_move_note, compile_moonshot_upside, compile_near_barrier_proxy,
     compile_portfolio_crash_shield, compile_range_conviction, compile_upside_step_ladder,
@@ -173,6 +174,17 @@ pub struct DevinspectMintBreakoutJsonArgs {
     pub max_quote_market_attempts: usize,
     pub write_execute_script: bool,
 }
+
+pub struct DevinspectRedeemBreakoutJsonArgs {
+    pub rpc_url: String,
+    pub manager_id: String,
+    pub sender: String,
+    pub from_execution_json: PathBuf,
+    pub auto_size_down: bool,
+    pub write_execute_script: bool,
+    pub allow_zero_payout_script: bool,
+}
+
 struct CheckAnyMarketMintableArgs {
     server_url: String,
     predict_id: String,
@@ -576,6 +588,19 @@ enum Command {
 
         #[arg(long, default_value_t = false)]
         strict_freshness: bool,
+    },
+    DebugRedeemPrecheck {
+        #[arg(long)]
+        manager_id: String,
+
+        #[arg(long)]
+        sender: String,
+
+        #[arg(long)]
+        from_execution_json: PathBuf,
+
+        #[arg(long, default_value_t = 100)]
+        redeem_bps: u16,
     },
     FindMintableBreakoutJson {
         #[arg(long)]
@@ -985,6 +1010,16 @@ async fn main() -> std::process::ExitCode {
             );
 
             list_markets_json_command(cli.server_url, cli.predict_id, freshness).await
+        }
+        Command::DebugRedeemPrecheck { manager_id, sender, from_execution_json, redeem_bps } => {
+            debug_redeem_precheck_command(
+                cli.rpc_url,
+                manager_id,
+                sender,
+                from_execution_json,
+                redeem_bps,
+            )
+            .await
         }
         Command::FindMintableBreakoutJson {
             owner,
@@ -5720,6 +5755,97 @@ pub async fn devinspect_mint_breakout_json_value(
     ))
     .into())
 }
+
+pub async fn devinspect_redeem_breakout_json_value(
+    args: DevinspectRedeemBreakoutJsonArgs,
+) -> Result<serde_json::Value, Box<dyn std::error::Error>> {
+    validate_sui_address_arg("manager-id", &args.manager_id)?;
+    validate_sui_address_arg("sender", &args.sender)?;
+    validate_redeem_bps(10_000)?;
+
+    let base_reads = load_position_reads_from_execution_json(&args.from_execution_json)?;
+
+    if base_reads.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no PositionMinted or RangeMinted events found",
+        )
+        .into());
+    }
+
+    let oracle_id = first_oracle_id(&base_reads)?;
+    let rpc = SuiRpcClient::new(args.rpc_url.clone(), StdDuration::from_secs(20))?;
+    let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let manager = resolve_sui_object(&rpc, &args.manager_id).await?;
+    let oracle = resolve_sui_object(&rpc, &oracle_id).await?;
+    let clock = resolve_sui_object(&rpc, SUI_CLOCK_OBJECT_ID).await?;
+
+    validate_predict_manager_object(&manager)?;
+    validate_quote_object_refs_quiet(&predict, &oracle, &clock)?;
+
+    let candidates = redeem_bps_candidates(10_000, args.auto_size_down);
+    let mut failures = Vec::new();
+
+    for bps in candidates {
+        let reads = scale_position_reads(&base_reads, bps)?;
+        let tx_kind = build_redeem_tx_kind(
+            &reads,
+            MintObjectRefs { predict: &predict, manager: &manager, oracle: &oracle, clock: &clock },
+            &args.sender,
+        )?;
+
+        let response =
+            rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+
+        match redeem_preview_from_response(&response) {
+            Ok((total_payout_raw, events)) => {
+                let asset =
+                    QuoteAssetDisplay { symbol: "dUSDC".to_string(), decimals: DUSDC_DECIMALS };
+
+                let mut warnings = Vec::new();
+                if args.write_execute_script {
+                    warnings.push(
+                        "write_execute_script was requested, but direct API preview mode does not emit helper scripts.".to_string(),
+                    );
+                }
+                if args.allow_zero_payout_script {
+                    warnings.push(
+                        "allow_zero_payout_script is ignored unless script generation is enabled."
+                            .to_string(),
+                    );
+                }
+
+                return Ok(serde_json::json!({
+                    "ok": true,
+                    "managerId": args.manager_id,
+                    "oracleId": oracle_id,
+                    "fromExecutionJson": display_path(&args.from_execution_json),
+                    "requestedRedeemBps": 10_000,
+                    "selectedRedeemBps": bps,
+                    "autoSizeDown": args.auto_size_down,
+                    "legs": serialize_manager_position_reads(&reads),
+                    "totalPayoutRaw": total_payout_raw.to_string(),
+                    "totalPayoutDisplay": asset.format_amount(total_payout_raw),
+                    "eventCount": events.len(),
+                    "events": events,
+                    "failures": failures,
+                    "warnings": warnings,
+                }));
+            }
+            Err(err) => failures.push(serde_json::json!({
+                "redeemBps": bps,
+                "reason": err.to_string(),
+            })),
+        }
+    }
+
+    Err(io::Error::other(format!(
+        "all redeem preview attempts failed: {}",
+        serde_json::to_string(&failures)?
+    ))
+    .into())
+}
+
 fn print_manager_balance_response(
     response: &serde_json::Value,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -6312,6 +6438,112 @@ fn format_usable(status: &StructxMarketStatus) -> String {
         }
     }
 }
+
+fn validate_redeem_bps(bps: u16) -> Result<(), Box<dyn std::error::Error>> {
+    if bps == 0 || bps > 10_000 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--redeem-bps must be in 1..=10000",
+        )
+        .into());
+    }
+
+    Ok(())
+}
+
+fn scale_quantity_bps(quantity: u64, bps: u16) -> u64 {
+    let scaled = quantity.saturating_mul(bps as u64) / 10_000;
+    scaled.max(1).min(quantity)
+}
+
+fn scale_position_reads(
+    reads: &[ManagerPositionRead],
+    bps: u16,
+) -> Result<Vec<ManagerPositionRead>, Box<dyn std::error::Error>> {
+    validate_redeem_bps(bps)?;
+
+    reads
+        .iter()
+        .map(|read| match read {
+            ManagerPositionRead::Binary {
+                oracle_id,
+                expiry_ms,
+                strike_raw,
+                is_up,
+                expected_quantity,
+            } => Ok(ManagerPositionRead::Binary {
+                oracle_id: oracle_id.clone(),
+                expiry_ms: *expiry_ms,
+                strike_raw: *strike_raw,
+                is_up: *is_up,
+                expected_quantity: scale_quantity_bps(*expected_quantity, bps),
+            }),
+            ManagerPositionRead::Range {
+                oracle_id,
+                expiry_ms,
+                lower_raw,
+                upper_raw,
+                expected_quantity,
+            } => Ok(ManagerPositionRead::Range {
+                oracle_id: oracle_id.clone(),
+                expiry_ms: *expiry_ms,
+                lower_raw: *lower_raw,
+                upper_raw: *upper_raw,
+                expected_quantity: scale_quantity_bps(*expected_quantity, bps),
+            }),
+        })
+        .collect()
+}
+
+async fn debug_redeem_precheck_command(
+    rpc_url: String,
+    manager_id: String,
+    sender: String,
+    from_execution_json: PathBuf,
+    redeem_bps: u16,
+) -> Result<(), Box<dyn std::error::Error>> {
+    validate_redeem_bps(redeem_bps)?;
+
+    let base_reads = load_position_reads_from_execution_json(&from_execution_json)?;
+    let reads = scale_position_reads(&base_reads, redeem_bps)?;
+
+    if reads.is_empty() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "no PositionMinted or RangeMinted events found",
+        )
+        .into());
+    }
+
+    let rpc = SuiRpcClient::new(rpc_url, StdDuration::from_secs(20))?;
+    let manager = resolve_sui_object(&rpc, &manager_id).await?;
+
+    print_manager_preflight(&manager);
+    validate_predict_manager_object(&manager)?;
+
+    println!("Redeem precheck source");
+    println!("execution json: {}", display_path(&from_execution_json));
+    println!("manager_id: {manager_id}");
+    println!("redeem_bps: {redeem_bps}");
+    println!();
+
+    print_scaled_redeem_reads(&reads);
+
+    let tx_kind = build_redeem_precheck_tx_kind(&reads, &manager, &sender)?;
+
+    println!("Built redeem-precheck TransactionKind");
+    println!("sender: {}", tx_kind.sender);
+    println!("tx_kind_b64_len: {}", tx_kind.tx_kind_b64.len());
+    println!("precheck result command indices: {:?}", tx_kind.quote_result_command_indices);
+    println!();
+
+    let response = rpc.dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64).await?;
+
+    print_redeem_precheck_response(&reads, &tx_kind, &response)?;
+
+    Ok(())
+}
+
 fn compile_strategy_sender(owner: &str) -> String {
     if owner.trim().is_empty() {
         "0x0000000000000000000000000000000000000000000000000000000000000000".to_string()
@@ -7370,4 +7602,261 @@ async fn devinspect_mint_for_selected_market_json(
         },
         "warnings": warnings,
     }))
+}
+
+fn redeem_bps_candidates(requested: u16, auto_size_down: bool) -> Vec<u16> {
+    if !auto_size_down {
+        return vec![requested];
+    }
+
+    let ladder = [10_000u16, 7_500, 5_000, 2_500, 1_000, 500, 250, 100, 50, 10, 1];
+
+    let mut candidates = vec![requested];
+
+    for bps in ladder {
+        if bps <= requested && !candidates.contains(&bps) {
+            candidates.push(bps);
+        }
+    }
+
+    candidates
+}
+
+fn print_redeem_precheck_response(
+    reads: &[ManagerPositionRead],
+    tx_kind: &QuoteTxKind,
+    response: &serde_json::Value,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let status = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    println!("precheck devInspect status: {status}");
+
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+
+    let results = response
+        .get("results")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing devInspect results"))?;
+
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec![
+        "#",
+        "kind",
+        "direction",
+        "strike/lower",
+        "upper",
+        "requested qty",
+        "manager qty",
+        "check",
+    ]);
+
+    for (idx, read) in reads.iter().enumerate() {
+        let command_idx = tx_kind
+            .quote_result_command_indices
+            .get(idx)
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing command index"))?;
+
+        let result = results.get(*command_idx).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("missing result for command {command_idx}"),
+            )
+        })?;
+
+        let return_values =
+            result.get("returnValues").and_then(serde_json::Value::as_array).ok_or_else(|| {
+                io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("missing returnValues for command {command_idx}"),
+                )
+            })?;
+
+        if return_values.len() != 1 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!("expected 1 position return, got {}", return_values.len()),
+            )
+            .into());
+        }
+
+        let manager_qty = decode_devinspect_u64(&return_values[0])?;
+        let requested_qty = position_expected_quantity(read);
+        let ok = manager_qty >= requested_qty;
+
+        match read {
+            ManagerPositionRead::Binary { strike_raw, is_up, .. } => {
+                table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new("binary"),
+                    Cell::new(if *is_up { "up" } else { "down" }),
+                    Cell::new(format_raw_price_e9(*strike_raw)),
+                    Cell::new("—"),
+                    Cell::new(requested_qty),
+                    Cell::new(manager_qty),
+                    Cell::new(if ok { "ok" } else { "bad" }),
+                ]);
+            }
+            ManagerPositionRead::Range { lower_raw, upper_raw, .. } => {
+                table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new("range"),
+                    Cell::new("—"),
+                    Cell::new(format_raw_price_e9(*lower_raw)),
+                    Cell::new(format_raw_price_e9(*upper_raw)),
+                    Cell::new(requested_qty),
+                    Cell::new(manager_qty),
+                    Cell::new(if ok { "ok" } else { "bad" }),
+                ]);
+            }
+        }
+    }
+
+    println!("Redeem precheck manager quantities");
+    println!("{table}");
+
+    Ok(())
+}
+
+fn serialize_manager_position_reads(reads: &[ManagerPositionRead]) -> Vec<serde_json::Value> {
+    reads
+        .iter()
+        .map(|read| match read {
+            ManagerPositionRead::Binary {
+                oracle_id,
+                expiry_ms,
+                strike_raw,
+                is_up,
+                expected_quantity,
+            } => serde_json::json!({
+                "kind": "binary",
+                "oracleId": oracle_id,
+                "expiryMs": expiry_ms,
+                "strikeRaw": strike_raw.to_string(),
+                "strike": format_raw_price_e9(*strike_raw),
+                "direction": if *is_up { "up" } else { "down" },
+                "quantity": expected_quantity.to_string(),
+            }),
+            ManagerPositionRead::Range {
+                oracle_id,
+                expiry_ms,
+                lower_raw,
+                upper_raw,
+                expected_quantity,
+            } => serde_json::json!({
+                "kind": "range",
+                "oracleId": oracle_id,
+                "expiryMs": expiry_ms,
+                "lowerRaw": lower_raw.to_string(),
+                "upperRaw": upper_raw.to_string(),
+                "lower": format_raw_price_e9(*lower_raw),
+                "upper": format_raw_price_e9(*upper_raw),
+                "quantity": expected_quantity.to_string(),
+            }),
+        })
+        .collect()
+}
+
+fn print_scaled_redeem_reads(reads: &[ManagerPositionRead]) {
+    let mut table = Table::new();
+    table.load_preset(UTF8_FULL);
+    table.set_header(vec!["#", "kind", "direction", "strike/lower", "upper", "redeem qty"]);
+
+    for (idx, read) in reads.iter().enumerate() {
+        match read {
+            ManagerPositionRead::Binary { strike_raw, is_up, expected_quantity, .. } => {
+                table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new("binary"),
+                    Cell::new(if *is_up { "up" } else { "down" }),
+                    Cell::new(format_raw_price_e9(*strike_raw)),
+                    Cell::new("—"),
+                    Cell::new(*expected_quantity),
+                ]);
+            }
+            ManagerPositionRead::Range { lower_raw, upper_raw, expected_quantity, .. } => {
+                table.add_row(vec![
+                    Cell::new(idx),
+                    Cell::new("range"),
+                    Cell::new("—"),
+                    Cell::new(format_raw_price_e9(*lower_raw)),
+                    Cell::new(format_raw_price_e9(*upper_raw)),
+                    Cell::new(*expected_quantity),
+                ]);
+            }
+        }
+    }
+
+    println!("{table}");
+    println!();
+}
+
+fn redeem_preview_from_response(
+    response: &serde_json::Value,
+) -> Result<(u64, Vec<serde_json::Value>), Box<dyn std::error::Error>> {
+    let status = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    if status != "success" {
+        return Err(io::Error::other(devinspect_failure_summary(response)).into());
+    }
+
+    let events =
+        response.get("events").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+
+    let mut total_payout_raw = 0u64;
+    let mut items = Vec::new();
+
+    for event in events {
+        let event_type = event.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+
+        let parsed = event.get("parsedJson").unwrap_or(&serde_json::Value::Null);
+
+        if event_type.ends_with("::predict::PositionRedeemed") {
+            let payout = json_required_u64(parsed, "payout")?;
+            total_payout_raw = total_payout_raw
+                .checked_add(payout)
+                .ok_or_else(|| io::Error::other("total payout overflow"))?;
+
+            items.push(serde_json::json!({
+                "event": "PositionRedeemed",
+                "direction": if json_required_bool(parsed, "is_up")? { "up" } else { "down" },
+                "strike": format_raw_price_e9(json_required_u64(parsed, "strike")?),
+                "upper": serde_json::Value::Null,
+                "quantity": json_required_u64(parsed, "quantity")?.to_string(),
+                "payoutRaw": payout.to_string(),
+                "bidPrice": json_required_string(parsed, "bid_price")?,
+                "isSettled": json_required_bool(parsed, "is_settled")?,
+            }));
+        } else if event_type.ends_with("::predict::RangeRedeemed") {
+            let payout = json_required_u64(parsed, "payout")?;
+            total_payout_raw = total_payout_raw
+                .checked_add(payout)
+                .ok_or_else(|| io::Error::other("total payout overflow"))?;
+
+            items.push(serde_json::json!({
+                "event": "RangeRedeemed",
+                "direction": serde_json::Value::Null,
+                "strike": format_raw_price_e9(json_required_u64(parsed, "lower_strike")?),
+                "upper": format_raw_price_e9(json_required_u64(parsed, "higher_strike")?),
+                "quantity": json_required_u64(parsed, "quantity")?.to_string(),
+                "payoutRaw": payout.to_string(),
+                "bidPrice": json_required_string(parsed, "bid_price")?,
+                "isSettled": json_required_bool(parsed, "is_settled")?,
+            }));
+        }
+    }
+
+    Ok((total_payout_raw, items))
 }
