@@ -3231,6 +3231,7 @@ fn estimate_complexity_penalty_bps(output: &serde_json::Value) -> u16 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn compile_advanced_strategy_json_from_market(
     args: &CompileStrategyJsonArgs,
     strategy_kind: AdvancedStrategyKind,
@@ -3252,15 +3253,39 @@ async fn compile_advanced_strategy_json_from_market(
         AdvancedStrategyKind::PortfolioCrashShield => {
             let exposure_raw = dusdc_f64_to_raw(args.portfolio_exposure_dusdc)?;
             let ask_down_tail = quote_single_binary_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k1.raw, false, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k1.raw,
+                false,
+                probe_quantity,
             )
             .await?;
             let ask_lower_range = quote_single_range_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k1.raw, k2.raw, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k1.raw,
+                k2.raw,
+                probe_quantity,
             )
             .await?;
             let ask_mild_range = quote_single_range_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k2.raw, k3.raw, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k2.raw,
+                k3.raw,
+                probe_quantity,
             )
             .await?;
 
@@ -3280,19 +3305,51 @@ async fn compile_advanced_strategy_json_from_market(
         }
         AdvancedStrategyKind::ConvexTailLadder => {
             let ask_down_tail = quote_single_binary_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k1.raw, false, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k1.raw,
+                false,
+                probe_quantity,
             )
             .await?;
             let ask_lower_range = quote_single_range_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k1.raw, k2.raw, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k1.raw,
+                k2.raw,
+                probe_quantity,
             )
             .await?;
             let ask_upper_range = quote_single_range_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k3.raw, k4.raw, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k3.raw,
+                k4.raw,
+                probe_quantity,
             )
             .await?;
             let ask_up_tail = quote_single_binary_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k4.raw, true, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k4.raw,
+                true,
+                probe_quantity,
             )
             .await?;
 
@@ -3314,19 +3371,51 @@ async fn compile_advanced_strategy_json_from_market(
 
         AdvancedStrategyKind::ExpiryMoveNote => {
             let ask_down_tail = quote_single_binary_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k1.raw, false, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k1.raw,
+                false,
+                probe_quantity,
             )
             .await?;
             let ask_lower_range = quote_single_range_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k1.raw, k2.raw, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k1.raw,
+                k2.raw,
+                probe_quantity,
             )
             .await?;
             let ask_upper_range = quote_single_range_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k3.raw, k4.raw, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k3.raw,
+                k4.raw,
+                probe_quantity,
             )
             .await?;
             let ask_up_tail = quote_single_binary_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k4.raw, true, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k4.raw,
+                true,
+                probe_quantity,
             )
             .await?;
 
@@ -3653,11 +3742,27 @@ async fn compile_advanced_strategy_json_from_market(
 
         AdvancedStrategyKind::MoonshotUpside => {
             let ask_upper_range = quote_single_range_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k3.raw, k4.raw, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k3.raw,
+                k4.raw,
+                probe_quantity,
             )
             .await?;
             let ask_up_tail = quote_single_binary_ask_raw(
-                args, selected, predict, oracle, clock, rpc, k4.raw, true, probe_quantity,
+                args,
+                selected,
+                predict,
+                oracle,
+                clock,
+                rpc,
+                k4.raw,
+                true,
+                probe_quantity,
             )
             .await?;
 
@@ -4259,10 +4364,8 @@ async fn demo_status_command(
     let execution_json: serde_json::Value =
         serde_json::from_slice(&fs::read(&from_execution_json)?)?;
 
-    let digest = execution_json
-        .get("digest")
-        .and_then(serde_json::Value::as_str)
-        .unwrap_or("unknown");
+    let digest =
+        execution_json.get("digest").and_then(serde_json::Value::as_str).unwrap_or("unknown");
 
     let status = execution_json
         .get("effects")

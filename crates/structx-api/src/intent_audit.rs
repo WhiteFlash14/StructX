@@ -4,6 +4,8 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
+use crate::storage;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct IntentExecutionAudit {
     pub schema_version: u32,
@@ -48,11 +50,11 @@ impl DiskIntentAuditStore {
     }
 
     pub fn default_state_dir() -> Self {
-        Self::new("artifacts/structx_state/intent_audits")
+        Self::new(storage::state_root().join("intent_audits"))
     }
 
     fn audit_path(&self, audit_id: &str) -> PathBuf {
-        self.root_dir.join(format!("{audit_id}.json"))
+        self.root_dir.join(format!("{}.json", storage::safe_component(audit_id)))
     }
 
     fn by_proposal_dir(&self) -> PathBuf {
@@ -60,7 +62,7 @@ impl DiskIntentAuditStore {
     }
 
     fn by_proposal_path(&self, proposal_id: &str) -> PathBuf {
-        self.by_proposal_dir().join(format!("{proposal_id}.json"))
+        self.by_proposal_dir().join(format!("{}.json", storage::safe_component(proposal_id)))
     }
 
     fn by_digest_dir(&self) -> PathBuf {
@@ -68,7 +70,7 @@ impl DiskIntentAuditStore {
     }
 
     fn by_digest_path(&self, digest: &str) -> PathBuf {
-        self.by_digest_dir().join(format!("{digest}.json"))
+        self.by_digest_dir().join(format!("{}.json", storage::safe_component(digest)))
     }
 
     pub async fn save(&self, audit: &IntentExecutionAudit) -> anyhow::Result<()> {

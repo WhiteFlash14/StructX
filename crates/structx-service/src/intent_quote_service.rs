@@ -89,26 +89,12 @@ pub async fn quote_intent_plan<S: MarketStore + ?Sized>(
 
     let max_payout = extract_u64_any(
         &raw_compiled_strategy,
-        &[
-            "maxGrossPayoutRaw",
-            "max_payout",
-            "maxPayout",
-            "gross_max_payout",
-            "grossMaxPayout",
-        ],
+        &["maxGrossPayoutRaw", "max_payout", "maxPayout", "gross_max_payout", "grossMaxPayout"],
     )
-    .unwrap_or_else(|| {
-        legs.iter()
-            .map(|leg| leg.quantity)
-            .max()
-            .unwrap_or_default()
-    });
+    .unwrap_or_else(|| legs.iter().map(|leg| leg.quantity).max().unwrap_or_default());
 
-    let max_loss = extract_u64_any(
-        &raw_compiled_strategy,
-        &["maxLossRaw", "max_loss", "maxLoss"],
-    )
-    .unwrap_or(total_premium);
+    let max_loss = extract_u64_any(&raw_compiled_strategy, &["maxLossRaw", "max_loss", "maxLoss"])
+        .unwrap_or(total_premium);
 
     let payoff_table = extract_payoff_rows(&raw_compiled_strategy)
         .unwrap_or_else(|| fallback_payoff_table(&legs, total_premium));
@@ -129,18 +115,16 @@ pub async fn quote_intent_plan<S: MarketStore + ?Sized>(
 
     let mut warnings = request.intent_plan.warnings.clone();
     warnings.push(
-        "This proposal is terminal-expiry based. It pays according to settlement, not whether the market touches a level before expiry."
+        "This strategy pays from BTC's final settlement price at expiry. Price moves before expiry do not determine the payout."
             .to_string(),
     );
     if request.intent_plan.confidence != IntentConfidence::High {
         warnings.push(format!(
-            "Intent confidence is {:?}; review the selected market and legs carefully before signing.",
+            "StructX had {:?} confidence in the market match. Review the selected market and positions before opening.",
             request.intent_plan.confidence
         ));
     }
-    if !selected_market
-        .preferred_quote_asset
-        .eq_ignore_ascii_case(&request.intent_plan.quote_asset)
+    if !selected_market.preferred_quote_asset.eq_ignore_ascii_case(&request.intent_plan.quote_asset)
     {
         warnings.push(format!(
             "Selected market prefers quote asset {} but intent requested {}.",
@@ -149,7 +133,7 @@ pub async fn quote_intent_plan<S: MarketStore + ?Sized>(
     }
     if selected_market.oracle_id != requested_market.oracle_id {
         warnings.push(format!(
-            "The initially selected market could not be quoted cleanly, so StructX fell back to oracle {} for the final proposal.",
+            "The first market was unavailable for a clean quote, so StructX used oracle {} for this preview.",
             selected_market.oracle_id
         ));
     }
@@ -207,12 +191,10 @@ async fn resolve_selected_market<S: MarketStore + ?Sized>(
     };
 
     let candidates = store.search_markets(query).await?;
-    candidates.into_iter().next().ok_or_else(|| {
-        anyhow!(
-            "no active market found for '{}'",
-            request.intent_plan.market_query
-        )
-    })
+    candidates
+        .into_iter()
+        .next()
+        .ok_or_else(|| anyhow!("no active market found for '{}'", request.intent_plan.market_query))
 }
 
 async fn compile_candidate_markets<S: MarketStore + ?Sized>(
@@ -307,10 +289,7 @@ fn build_compile_args(
             .unwrap_or_else(|_| PREDICT_OBJECT_ID.to_string()),
         rpc_url: env::var("STRUCTX_RPC_URL")
             .unwrap_or_else(|_| DEFAULT_SUI_TESTNET_RPC_URL.to_string()),
-        owner: request
-            .user_address
-            .clone()
-            .unwrap_or_else(|| "0x0".to_string()),
+        owner: request.user_address.clone().unwrap_or_else(|| "0x0".to_string()),
         strategy: backend_strategy_id.to_string(),
         budget_dusdc: nanos_to_display_dusdc(budget_nanos),
         style: style.to_string(),
@@ -351,13 +330,7 @@ async fn load_all_catalog_oracle_ids<S: MarketStore + ?Sized>(
     Ok(store
         .load_latest_catalog()
         .await?
-        .map(|catalog| {
-            catalog
-                .markets
-                .into_iter()
-                .map(|market| market.oracle_id)
-                .collect()
-        })
+        .map(|catalog| catalog.markets.into_iter().map(|market| market.oracle_id).collect())
         .unwrap_or_default())
 }
 
@@ -373,9 +346,7 @@ fn build_excluded_oracle_ids(
 }
 
 async fn compile_with_existing_service(args: CompileStrategyJsonArgs) -> anyhow::Result<Value> {
-    crate::compile_strategy_json_value(args)
-        .await
-        .map_err(|err| anyhow!(err.to_string()))
+    crate::compile_strategy_json_value(args).await.map_err(|err| anyhow!(err.to_string()))
 }
 
 fn extract_proposal_legs(raw: &Value, market: &CatalogMarketSnapshot) -> Vec<CompiledProposalLeg> {
@@ -496,10 +467,7 @@ fn fallback_payoff_table(legs: &[CompiledProposalLeg], total_premium: u64) -> Ve
 
     legs.iter()
         .map(|leg| PayoffRow {
-            label: leg
-                .label
-                .clone()
-                .unwrap_or_else(|| format!("{} leg", leg.kind)),
+            label: leg.label.clone().unwrap_or_else(|| format!("{} leg", leg.kind)),
             settlement_lower: leg.lower.map(|v| v as f64),
             settlement_upper: leg.upper.or(leg.strike).map(|v| v as f64),
             gross_payout: leg.quantity,
@@ -511,17 +479,12 @@ fn fallback_payoff_table(legs: &[CompiledProposalLeg], total_premium: u64) -> Ve
 fn extract_string_any(raw: &Value, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| {
         let value = get_path(raw, path)?;
-        value
-            .as_str()
-            .map(|s| s.trim().to_string())
-            .filter(|s| !s.is_empty())
+        value.as_str().map(|s| s.trim().to_string()).filter(|s| !s.is_empty())
     })
 }
 
 fn extract_u64_any(raw: &Value, paths: &[&str]) -> Option<u64> {
-    paths
-        .iter()
-        .find_map(|path| parse_u64(get_path(raw, path)?))
+    paths.iter().find_map(|path| parse_u64(get_path(raw, path)?))
 }
 
 fn extract_i128_any(raw: &Value, paths: &[&str]) -> Option<i128> {

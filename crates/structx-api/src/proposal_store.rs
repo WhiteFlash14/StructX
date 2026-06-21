@@ -4,6 +4,8 @@ use anyhow::{anyhow, Context};
 use serde::{Deserialize, Serialize};
 use tokio::fs;
 
+use crate::storage;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredExecutionProposal {
     pub proposal_id: String,
@@ -23,11 +25,11 @@ impl DiskProposalStore {
     }
 
     pub fn default_state_dir() -> Self {
-        Self::new("artifacts/structx_state/proposals")
+        Self::new(storage::state_root().join("proposals"))
     }
 
     fn proposal_path(&self, proposal_id: &str) -> PathBuf {
-        self.root_dir.join(format!("{proposal_id}.json"))
+        self.root_dir.join(format!("{}.json", storage::safe_component(proposal_id)))
     }
 
     pub async fn save(
