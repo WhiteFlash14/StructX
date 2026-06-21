@@ -272,13 +272,12 @@ export function NormalModeView({
           disabled={loading || !message.trim()}
           onClick={() => void generateStrategy()}
         >
-          {loading ? "Generating…" : "Generate strategy"}
+          {loading ? "Finding a strategy…" : "Find my strategy"}
         </button>
 
         <div className="guided-disclaimer">
-          AI helps interpret intent. The final payoff, premium, and transaction
-          are produced by deterministic StructX compiler logic. You must approve
-          every transaction in your wallet.
+          StructX uses your message to choose a strategy and live market. You
+          can review the premium and payoff before your wallet opens it.
         </div>
 
         {error && (
@@ -292,8 +291,8 @@ export function NormalModeView({
       <section className="preview-column">
         {!compiled && !parsedIntent && (
           <EmptyState
-            title="No recommendation yet"
-            body="Enter your goal and budget. StructX will parse the intent, recommend a strategy, and compile the payoff preview."
+            title="Your strategy will appear here"
+            body="Enter your view and budget. StructX will find a matching strategy and show the full payoff."
           />
         )}
 
@@ -322,8 +321,8 @@ export function NormalModeView({
                 <p className="eyebrow">Next step</p>
                 <h2>Open or customize</h2>
                 <p className="muted">
-                  Move into Advanced Mode to use the existing dry-run, wallet
-                  signature, and audit flow with this recommendation.
+                  Open this recommendation as shown, or switch to Advanced Mode
+                  if you want to change the strategy settings first.
                 </p>
               </div>
 
@@ -362,7 +361,7 @@ function ParsedIntentCard({ parsed }: { parsed: ParsedIntentSuccess }) {
   return (
     <section className="panel">
       <div className="panel-header">
-        <p className="eyebrow">Parsed intent</p>
+        <p className="eyebrow">What StructX understood</p>
         <h2>{intentGoalLabel(parsed.goal)}</h2>
       </div>
 
@@ -392,8 +391,7 @@ function RecommendationCard({ compiled }: { compiled: GuidedCompileResponse }) {
       </div>
 
       <p className="muted">
-        Suggested from your intent, then priced by the deterministic StructX
-        compiler.
+        Matched to your view and priced from the selected live market.
       </p>
 
       <div className="stats-grid">

@@ -9,7 +9,7 @@ import {
 export const metadata = {
   title: "StructX",
   description:
-    "StructX turns market goals into transparent DeepBook Predict positions on Sui Testnet. Preview outcomes, dry-run transactions, sign from your wallet, and audit minted positions.",
+    "Choose how you think BTC will move, review the possible outcomes, and open the strategy from your Sui wallet.",
 };
 
 export default function LandingPage() {
@@ -31,16 +31,16 @@ function Hero() {
     <section className="hero" id="top">
       <div className="hero-grid">
         <div className="hero-text">
-          <p className="eyebrow">PAYOFF COMPILER FOR DEEPBOOK PREDICT</p>
+          <p className="eyebrow">BTC STRATEGIES ON DEEPBOOK PREDICT</p>
           <h1>
-            Structured BTC payoffs,
+            Build around your BTC view,
             <br />
-            <span className="accent">compiled from intent.</span>
+            <span className="accent">then see the payoff clearly.</span>
           </h1>
           <p className="hero-sub">
-            StructX turns market goals into transparent Predict positions
-            priced against DeepBook&apos;s live BTC vol surface. Preview
-            outcomes, sign from your wallet.
+            Tell StructX how you think BTC will move or choose a strategy
+            yourself. You can review the price and every payoff scenario
+            before opening it from your wallet.
           </p>
         </div>
         <div className="hero-visual" aria-hidden>
@@ -124,23 +124,23 @@ function PayoffMiniChart() {
 function HowItWorks() {
   const steps = [
     {
-      title: "Describe or choose",
-      body: "Use Normal Mode to describe your goal, or Advanced Mode to pick a strategy directly.",
+      title: "Share your view",
+      body: "Describe the move you expect, or choose a strategy from the library.",
     },
     {
       title: "Preview the payoff",
-      body: "StructX compiles legs, quotes live premiums, and renders payoff scenarios before you sign.",
+      body: "See the live premium, the positions being opened, and what each expiry outcome would pay.",
     },
     {
       title: "Sign from your wallet",
-      body: "Dry-run, then sign the Sui PTB from your own wallet. StructX never holds your funds.",
+      body: "StructX checks the full transaction first, then your wallet asks you to review and approve it.",
     },
   ];
   return (
     <section className="section" id="how-it-works">
       <div className="section-head center">
         <p className="eyebrow accent-text">HOW IT WORKS</p>
-        <h2>From intent to wallet-signed payoff.</h2>
+        <h2>From your market view to an open position.</h2>
       </div>
       <ol className="howto-list">
         {steps.map((s, i) => (
@@ -163,8 +163,9 @@ function AsymmetricReturns() {
           <p className="eyebrow accent-text">DEFINED PAYOFF</p>
           <h2>See the full payoff before you sign.</h2>
           <p className="section-sub">
-            Loss is capped at the premium you pay. Wins are the bands outside
-            the center. Every scenario is rendered before the wallet prompt.
+            Your maximum loss is the premium shown in the preview. The payoff
+            table shows what you receive in each price range, so you know the
+            shape of the trade before your wallet opens.
           </p>
         </div>
         <div className="split-visual">
@@ -178,9 +179,9 @@ function AsymmetricReturns() {
 function PayoffShowcase() {
   const bars = [
     { label: "BTC < 63K", h: 92, tone: "win" },
-    { label: "63K–64K", h: 52, tone: "win" },
-    { label: "64K–65K", h: 14, tone: "loss" },
-    { label: "65K–66K", h: 52, tone: "win" },
+    { label: "63K to 64K", h: 52, tone: "win" },
+    { label: "64K to 65K", h: 14, tone: "loss" },
+    { label: "65K to 66K", h: 52, tone: "win" },
     { label: "BTC > 66K", h: 92, tone: "win" },
   ];
   return (
@@ -228,9 +229,9 @@ function CallToAction() {
         <p className="eyebrow accent-text">BUILD YOUR FIRST STRATEGY</p>
         <h2>StructX is live on Sui Testnet.</h2>
         <p className="section-sub">
-          AI helps interpret intent. Every payoff, premium, and transaction is
-          produced by deterministic StructX logic, and you approve everything
-          from your own wallet.
+          Describe the move you have in mind and StructX will match it to a
+          strategy. The preview shows the exact structure, and your wallet
+          stays in control of the transaction from start to finish.
         </p>
         <div className="hero-ctas center">
           <Link href="/strategies/breakout-protection" className="btn btn-primary">

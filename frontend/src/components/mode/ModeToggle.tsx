@@ -17,7 +17,7 @@ export function ModeToggle({ mode, onChange }: Props) {
           onClick={() => onChange("normal")}
         >
           Normal
-          <span>AI-assisted intent</span>
+          <span>Describe your market view</span>
         </button>
         <button
           type="button"
@@ -25,7 +25,7 @@ export function ModeToggle({ mode, onChange }: Props) {
           onClick={() => onChange("advanced")}
         >
           Advanced
-          <span>Direct strategy builder</span>
+          <span>Choose every setting</span>
         </button>
       </div>
     </section>

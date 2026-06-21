@@ -18,6 +18,32 @@ function requireString(value: string | undefined, message: string): string {
   return value;
 }
 
+export function addSlippageBps(raw: bigint, slippageBps: number): bigint {
+  if (!Number.isInteger(slippageBps) || slippageBps < 0 || slippageBps > 10_000) {
+    throw new Error("Slippage must be a whole number between 0 and 10,000 bps.");
+  }
+  return (raw * BigInt(10_000 + slippageBps) + 9_999n) / 10_000n;
+}
+
+/**
+ * The mint entrypoints do not accept a max-cost argument. Keeping only this
+ * much dUSDC in the manager gives the combined transaction enough room for
+ * the selected slippage while avoiding an exact-price deposit that can fail
+ * as soon as the order book moves.
+ */
+export function requiredManagerReserveRaw(
+  payload: BuildOpenStrategyResponse,
+): bigint {
+  if (payload.summary.legs.length === 0) {
+    return BigInt(payload.summary.premiumRequiredRaw);
+  }
+
+  return payload.summary.legs.reduce((total, leg) => {
+    const raw = leg.maxCostRaw ?? leg.premiumRaw;
+    return total + BigInt(raw);
+  }, 0n);
+}
+
 export function buildOpenStrategyTransaction(
   payload: BuildOpenStrategyResponse,
 ): Transaction {
@@ -257,13 +283,14 @@ export type CoinSource = {
 export async function fetchWalletDusdcBalance(
   client: CoinSource,
   owner: string,
+  minimumRaw?: bigint,
 ): Promise<{ totalRaw: bigint; coinObjectIds: string[] }> {
   const out: string[] = [];
   let cursor: string | null | undefined = null;
   let total = 0n;
-  // Paginate — most wallets have <50 dUSDC coin objects, but defend against
-  // unbounded pages.
-  for (let i = 0; i < 4; i += 1) {
+  const seenCursors = new Set<string>();
+
+  while (true) {
     const page = await client.getCoins({
       owner,
       coinType: DUSDC_COIN_TYPE,
@@ -277,8 +304,15 @@ export async function fetchWalletDusdcBalance(
       } catch {
         // ignore non-numeric balances
       }
+      if (minimumRaw !== undefined && total >= minimumRaw) {
+        return { totalRaw: total, coinObjectIds: out };
+      }
     }
     if (!page.hasNextPage || !page.nextCursor) break;
+    if (seenCursors.has(page.nextCursor)) {
+      throw new Error("The Sui RPC repeated a dUSDC pagination cursor.");
+    }
+    seenCursors.add(page.nextCursor);
     cursor = page.nextCursor;
   }
   return { totalRaw: total, coinObjectIds: out };

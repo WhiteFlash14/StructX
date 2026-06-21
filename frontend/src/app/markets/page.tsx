@@ -116,7 +116,7 @@ function marketDescription(
     case "DeepBook":
       return `${underlying} terminal market settling at ${expiry}. Visible here for discovery, then opened on DeepBook Predict directly.`;
     default:
-      return `${underlying} terminal market settling at ${expiry}. Listed on the live registry, but not currently openable from StructX.`;
+      return `${underlying} terminal market settling at ${expiry}. This market is listed in the live registry and is currently available for viewing.`;
   }
 }
 
@@ -152,7 +152,7 @@ function readMarket(m: RawMarket): MarketRow {
 
 function formatExpiry(expiryMs: string): string {
   const n = Number(expiryMs);
-  if (!Number.isFinite(n) || n <= 0) return "—";
+  if (!Number.isFinite(n) || n <= 0) return "Unavailable";
   const date = new Date(n);
   return date.toLocaleString(undefined, {
     month: "short",
@@ -165,7 +165,7 @@ function formatExpiry(expiryMs: string): string {
 
 function formatCountdown(expiryMs: string): string {
   const n = Number(expiryMs);
-  if (!Number.isFinite(n) || n <= 0) return "—";
+  if (!Number.isFinite(n) || n <= 0) return "Unavailable";
   const diff = n - Date.now();
   if (diff <= 0) return "Expired";
   const days = Math.floor(diff / 86_400_000);
@@ -427,11 +427,11 @@ export default function MarketsPage() {
               <span className="strategies-eyebrow-dot" aria-hidden />
               Live markets
             </p>
-            <h1>DeepBook Predict market directory</h1>
+            <h1>DeepBook Predict markets</h1>
             <p className="markets-sub">
-              Browse every active Predict market by asset, then either build
-              inside StructX for supported BTC expiries or jump straight out
-              to DeepBook’s trading surface.
+              Browse the active expiry markets by asset. Supported BTC markets
+              can be used in StructX, and every market can be opened directly
+              in DeepBook.
             </p>
           </div>
           <button
@@ -480,8 +480,7 @@ export default function MarketsPage() {
 
             {assetCategories.length === 1 && assetCategories[0] === "BTC" && (
               <p className="markets-note">
-                The current DeepBook Predict snapshot only contains BTC markets,
-                so the directory is correctly showing BTC-only results right now.
+                DeepBook currently has active BTC markets in this snapshot.
               </p>
             )}
 
@@ -513,7 +512,7 @@ export default function MarketsPage() {
               <article className="markets-stat-card">
                 <span>Next expiry</span>
                 <strong>
-                  {nextTradable ? formatCountdown(nextTradable.expiryMs) : "—"}
+                  {nextTradable ? formatCountdown(nextTradable.expiryMs) : "Unavailable"}
                 </strong>
                 <small>
                   {nextTradable
@@ -526,7 +525,7 @@ export default function MarketsPage() {
                 <strong>
                   {nextTradable?.spotRaw
                     ? formatPriceCompact(nextTradable.spotRaw)
-                    : "—"}
+                    : "Unavailable"}
                 </strong>
                 <small>Latest price snapshot from the oracle feed</small>
               </article>
@@ -543,7 +542,7 @@ export default function MarketsPage() {
                 <span>DeepBook direct</span>
                 <strong>{deepbookOnlyCount}</strong>
                 <small>
-                  Markets shown here for discovery but opened on DeepBook
+                  Markets available directly through DeepBook
                 </small>
               </article>
             </div>
@@ -612,7 +611,7 @@ export default function MarketsPage() {
                             <div>
                               <span>Spot</span>
                               <strong className="mono">
-                                {m.spotRaw ? formatPriceCompact(m.spotRaw) : "—"}
+                                {m.spotRaw ? formatPriceCompact(m.spotRaw) : "Unavailable"}
                               </strong>
                             </div>
                             <div>
@@ -662,10 +661,9 @@ export default function MarketsPage() {
         )}
 
         <p className="markets-note">
-          StructX now serves the last saved market directory snapshot from the
-          API’s disk cache first, then rechecks DeepBook in the background so
-          new assets, new expiries, and expired markets roll through without
-          needing a manual refresh.
+          Market data loads from the latest saved snapshot while StructX checks
+          DeepBook for new assets, upcoming expiries, and expired markets in the
+          background.
         </p>
       </section>
       <LandingFooter />

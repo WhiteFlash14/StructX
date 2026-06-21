@@ -1,13 +1,13 @@
 // Light-weight formatting helpers used across StructX components.
 
 export function shortAddress(address: string | null | undefined): string {
-  if (!address) return "—";
+  if (!address) return "Unavailable";
   if (address.length <= 14) return address;
   return `${address.slice(0, 6)}…${address.slice(-6)}`;
 }
 
 export function formatDate(value: string | null | undefined): string {
-  if (!value) return "—";
+  if (!value) return "Unavailable";
   const date = new Date(value);
   if (Number.isNaN(date.getTime())) return value;
   return date.toLocaleString();
@@ -39,7 +39,7 @@ export function formatNumberTwoDecimals(value: number): string {
 export function formatCompactNumber(
   value: string | number | null | undefined,
 ): string {
-  if (value === null || value === undefined || value === "") return "—";
+  if (value === null || value === undefined || value === "") return "Unavailable";
   const numeric =
     typeof value === "number" ? value : Number.parseFloat(value.toString());
   if (!Number.isFinite(numeric)) return String(value);
@@ -55,7 +55,7 @@ export function formatCompactNumber(
 }
 
 export function formatPriceCompact(value: string | null | undefined): string {
-  if (!value) return "—";
+  if (!value) return "Unavailable";
   const trimmed = value.trim();
   const numeric = Number.parseFloat(trimmed);
   if (!Number.isFinite(numeric)) return value;
@@ -72,7 +72,7 @@ export function formatPriceCompact(value: string | null | undefined): string {
 export function formatDusdcDisplayString(
   value: string | null | undefined,
 ): string {
-  if (!value) return "—";
+  if (!value) return "Unavailable";
   const numeric = Number.parseFloat(value.replace(/\s*dUSDC$/i, ""));
   if (!Number.isFinite(numeric)) return value;
   return `${formatNumberTwoDecimals(numeric)} dUSDC`;
@@ -80,7 +80,7 @@ export function formatDusdcDisplayString(
 
 // Format a stdout-derived dUSDC raw string ("1234567") to "1.23 dUSDC".
 export function formatDusdcDisplay(raw: string | null | undefined): string {
-  if (!raw) return "—";
+  if (!raw) return "Unavailable";
   const big = bigIntSafe(raw);
   if (big === null) return raw;
 

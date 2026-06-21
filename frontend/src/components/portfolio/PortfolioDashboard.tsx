@@ -40,7 +40,7 @@ function legLabel(record: PortfolioTradeRecord): string[] {
   if (!record.mintedLegs.length) return [`${record.legCount} legs`];
   return record.mintedLegs.slice(0, 4).map((leg) =>
     leg.kind === "RANGE"
-      ? `${leg.kind} ${leg.lower ?? "?"}–${leg.upper ?? "?"}`
+      ? `${leg.kind} ${leg.lower ?? "?"} to ${leg.upper ?? "?"}`
       : `${leg.kind} ${leg.strike ?? "?"}`,
   );
 }

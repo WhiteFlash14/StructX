@@ -38,8 +38,8 @@ export function ExecutionPanel({
         <p className="eyebrow">Execution</p>
         <h2>Open strategy</h2>
         <p className="muted">
-          StructX builds a wallet-signed PTB that spends from the selected
-          PredictManager. Your wallet still approves the transaction.
+          StructX prepares the transaction using your selected PredictManager,
+          then your wallet shows the details for approval.
         </p>
       </div>
 
@@ -59,7 +59,7 @@ export function ExecutionPanel({
 
           {phase === "preflight" && (
             <button type="button" className="primary-button" disabled>
-              Resolve preflight
+              Complete the checks above
             </button>
           )}
 
@@ -70,7 +70,7 @@ export function ExecutionPanel({
               onClick={onDryRun}
               disabled={dryRunning || opening}
             >
-              {dryRunning ? "Dry-running…" : "Dry-run transaction"}
+              {dryRunning ? "Checking transaction…" : "Check transaction"}
             </button>
           )}
 
@@ -82,7 +82,7 @@ export function ExecutionPanel({
                 onClick={onDryRun}
                 disabled={dryRunning || opening}
               >
-                {dryRunning ? "Dry-running…" : "Run dry-run again"}
+                {dryRunning ? "Checking transaction…" : "Check again"}
               </button>
               <button
                 type="button"
@@ -90,7 +90,7 @@ export function ExecutionPanel({
                 onClick={onOpen}
                 disabled={opening}
               >
-                {opening ? "Waiting for wallet…" : "Sign and open strategy"}
+                {opening ? "Waiting for wallet…" : "Review and open strategy"}
               </button>
             </>
           )}

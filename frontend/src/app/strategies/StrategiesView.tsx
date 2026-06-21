@@ -403,15 +403,15 @@ export function StrategiesView() {
       <section className="strategies-hero">
         <p className="strategies-eyebrow">
           <span className="strategies-eyebrow-dot" aria-hidden />
-          Payoff library
+          Strategy library
         </p>
         <h1>
-          Defined-risk BTC strategies,{" "}
-          <span className="accent">compiled on DeepBook Predict.</span>
+          Choose how you want to trade BTC,{" "}
+          <span className="accent">then review the full payoff.</span>
         </h1>
         <p className="strategies-sub">
-          Each template compiles into transparent Predict positions on Sui
-          Testnet. Describe what you want, or pick a strategy directly.
+          Describe the move you expect and let StructX suggest a strategy, or
+          browse the library and choose one yourself.
         </p>
 
         <div className="new-mode-toggle-wrap">
@@ -499,7 +499,7 @@ export function StrategiesView() {
                   >
                     <option value="recommended">Recommended</option>
                     <option value="budget">Lowest min size</option>
-                    <option value="name">A – Z</option>
+                    <option value="name">A to Z</option>
                   </select>
                   <svg
                     className="strategies-sort-caret"

@@ -12,7 +12,9 @@ import {
   auditIntentExecution,
   buildIntentExecutePlan,
   buildOpenStrategy,
+  getManagerBalance,
   getStoredManager,
+  invalidateManagerBalance,
   planFromIntent,
   quoteIntentPlan,
   type AuditIntentExecutionResponse,
@@ -21,7 +23,11 @@ import {
   type IntentPlanningResponse,
   type RiskStyle,
 } from "@/lib/api";
-import { buildOpenStrategyTransaction } from "@/lib/tx";
+import {
+  buildDepositAndOpenStrategyTransaction,
+  fetchWalletDusdcBalance,
+  requiredManagerReserveRaw,
+} from "@/lib/tx";
 
 type QuickPrompt = {
   label: string;
@@ -296,7 +302,45 @@ export function NormalModeIntentPanel() {
         slippageBps: 300,
       });
 
-      const tx = buildOpenStrategyTransaction(build);
+      invalidateManagerBalance(managerId);
+      const balance = await getManagerBalance(managerId);
+      if (!balance.ok || balance.balanceRaw === undefined) {
+        throw new Error(
+          balance.error ?? "Could not read the latest PredictManager balance.",
+        );
+      }
+      const managerBalanceRaw = BigInt(balance.balanceRaw);
+      const reserveRaw = requiredManagerReserveRaw(build);
+      const depositRaw =
+        reserveRaw > managerBalanceRaw ? reserveRaw - managerBalanceRaw : 0n;
+      const wallet = await fetchWalletDusdcBalance(
+        suiClient,
+        account.address,
+        depositRaw > 0n ? depositRaw : undefined,
+      );
+      if (wallet.totalRaw < depositRaw) {
+        throw new Error(
+          `This strategy needs ${depositRaw} raw dUSDC from your wallet, but only ${wallet.totalRaw} is available.`,
+        );
+      }
+      const transactionArgs = {
+        payload: build,
+        depositRaw,
+        walletDusdcCoinIds: depositRaw > 0n ? wallet.coinObjectIds : [],
+      };
+      const preflightTx = buildDepositAndOpenStrategyTransaction(transactionArgs);
+      const preflight = await suiClient.devInspectTransactionBlock({
+        sender: account.address,
+        transactionBlock: preflightTx,
+      });
+      if (preflight.effects?.status?.status !== "success") {
+        throw new Error(
+          preflight.effects?.status?.error ??
+            "The final transaction check did not succeed.",
+        );
+      }
+
+      const tx = buildDepositAndOpenStrategyTransaction(transactionArgs);
       const execution = await signAndExecuteTransaction({
         transaction: tx,
         chain: "sui:testnet",
@@ -345,7 +389,7 @@ export function NormalModeIntentPanel() {
   }
 
   function formatDusdcMicro(raw?: number | null) {
-    if (raw == null) return "—";
+    if (raw == null) return "Unavailable";
     const value = raw / 1_000_000;
     return `${value.toLocaleString(undefined, {
       maximumFractionDigits: 6,
@@ -353,7 +397,7 @@ export function NormalModeIntentPanel() {
   }
 
   function formatBudgetDisplay(raw?: number | null) {
-    if (raw == null) return "—";
+    if (raw == null) return "Unavailable";
     return `${raw / 1_000_000_000} dUSDC`;
   }
 
@@ -466,7 +510,7 @@ export function NormalModeIntentPanel() {
   }
 
   function formatExpiry(ms?: number) {
-    if (!ms) return "—";
+    if (!ms) return "Unavailable";
     const dateLabel = new Date(ms).toLocaleString();
 
     if (ms <= Date.now()) {
@@ -482,9 +526,9 @@ export function NormalModeIntentPanel() {
         <div className="normal-stage-head">
           <h2 className="normal-stage-title">What&apos;s your BTC view?</h2>
           <p className="normal-stage-sub">
-            Describe your view in plain English. StructX parses it, finds a
-            matching DeepBook Predict market, and shows you the strategy before
-            you sign anything.
+            Describe the move you expect in your own words. StructX will find a
+            matching DeepBook Predict market and show the strategy, price, and
+            payoff before your wallet opens it.
           </p>
         </div>
 
@@ -598,12 +642,12 @@ export function NormalModeIntentPanel() {
             <div className="normal-card">
               <div className="normal-card-eyebrow">
                 <span className="normal-step-num small">3</span>
-                Typed plan preview
+                Your strategy will appear here
               </div>
-              <h3>Prompt to market plan</h3>
+              <h3>Start with your BTC view</h3>
               <p className="normal-reason">
-                You will see the parsed intent, matching markets, and any
-                clarification needed before StructX compiles a quoted position.
+                StructX will show what it understood, the market it found, and
+                the live strategy that matches your view.
               </p>
             </div>
           )}
@@ -612,7 +656,7 @@ export function NormalModeIntentPanel() {
             <div className="normal-error">
               <strong>
                 {error.toLowerCase().includes("expired")
-                  ? "Quote refreshed needed"
+                  ? "The quote needs a refresh"
                   : "Need a bit more info"}
               </strong>
               <p>{error}</p>
@@ -631,7 +675,7 @@ export function NormalModeIntentPanel() {
               <div className="normal-card">
                 <div className="normal-card-eyebrow">
                   <span className="normal-step-num small">3</span>
-                  Typed intent
+                  What StructX understood
                 </div>
                 <h3>{response.intent_plan.market_query || "Unresolved market"}</h3>
                 <dl className="normal-meta">
@@ -678,9 +722,9 @@ export function NormalModeIntentPanel() {
                     <dd>{formatExpiry(response.selected_market.expiry_ms)}</dd>
                   </dl>
                   <p className="normal-reason">
-                    StructX will use this live {response.selected_market.underlying} market for
-                    the quote. You will still review the final cost and payout profile before
-                    signing anything.
+                    StructX will price the strategy using this live{" "}
+                    {response.selected_market.underlying} market. The next step
+                    shows the final cost and payoff.
                   </p>
                   {!response.needs_clarification && (
                     <button
@@ -689,7 +733,7 @@ export function NormalModeIntentPanel() {
                       disabled={loading}
                       onClick={() => void handleQuote()}
                     >
-                      {loading ? "Quoting..." : "Quote proposal"}
+                      {loading ? "Getting the live price..." : "See live price"}
                     </button>
                   )}
                 </div>
@@ -697,7 +741,7 @@ export function NormalModeIntentPanel() {
 
               {response.candidate_markets.length > 0 && (
                 <div className="normal-card">
-                  <div className="normal-card-eyebrow">Candidate markets</div>
+                  <div className="normal-card-eyebrow">Other matching markets</div>
                   <div className="normal-stats">
                     {response.candidate_markets.slice(0, 4).map((market) => (
                       <div key={market.market_id} className="normal-stat">
@@ -712,7 +756,7 @@ export function NormalModeIntentPanel() {
               {(response.intent_plan.assumptions.length > 0 ||
                 response.intent_plan.warnings.length > 0) && (
                 <div className="normal-card">
-                  <div className="normal-card-eyebrow">Trust and warnings</div>
+                  <div className="normal-card-eyebrow">Things to know</div>
                   {response.intent_plan.assumptions.length > 0 && (
                     <div className="normal-reason">
                       Assumptions: {response.intent_plan.assumptions.join(" ")}
@@ -730,7 +774,7 @@ export function NormalModeIntentPanel() {
                 <div className="normal-card normal-card-recommend">
                   <div className="normal-card-eyebrow">
                     <span className="normal-step-num small">5</span>
-                    Execution proposal
+                    Your live strategy
                   </div>
                   <h3>{humanizeTemplate(proposal.strategy_template)}</h3>
                   <p className="normal-reason">{proposal.reason_for_selection}</p>
@@ -788,11 +832,11 @@ export function NormalModeIntentPanel() {
                   )}
 
                   <div className="normal-card">
-                    <div className="normal-card-eyebrow">Execution</div>
+                    <div className="normal-card-eyebrow">Ready to open</div>
                     <p className="normal-reason">
                       {managerId
                         ? `PredictManager ready: ${managerId}`
-                        : "No stored PredictManager found for this wallet yet."}
+                        : "Connect or create a PredictManager for this wallet before opening."}
                     </p>
                     <p className="normal-reason">
                       Quotes expire quickly. If this one goes stale, StructX will refresh it before
@@ -805,7 +849,7 @@ export function NormalModeIntentPanel() {
                         disabled={loading}
                         onClick={() => void handlePrepareExecution()}
                       >
-                        {loading ? "Preparing..." : "Prepare wallet transaction"}
+                        {loading ? "Preparing transaction..." : "Review wallet transaction"}
                       </button>
 
                       {executePlan && (
@@ -815,7 +859,7 @@ export function NormalModeIntentPanel() {
                           disabled={loading || !managerId}
                           onClick={() => void handleSignAndExecute()}
                         >
-                          {loading ? "Waiting for wallet..." : "Sign and open position"}
+                          {loading ? "Waiting for wallet..." : "Review and open position"}
                         </button>
                       )}
                     </div>
@@ -823,10 +867,10 @@ export function NormalModeIntentPanel() {
 
                   {executePlan && (
                     <div className="normal-card">
-                      <div className="normal-card-eyebrow">Wallet transaction plan</div>
+                      <div className="normal-card-eyebrow">Wallet transaction ready</div>
                       <p className="normal-reason">
-                        Backend rechecked your saved quote and prepared the transaction details the
-                        wallet needs for signing.
+                        StructX checked the latest quote and prepared the full transaction for your
+                        wallet to review.
                       </p>
                       {executePlan.compiled_strategy_id && (
                         <p className="normal-reason mono">
@@ -843,7 +887,7 @@ export function NormalModeIntentPanel() {
 
                   {auditResult && (
                     <div className="normal-card normal-card-recommend">
-                      <div className="normal-card-eyebrow">Execution audited</div>
+                      <div className="normal-card-eyebrow">Position opened</div>
                       <p className="normal-reason mono">{auditResult.audit.tx_digest}</p>
                       <p className="normal-reason">
                         Position sync: {auditResult.position_sync_status}

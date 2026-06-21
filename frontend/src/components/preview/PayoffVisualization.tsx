@@ -23,9 +23,9 @@ export function PayoffVisualization({ compiled }: Props) {
   const buckets = useMemo(() => {
     const labels: string[] = [
       `BTC < ${strikeLabels[0]}`,
-      `${strikeLabels[0]}–${strikeLabels[1]}`,
-      `${strikeLabels[1]}–${strikeLabels[2]}`,
-      `${strikeLabels[2]}–${strikeLabels[3]}`,
+      `${strikeLabels[0]} to ${strikeLabels[1]}`,
+      `${strikeLabels[1]} to ${strikeLabels[2]}`,
+      `${strikeLabels[2]} to ${strikeLabels[3]}`,
       `BTC > ${strikeLabels[3]}`,
     ];
     return labels.map((label, idx) => {
@@ -63,7 +63,7 @@ export function PayoffVisualization({ compiled }: Props) {
           ))}
         </div>
         <div className="payoff-axis">
-          <span>—</span>
+          <span>Unavailable</span>
           {strikeLabels.map((s, idx) => (
             <span key={idx} className="mono">
               {s}

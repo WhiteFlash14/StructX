@@ -216,8 +216,8 @@ export function StrategyBuilder({
         </p>
       )}
       <p className="field-help">
-        StructX auto-detects the funding manager for the connected wallet and
-        spends premium from there during mint.
+        StructX uses the PredictManager connected to this wallet and funds it
+        from your wallet when the strategy needs more dUSDC.
       </p>
 
       <div className="ticket-row">
@@ -233,7 +233,7 @@ export function StrategyBuilder({
             <span>dUSDC</span>
           </div>
           <span className="field-help">
-            Max premium you are willing to pay for this strategy.
+            This is the most you want to spend on the strategy.
           </span>
         </label>
       </div>
@@ -576,7 +576,7 @@ export function StrategyBuilder({
               <span>bps</span>
             </div>
             <span className="field-help">
-              Applied as a slippage guard before transaction build.
+              Sets how much the live price may move from the preview.
             </span>
           </label>
           <label className="field">
@@ -585,7 +585,7 @@ export function StrategyBuilder({
               <option value="nearest_active">Nearest active</option>
             </select>
             <span className="field-help">
-              Expiry selection becomes editable in a future milestone.
+              This strategy currently uses the nearest active expiry.
             </span>
           </label>
         </div>
@@ -597,7 +597,7 @@ export function StrategyBuilder({
         onClick={onCompile}
         disabled={compileDisabled}
       >
-        {compiling ? "Compiling…" : "Preview payoff"}
+        {compiling ? "Updating preview…" : "Preview payoff"}
       </button>
 
       {disabledReason && compileDisabled && (

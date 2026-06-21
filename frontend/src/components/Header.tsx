@@ -31,9 +31,8 @@ export function Header({ onCopyAddress }: Props) {
         <h1>Struct X</h1>
         <p className="subtitle">Powered by DeepBook Predict</p>
         <p className="subtitle">
-          Structured payoff builder on DeepBook Predict. Compile a strategy,
-          preview its legs and payoff, then open it from your own wallet.
-          Non-custodial — StructX never holds your funds.
+          Choose a strategy, review its positions and possible outcomes, then
+          open it from your wallet. You stay in control throughout the process.
         </p>
       </div>
 

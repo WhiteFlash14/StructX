@@ -59,7 +59,7 @@ export function ExecutionPanel({
     },
     { ok: compiled, text: "Strategy compiled" },
     { ok: budgetOk, text: "Budget covers premium" },
-    { ok: premiumOk, text: "Manager balance covers premium" },
+    { ok: premiumOk, text: "Wallet and manager can cover the premium" },
   ];
 
   return (
@@ -68,8 +68,8 @@ export function ExecutionPanel({
         <p className="eyebrow">Execution</p>
         <h2>Open strategy</h2>
         <p className="muted">
-          StructX builds a wallet-signed PTB. Your wallet asks for signature.
-          StructX never receives private keys and never custodies funds.
+          StructX prepares and checks the complete transaction. Your wallet
+          then shows it for review and approval.
         </p>
       </div>
 
@@ -100,7 +100,7 @@ export function ExecutionPanel({
           onClick={onDryRun}
           disabled={!canDryRun || dryRunning || opening}
         >
-          {dryRunning ? "Dry-running…" : "Dry-run transaction"}
+          {dryRunning ? "Checking transaction…" : "Check transaction"}
         </button>
 
         <button
@@ -114,11 +114,11 @@ export function ExecutionPanel({
       </div>
 
       {disabledReason && !canOpen && (
-        <p className="hint">Why disabled? {disabledReason}</p>
+        <p className="hint">To continue, {disabledReason}</p>
       )}
 
       <p className="hint">
-        Dry-run confirms the transaction shape before the wallet signature.
+        This check uses the current market and balance without moving funds.
       </p>
     </section>
   );

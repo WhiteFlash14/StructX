@@ -80,7 +80,7 @@ const QUICK_CHIPS: ReadonlyArray<Chip> = [
     id: "either",
     label: "Big move, either way",
     prompt:
-      "I expect a big BTC move but I do not know direction. Use 50 dUSDC.",
+      "I expect a big BTC move in either direction. Use 50 dUSDC.",
     icon: (
       <svg {...ICON_PROPS}>
         <path d="M3 12h18" />
@@ -183,8 +183,8 @@ export function NormalModePanel() {
             <div>
               <h2>Describe your market goal</h2>
               <p className="normal-panel-sub">
-                Pick a prompt or type your own. StructX picks a defined-risk
-                payoff that matches.
+                Start with one of these ideas or write your own. StructX will
+                match it to a strategy with a clear maximum loss.
               </p>
             </div>
           </div>
@@ -277,11 +277,11 @@ export function NormalModePanel() {
             {loading ? (
               <>
                 <span className="normal-generate-spinner" aria-hidden />
-                Generating…
+                Finding a strategy…
               </>
             ) : (
               <>
-                Generate strategy
+                Find my strategy
                 <svg
                   width="14"
                   height="14"
@@ -300,10 +300,9 @@ export function NormalModePanel() {
           </button>
 
           <p className="normal-disclaimer">
-            AI helps interpret your goal. The actual payoff, premium, and
-            on-chain transaction come from the deterministic StructX compiler.
-            You approve every transaction in your wallet. StructX never holds
-            funds.
+            StructX uses your message to choose a strategy, then calculates
+            the payoff and premium from live market data. Your wallet shows
+            the full transaction for approval when you decide to open it.
           </p>
         </div>
 
@@ -325,7 +324,7 @@ export function NormalModePanel() {
             <div className="normal-card">
               <div className="normal-card-eyebrow">
                 <span className="normal-step-num small">3</span>
-                Parsed intent
+                What we understood
               </div>
               <h3>{goalLabel(parsed.goal)}</h3>
               <dl className="normal-meta">

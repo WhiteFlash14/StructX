@@ -68,7 +68,7 @@ export function AuditReceipt({ audit, onCopied }: Props) {
               ? `${verification.verifiedCount} / ${
                   verification.verifiedCount + verification.mismatchCount
                 }`
-              : "—"
+              : "Unavailable"
           }
         />
       </div>
@@ -120,7 +120,7 @@ export function AuditReceipt({ audit, onCopied }: Props) {
                     <span className="kind-pill subtle">{leg.event}</span>
                   </td>
                   <td>{leg.kind}</td>
-                  <td>{leg.direction ?? "—"}</td>
+                  <td>{leg.direction ?? "Unavailable"}</td>
                   <td className="mono">
                     {leg.kind === "RANGE"
                       ? `${formatPriceCompact(leg.lower)} → ${formatPriceCompact(leg.upper)}`

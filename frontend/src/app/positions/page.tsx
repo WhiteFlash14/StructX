@@ -45,7 +45,7 @@ import {
 
 function formatExpiryCountdown(expiryMs: string): string {
   const exp = Number(expiryMs);
-  if (!Number.isFinite(exp) || exp <= 0) return "—";
+  if (!Number.isFinite(exp) || exp <= 0) return "Unavailable";
   const diffMs = exp - Date.now();
   if (diffMs <= 0) return "Expired";
   const days = Math.floor(diffMs / 86_400_000);
@@ -60,14 +60,14 @@ function strikeText(p: PositionRecord): string {
     return `${formatPriceCompact(p.lowerRaw)} → ${formatPriceCompact(p.upperRaw)}`;
   }
   if (p.strikeRaw) return formatPriceCompact(p.strikeRaw);
-  return "—";
+  return "Unavailable";
 }
 
 function formatPreviewDusdc(
   raw: string | null | undefined,
   previewAtUnix: number | null | undefined,
 ): string {
-  if (!previewAtUnix || previewAtUnix <= 0) return "—";
+  if (!previewAtUnix || previewAtUnix <= 0) return "Unavailable";
   return formatDusdcDisplay(raw);
 }
 
@@ -469,8 +469,8 @@ export default function PositionsPage() {
             </p>
             <h1>What you have open</h1>
             <p className="positions-sub">
-              Every position you opened from a strategy, with how much it
-              paid in, what it&apos;s worth right now, and a one-click close.
+              See what you paid, the latest close estimate, and the profit or
+              loss for every position opened through StructX.
             </p>
           </div>
           <div className="positions-actions">
@@ -779,7 +779,7 @@ function previewStatusFromError(
     msg.includes("einsufficientposition") ||
     msg.includes("insufficient_position")
   ) {
-    return "No longer held";
+    return "Position closed";
   }
   if (msg.includes("ezeroquantity")) {
     return "Closed";
@@ -1025,7 +1025,7 @@ function RedeemModal({
 
         <dl className="redeem-modal-grid">
           <dt>Strategy</dt>
-          <dd>{position.strategy ?? "—"}</dd>
+          <dd>{position.strategy ?? "Unavailable"}</dd>
           <dt>Kind</dt>
           <dd className="mono">{position.kind}</dd>
           <dt>Strike / range</dt>
@@ -1056,25 +1056,24 @@ function RedeemModal({
             </div>
             {preview.isSettled && (
               <p className="redeem-modal-hint">
-                The oracle has settled. This payout is final, not a live
-                preview.
+                The oracle has settled, so this is the final payout.
               </p>
             )}
           </div>
         )}
 
         <p className="redeem-modal-disclaimer">
-          Closing this position is a wallet-signed transaction. The estimate
-          above comes from an unsigned simulation. The actual payout can move
-          if the market shifts before you sign. Funds are deposited into your{" "}
-          <strong>PredictManager</strong>, not directly into your wallet.
+          The estimate uses the current market and can move before your wallet
+          approves the close. The payout is added to your{" "}
+          <strong>PredictManager</strong> balance, where it is ready for another
+          strategy or a separate withdrawal.
         </p>
 
         {previewError && <p className="redeem-modal-error">{previewError}</p>}
         {signError && <p className="redeem-modal-error">{signError}</p>}
         {signedDigest && (
           <p className="redeem-modal-success">
-            Redeem accepted · digest {shortAddress(signedDigest)}
+            Position close accepted. Digest {shortAddress(signedDigest)}
           </p>
         )}
 

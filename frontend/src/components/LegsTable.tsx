@@ -23,9 +23,9 @@ function legBadge(leg: StrategyLeg) {
 
 function strikeText(leg: StrategyLeg) {
   if (leg.kind === "RANGE") {
-    return `${leg.lower ?? "—"} → ${leg.upper ?? "—"}`;
+    return `${leg.lower ?? "Unavailable"} to ${leg.upper ?? "Unavailable"}`;
   }
-  return leg.strike ?? "—";
+  return leg.strike ?? "Unavailable";
 }
 
 type Props = {
@@ -66,7 +66,7 @@ export function LegsTable({ legs }: Props) {
                   <td className="mono">{leg.quantityDisplay}</td>
                   <td className="mono dim">{leg.askPriceRaw}</td>
                   <td className="mono">{leg.premiumDisplay}</td>
-                  <td className="mono dim">{leg.maxCostRaw ?? "—"}</td>
+                  <td className="mono dim">{leg.maxCostRaw ?? "Unavailable"}</td>
                 </tr>
               );
             })}

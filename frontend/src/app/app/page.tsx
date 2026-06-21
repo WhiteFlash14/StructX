@@ -34,6 +34,7 @@ import {
   buildOpenStrategy,
   compileStrategy,
   getManagerBalance,
+  invalidateManagerBalance,
 } from "@/lib/api";
 import { mapDryRunFailure, mapError, type FriendlyError } from "@/lib/errors";
 import { appendPortfolioHistory, readPortfolioHistory } from "@/lib/portfolioHistory";
@@ -46,13 +47,17 @@ import {
   type CategoryTab,
 } from "@/lib/strategyCatalog";
 import {
+  addSlippageBps,
   buildCreateManagerTransaction,
+  buildDepositAndOpenStrategyTransaction,
+  fetchWalletDusdcBalance,
   PREDICT_MANAGER_TYPE,
+  requiredManagerReserveRaw,
 } from "@/lib/tx";
-import { buildOpenStrategyTransaction } from "@/lib/tx";
 import type {
   AppMode,
   AuditResponse,
+  BuildOpenStrategyResponse,
   CompileResponse,
   ExecutionStage,
   GuidedCompileResponse,
@@ -154,6 +159,7 @@ export default function HomePage() {
   const [managerBalance, setManagerBalance] =
     useState<ManagerBalanceResponse | null>(null);
   const [managerBalanceLoading, setManagerBalanceLoading] = useState(false);
+  const [walletDusdcRaw, setWalletDusdcRaw] = useState<string | null>(null);
   const [managerDiscovering, setManagerDiscovering] = useState(false);
   const [creatingManager, setCreatingManager] = useState(false);
   const [managerNotice, setManagerNotice] = useState<ManagerNotice>(null);
@@ -291,10 +297,22 @@ export default function HomePage() {
   useEffect(() => {
     if (!connectedAddress) {
       setPortfolioHistory([]);
+      setWalletDusdcRaw(null);
       return;
     }
     setPortfolioHistory(readPortfolioHistory(connectedAddress));
-  }, [connectedAddress]);
+    let cancelled = false;
+    void fetchWalletDusdcBalance(suiClient, connectedAddress)
+      .then(({ totalRaw }) => {
+        if (!cancelled) setWalletDusdcRaw(totalRaw.toString());
+      })
+      .catch(() => {
+        if (!cancelled) setWalletDusdcRaw(null);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [connectedAddress, suiClient]);
 
   useEffect(() => {
     const stored = window.localStorage.getItem("structx.mode");
@@ -590,15 +608,19 @@ export default function HomePage() {
   ]);
 
   const premiumOk = useMemo(() => {
-    if (!compiled || !managerBalance?.balanceRaw) return false;
+    if (!compiled || managerBalance?.balanceRaw === undefined || walletDusdcRaw === null) {
+      return false;
+    }
     try {
-      return (
-        BigInt(managerBalance.balanceRaw) >= BigInt(compiled.premiumRequiredRaw)
+      const reserve = addSlippageBps(
+        BigInt(compiled.premiumRequiredRaw),
+        Number(slippageBps),
       );
+      return BigInt(managerBalance.balanceRaw) + BigInt(walletDusdcRaw) >= reserve;
     } catch {
       return false;
     }
-  }, [compiled, managerBalance]);
+  }, [compiled, managerBalance, slippageBps, walletDusdcRaw]);
 
   const budgetOk = useMemo(() => {
     if (!compiled) return false;
@@ -641,14 +663,20 @@ export default function HomePage() {
         "Compiled owner does not match connected wallet. Re-preview with connected wallet.",
       );
     }
-    if (compiled && managerBalance?.balanceRaw) {
+    if (
+      compiled &&
+      managerBalance?.balanceRaw !== undefined &&
+      walletDusdcRaw !== null
+    ) {
       try {
-        if (
-          BigInt(managerBalance.balanceRaw) <
-          BigInt(compiled.premiumRequiredRaw)
-        ) {
+        const reserve = addSlippageBps(
+          BigInt(compiled.premiumRequiredRaw),
+          Number(slippageBps),
+        );
+        const available = BigInt(managerBalance.balanceRaw) + BigInt(walletDusdcRaw);
+        if (available < reserve) {
           warnings.push(
-            `Insufficient selected manager balance. Required ${compiled.premiumRequiredDisplay}, available ${managerBalance.balanceDisplay ?? managerBalance.balanceRaw}.`,
+            "Your wallet and PredictManager do not have enough dUSDC for this strategy and its price-movement allowance.",
           );
         }
       } catch {
@@ -665,6 +693,8 @@ export default function HomePage() {
     isTestnet,
     managerId,
     managerBalance,
+    slippageBps,
+    walletDusdcRaw,
   ]);
 
   const displayWarnings = useMemo(() => {
@@ -688,6 +718,44 @@ export default function HomePage() {
 
   const canOpen = canDryRun && dryRunOk;
 
+  const prepareOpenTransaction = useCallback(
+    async (build: BuildOpenStrategyResponse) => {
+      if (!connectedAddress) {
+        throw new Error("Connect a wallet before preparing the transaction.");
+      }
+      invalidateManagerBalance(managerId);
+      const balance = await getManagerBalance(managerId);
+      if (!balance.ok || balance.balanceRaw === undefined) {
+        throw new Error(
+          balance.error ?? "Could not read the latest PredictManager balance.",
+        );
+      }
+      setManagerBalance(balance);
+
+      const managerRaw = BigInt(balance.balanceRaw);
+      const reserveRaw = requiredManagerReserveRaw(build);
+      const depositRaw = reserveRaw > managerRaw ? reserveRaw - managerRaw : 0n;
+      const wallet = await fetchWalletDusdcBalance(
+        suiClient,
+        connectedAddress,
+        depositRaw > 0n ? depositRaw : undefined,
+      );
+      setWalletDusdcRaw(wallet.totalRaw.toString());
+      if (wallet.totalRaw < depositRaw) {
+        throw new Error(
+          "Your wallet does not have enough dUSDC to fund this strategy and its price-movement allowance.",
+        );
+      }
+
+      return {
+        payload: build,
+        depositRaw,
+        walletDusdcCoinIds: depositRaw > 0n ? wallet.coinObjectIds : [],
+      };
+    },
+    [connectedAddress, managerId, suiClient],
+  );
+
   const onDryRun = useCallback(async () => {
     if (!compiled || !connectedAddress) return;
     setDryRunning(true);
@@ -702,7 +770,8 @@ export default function HomePage() {
         maxPremiumRaw: compiled.premiumRequiredRaw,
         slippageBps: Number(slippageBps),
       });
-      const tx = buildOpenStrategyTransaction(build);
+      const transactionArgs = await prepareOpenTransaction(build);
+      const tx = buildDepositAndOpenStrategyTransaction(transactionArgs);
       const result = await suiClient.devInspectTransactionBlock({
         sender: connectedAddress,
         transactionBlock: tx,
@@ -727,6 +796,7 @@ export default function HomePage() {
     compiled,
     connectedAddress,
     managerId,
+    prepareOpenTransaction,
     slippageBps,
     suiClient,
     updateStage,
@@ -748,7 +818,23 @@ export default function HomePage() {
         maxPremiumRaw: compiled.premiumRequiredRaw,
         slippageBps: Number(slippageBps),
       });
-      const tx = buildOpenStrategyTransaction(build);
+      const transactionArgs = await prepareOpenTransaction(build);
+      const preflightTx = buildDepositAndOpenStrategyTransaction(transactionArgs);
+      const preflight = await suiClient.devInspectTransactionBlock({
+        sender: connectedAddress,
+        transactionBlock: preflightTx,
+      });
+      if (preflight.effects?.status?.status !== "success") {
+        updateStage("signature", "failed");
+        setOpenError(
+          mapDryRunFailure(
+            preflight.effects?.status?.error ??
+              "The final transaction check did not succeed.",
+          ),
+        );
+        return;
+      }
+      const tx = buildDepositAndOpenStrategyTransaction(transactionArgs);
       const execution = await signAndExecuteTransaction({
         transaction: tx,
         chain: "sui:testnet",
@@ -841,6 +927,7 @@ export default function HomePage() {
     compiled,
     connectedAddress,
     managerId,
+    prepareOpenTransaction,
     slippageBps,
     signAndExecuteTransaction,
     suiClient,
@@ -850,7 +937,13 @@ export default function HomePage() {
   ]);
 
   const compileDisabled =
-    compileLoading || !owner || !budgetDUSDC || Number(budgetDUSDC) <= 0;
+    compileLoading ||
+    !owner ||
+    !budgetDUSDC ||
+    Number(budgetDUSDC) <= 0 ||
+    !Number.isInteger(Number(slippageBps)) ||
+    Number(slippageBps) < 0 ||
+    Number(slippageBps) > 10_000;
   const managerBalanceDisplay = managerBalance?.ok
     ? (managerBalance.balanceDisplay ?? null)
     : null;
@@ -1221,7 +1314,7 @@ export default function HomePage() {
                               label: "Budget target",
                               detail: compiled
                                 ? `${compiled.premiumRequiredDisplay} vs target ${compiled.budgetDisplay}`
-                                : "—",
+                                : "Unavailable",
                             },
                             {
                               ok: premiumOk,

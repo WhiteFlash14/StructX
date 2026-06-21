@@ -168,7 +168,7 @@ export function Header({
                 </div>
                 <div className="avatar-balance-line">
                   <span>Selected manager balance</span>
-                  <strong>{managerBalance ?? "—"}</strong>
+                  <strong>{managerBalance ?? "Unavailable"}</strong>
                 </div>
                 <div className="avatar-pop-nav">
                   <button

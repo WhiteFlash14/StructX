@@ -4,12 +4,12 @@ import type { ExecutionStage, StageStatus } from "@/types/structx";
 
 const STAGES: { id: ExecutionStage; label: string; sub: string }[] = [
   { id: "configure", label: "Configure", sub: "Set your inputs" },
-  { id: "preview", label: "Preview", sub: "Compile the plan" },
-  { id: "preflight", label: "Preflight", sub: "Check wallet & balance" },
-  { id: "dryRun", label: "Dry-run", sub: "Simulate the transaction" },
-  { id: "signature", label: "Signature", sub: "Sign in your wallet" },
+  { id: "preview", label: "Preview", sub: "Build the payoff" },
+  { id: "preflight", label: "Balance check", sub: "Check wallet and manager" },
+  { id: "dryRun", label: "Transaction check", sub: "Test the full transaction" },
+  { id: "signature", label: "Wallet approval", sub: "Review in your wallet" },
   { id: "submitted", label: "Submitted", sub: "Wait for confirmation" },
-  { id: "audited", label: "Audited", sub: "Verify minted positions" },
+  { id: "audited", label: "Verified", sub: "Confirm the opened positions" },
 ];
 
 type Props = {

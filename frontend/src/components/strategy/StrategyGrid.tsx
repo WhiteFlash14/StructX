@@ -30,7 +30,7 @@ export function StrategyGrid({
         body={
           query
             ? "Try a different keyword, or clear the filters."
-            : "We are working on more payoff types. Clear filters to see what's available now."
+            : "Clear the filters to see the strategies available right now."
         }
         action={
           <button type="button" className="primary-button compact" onClick={onClearFilters}>
@@ -56,7 +56,7 @@ export function StrategyGrid({
         <div className="filler-inner">
           <p className="filler-eyebrow">Roadmap</p>
           <p className="filler-text">
-            More strategies coming as StructX matures on DeepBook Predict.
+            More payoff styles are coming to the library.
           </p>
         </div>
       </div>

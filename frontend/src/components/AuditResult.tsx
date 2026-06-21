@@ -27,10 +27,10 @@ export function AuditResult({ audit, onCopy }: Props) {
       </div>
 
       <div className="stats-grid">
-        <Stat label="Total premium paid" value={audit.totalCostDisplay ?? "—"} />
+        <Stat label="Total premium paid" value={audit.totalCostDisplay ?? "Unavailable"} />
         <Stat
           label="Manager balance after"
-          value={audit.managerBalanceDisplay ?? "—"}
+          value={audit.managerBalanceDisplay ?? "Unavailable"}
         />
         <Stat
           label="Verified positions"
@@ -39,12 +39,12 @@ export function AuditResult({ audit, onCopy }: Props) {
               ? `${verification.verifiedCount} / ${
                   verification.verifiedCount + verification.mismatchCount
                 }`
-              : "—"
+              : "Unavailable"
           }
         />
         <Stat
           label="Verification status"
-          value={verification?.status ?? "—"}
+          value={verification?.status ?? "Unavailable"}
         />
       </div>
 
@@ -85,11 +85,11 @@ export function AuditResult({ audit, onCopy }: Props) {
                     <span className="kind-pill subtle">{leg.event}</span>
                   </td>
                   <td>{leg.kind}</td>
-                  <td>{leg.direction ?? "—"}</td>
+                  <td>{leg.direction ?? "Unavailable"}</td>
                   <td className="mono">
                     {leg.kind === "RANGE"
-                      ? `${leg.lower ?? "—"} → ${leg.upper ?? "—"}`
-                      : (leg.strike ?? "—")}
+                      ? `${leg.lower ?? "Unavailable"} to ${leg.upper ?? "Unavailable"}`
+                      : (leg.strike ?? "Unavailable")}
                   </td>
                   <td className="mono">{leg.quantityDisplay}</td>
                   <td className="mono">{leg.costDisplay}</td>

@@ -57,8 +57,8 @@ export function BreakoutForm({
         <p className="eyebrow">Configure</p>
         <h2>Breakout Protection</h2>
         <p className="muted">
-          Define payoff parameters. StructX compiles a Predict mint plan in
-          your wallet. No funds are moved into a vault.
+          Choose the amount and payoff style, then review the Predict positions
+          StructX prepares for your wallet.
         </p>
       </div>
 
@@ -157,7 +157,7 @@ export function BreakoutForm({
         </select>
       </label>
       <p className="style-help">
-        Expiry selection will become user-editable in a later milestone.
+        This strategy currently uses the nearest active expiry.
       </p>
 
       <button
@@ -166,11 +166,11 @@ export function BreakoutForm({
         onClick={onCompile}
         disabled={compileDisabled}
       >
-        {compiling ? "Compiling strategy…" : "Preview strategy"}
+        {compiling ? "Updating preview…" : "Preview strategy"}
       </button>
 
       <p className="hint">
-        Quotes are live and may change before signing. Testnet only.
+        This preview uses live Testnet prices, which can move before you open.
       </p>
     </section>
   );

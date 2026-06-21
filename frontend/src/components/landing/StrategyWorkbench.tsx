@@ -28,10 +28,12 @@ import {
   shortAddress,
 } from "@/lib/format";
 import {
+  addSlippageBps,
   buildCreateManagerTransaction,
   buildDepositAndOpenStrategyTransaction,
   fetchWalletDusdcBalance,
   PREDICT_MANAGER_TYPE,
+  requiredManagerReserveRaw,
 } from "@/lib/tx";
 import { WorkbenchPreviewSkeleton } from "@/components/landing/WorkbenchPreviewSkeleton";
 import type {
@@ -81,11 +83,11 @@ function compactScenarioLabel(
   if (match) return `BTC ≥ ${match[1]}`;
 
   match = text.match(/^(.+?)\s*<\s*BTC settles\s*<=\s*(.+)$/i);
-  if (match) return `${match[1]}–${match[2]}`;
+  if (match) return `${match[1]} to ${match[2]}`;
 
   return text
     .replace(/^BTC settles\s*/i, "")
-    .replace(/\s+to\s+/gi, "–")
+    .replace(/\s+to\s+/gi, " to ")
     .replace(/\s+/g, " ")
     .trim();
 }
@@ -1031,22 +1033,24 @@ export function StrategyWorkbench({
     if (!compiled) return null;
     try {
       const premium = BigInt(compiled.premiumRequiredRaw);
+      const reserve = addSlippageBps(premium, Number(slippage));
       const managerBalance = managerBalanceRaw ? BigInt(managerBalanceRaw) : 0n;
       const walletBalance = walletDusdcRaw ? BigInt(walletDusdcRaw) : 0n;
       const totalAvailable = managerBalance + walletBalance;
-      const shortfall = premium > managerBalance ? premium - managerBalance : 0n;
+      const shortfall = reserve > managerBalance ? reserve - managerBalance : 0n;
       return {
         premium,
+        reserve,
         managerBalance,
         walletBalance,
         totalAvailable,
         shortfall,
-        sufficient: totalAvailable >= premium,
+        sufficient: totalAvailable >= reserve,
       };
     } catch {
       return null;
     }
-  }, [compiled, managerBalanceRaw, walletDusdcRaw]);
+  }, [compiled, managerBalanceRaw, slippage, walletDusdcRaw]);
 
   const premiumOk = fundsSnapshot?.sufficient ?? false;
 
@@ -1097,25 +1101,40 @@ export function StrategyWorkbench({
       );
       if (controller.signal.aborted) return;
 
-      // Decide deposit shortfall against the freshly built premium, not the
-      // older compile preview — between compile and build the live ask may
-      // have shifted and the backend re-quoted.
-      const premiumRaw = BigInt(build.summary.premiumRequiredRaw);
-      const managerBalance = managerBalanceRaw ? BigInt(managerBalanceRaw) : 0n;
-      const shortfall = premiumRaw > managerBalance ? premiumRaw - managerBalance : 0n;
+      // Refresh the manager balance at the last possible moment. A cached
+      // balance can overestimate what is available and underfund the atomic
+      // deposit-and-mint transaction.
+      invalidateManagerBalance(managerId);
+      const liveBalance = await getManagerBalance(managerId, {
+        signal: controller.signal,
+      });
+      if (controller.signal.aborted) return;
+      if (!liveBalance.ok || !liveBalance.balanceRaw) {
+        throw new Error(
+          liveBalance.error ?? "Could not read the latest PredictManager balance.",
+        );
+      }
+      setManagerBalanceRaw(liveBalance.balanceRaw);
+      setManagerBalanceDisplay(liveBalance.balanceDisplay ?? null);
+
+      const managerBalance = BigInt(liveBalance.balanceRaw);
+      const requiredReserve = requiredManagerReserveRaw(build);
+      const shortfall =
+        requiredReserve > managerBalance ? requiredReserve - managerBalance : 0n;
 
       let walletDusdcCoinIds: string[] = [];
       if (shortfall > 0n) {
         const { totalRaw, coinObjectIds } = await fetchWalletDusdcBalance(
           suiClient,
           connectedAddress,
+          shortfall,
         );
         if (controller.signal.aborted) return;
         if (totalRaw < shortfall) {
           setOpenError({
             title: "Not enough dUSDC",
-            message: `Need ${formatDusdcDisplay(shortfall.toString())} more than your manager holds, but your wallet only has ${formatDusdcDisplay(totalRaw.toString())}.`,
-            action: "Get test dUSDC from the Sui Testnet faucet and try again.",
+            message: `This strategy needs ${formatDusdcDisplay(shortfall.toString())} from your wallet, including the price-movement allowance. Your wallet currently has ${formatDusdcDisplay(totalRaw.toString())}.`,
+            action: "Add test dUSDC to this wallet or lower the amount, then try again.",
             severity: "blocking",
           });
           return;
@@ -1123,11 +1142,28 @@ export function StrategyWorkbench({
         walletDusdcCoinIds = coinObjectIds;
       }
 
-      const tx = buildDepositAndOpenStrategyTransaction({
+      const transactionArgs = {
         payload: build,
         depositRaw: shortfall,
         walletDusdcCoinIds,
+      };
+      const preflightTx = buildDepositAndOpenStrategyTransaction(transactionArgs);
+      const preflight = await suiClient.devInspectTransactionBlock({
+        sender: connectedAddress,
+        transactionBlock: preflightTx,
       });
+      if (controller.signal.aborted) return;
+      if (preflight.effects?.status?.status !== "success") {
+        setOpenError(
+          mapDryRunFailure(
+            preflight.effects?.status?.error ??
+              "The final transaction check did not succeed.",
+          ),
+        );
+        return;
+      }
+
+      const tx = buildDepositAndOpenStrategyTransaction(transactionArgs);
       const execution = await signAndExecuteTransaction({
         transaction: tx,
         chain: "sui:testnet",
@@ -1212,7 +1248,6 @@ export function StrategyWorkbench({
   }, [
     compiled,
     connectedAddress,
-    managerBalanceRaw,
     managerId,
     slippage,
     signAndExecuteTransaction,
@@ -1221,7 +1256,13 @@ export function StrategyWorkbench({
   ]);
 
   const compileDisabled =
-    compileLoading || !owner || !budget || Number(budget) <= 0;
+    compileLoading ||
+    !owner ||
+    !budget ||
+    Number(budget) <= 0 ||
+    !Number.isInteger(Number(slippage)) ||
+    Number(slippage) < 0 ||
+    Number(slippage) > 10_000;
 
   const disabledReason = useMemo(() => {
     if (!compiled) return "Preview the payoff first.";
@@ -1238,9 +1279,9 @@ export function StrategyWorkbench({
     if (managerBalanceLoading) return "Checking manager balance…";
     if (managerBalanceError) return managerBalanceError;
     if (!premiumOk && fundsSnapshot) {
-      const need = formatDusdcDisplay(fundsSnapshot.premium.toString());
+      const need = formatDusdcDisplay(fundsSnapshot.reserve.toString());
       const have = formatDusdcDisplay(fundsSnapshot.totalAvailable.toString());
-      return `Need ${need} (manager + wallet). You have ${have}. Get more from the Sui Testnet faucet.`;
+      return `This strategy needs ${need} across your wallet and manager, including the price-movement allowance. You currently have ${have}.`;
     }
     return null;
   }, [
@@ -1290,7 +1331,7 @@ export function StrategyWorkbench({
                 : !managerId
                   ? discover.phase === "checking"
                     ? "Checking…"
-                    : "—"
+                    : "Unavailable"
                   : managerBalanceLoading
                     ? "Checking…"
                     : (managerBalanceDisplay ?? "Unavailable")}
@@ -1760,7 +1801,7 @@ export function StrategyWorkbench({
             onClick={() => void onCompile()}
             disabled={compileDisabled}
           >
-            {compileLoading ? "Compiling…" : "Preview payoff"}
+            {compileLoading ? "Updating preview…" : "Preview payoff"}
           </button>
 
           {compiled && (
@@ -1772,11 +1813,11 @@ export function StrategyWorkbench({
             >
               {opening
                 ? willDeposit
-                  ? "Depositing…"
-                  : "Signing…"
+                  ? "Preparing deposit…"
+                  : "Preparing transaction…"
                 : willDeposit
-                  ? "Deposit & open"
-                  : "Sign & open"}
+                  ? "Fund manager and open"
+                  : "Review and open"}
             </button>
           )}
         </div>
@@ -1801,9 +1842,9 @@ export function StrategyWorkbench({
           <div className="wb-empty">
             <h3>Preview your payoff</h3>
             <p>
-              Set a budget on the left and tap{" "}
+              Choose an amount on the left, then select{" "}
               <strong>Preview payoff</strong> to see the legs, premium, and
-              payoff outcomes.
+              possible outcomes.
             </p>
           </div>
         )}
@@ -1838,7 +1879,7 @@ function ManagerStatus({
         <span className="wb-discover-dot dot-idle" aria-hidden />
         <div className="wb-discover-text">
           <strong>PredictManager</strong>
-          <span>Connect a wallet to auto-detect or create one.</span>
+          <span>Connect your wallet so StructX can find or create one.</span>
         </div>
       </div>
     );
@@ -1858,47 +1899,47 @@ function ManagerStatus({
         <div className="wb-discover-text">
           {phase.phase === "checking" && (
             <>
-              <strong>Looking up your PredictManager…</strong>
+              <strong>Finding your PredictManager…</strong>
               <span>
-                Checking saved managers, your wallet history, and live manager
-                balances on Sui Testnet.
+                Checking your saved manager and recent wallet activity on Sui
+                Testnet.
               </span>
             </>
           )}
           {phase.phase === "found" && (
             <>
-              <strong>PredictManager auto-detected</strong>
+              <strong>PredictManager found</strong>
               <span>
                 {phase.source === "history"
-                  ? "Recovered from your previous wallet transactions."
+                  ? "Found in your recent wallet transactions."
                   : phase.source === "backend"
-                    ? "Recovered from StructX manager history."
-                    : "Recovered from your previous browser session."}
+                    ? "Found in your StructX history."
+                    : "Loaded from this browser session."}
               </span>
             </>
           )}
           {phase.phase === "creating" && (
             <>
               <strong>Creating a PredictManager…</strong>
-              <span>Confirm the create-manager signature in your wallet.</span>
+              <span>Review and approve the manager creation in your wallet.</span>
             </>
           )}
           {phase.phase === "created" && (
             <>
               <strong>PredictManager ready</strong>
-              <span>Created and bound to your wallet.</span>
+              <span>Your new manager is ready for this wallet.</span>
             </>
           )}
           {phase.phase === "error" && (
             <>
-              <strong>Couldn't auto-create</strong>
+              <strong>PredictManager setup needs attention</strong>
               <span>{phase.message}</span>
             </>
           )}
           {phase.phase === "idle" && (
             <>
               <strong>PredictManager</strong>
-              <span>Connect a wallet to auto-detect or create one.</span>
+              <span>Connect your wallet so StructX can find or create one.</span>
             </>
           )}
         </div>
@@ -2117,12 +2158,12 @@ function AuditCard({ audit }: { audit: AuditResponse }) {
       <div className="wb-stats" style={{ marginTop: 14 }}>
         <div className="wb-stat">
           <label>Total premium</label>
-          <strong>{formatDusdcDisplayString(audit.totalCostDisplay) ?? "—"}</strong>
+          <strong>{formatDusdcDisplayString(audit.totalCostDisplay) ?? "Unavailable"}</strong>
         </div>
         <div className="wb-stat">
           <label>Manager after</label>
           <strong>
-            {formatDusdcDisplayString(audit.managerBalanceDisplay) ?? "—"}
+            {formatDusdcDisplayString(audit.managerBalanceDisplay) ?? "Unavailable"}
           </strong>
         </div>
         <div className="wb-stat">
@@ -2130,7 +2171,7 @@ function AuditCard({ audit }: { audit: AuditResponse }) {
           <strong>
             {verification
               ? `${verification.verifiedCount} / ${verification.verifiedCount + verification.mismatchCount}`
-              : "—"}
+              : "Unavailable"}
           </strong>
         </div>
         <div className="wb-stat">

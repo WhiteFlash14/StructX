@@ -30,9 +30,9 @@ export function EmptyPreview() {
         before you sign.
       </p>
       <ul className="empty-bullets">
-        <li>Non-custodial. Funds stay in your PredictManager.</li>
-        <li>Sui Testnet only.</li>
-        <li>Dry-run confirms the transaction shape before signing.</li>
+        <li>Your wallet stays in control of every transaction.</li>
+        <li>This version runs on Sui Testnet.</li>
+        <li>StructX checks the transaction before your wallet opens it.</li>
       </ul>
     </section>
   );

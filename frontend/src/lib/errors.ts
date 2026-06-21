@@ -49,6 +49,21 @@ function mapMoveAbort(text: string): FriendlyError | null {
       debug: text,
     };
   }
+  if (
+    lower.includes("ebalancemanagerbalancetoolow") ||
+    (lower.includes("balance_manager") &&
+      lower.includes("withdraw_with_proof") &&
+      lower.includes("code 3"))
+  ) {
+    return {
+      title: "Manager needs more dUSDC",
+      message:
+        "The PredictManager did not have enough dUSDC when the transaction was checked.",
+      action: "Try again so StructX can refresh the balance and fund the manager first.",
+      severity: "blocking",
+      debug: text,
+    };
+  }
   if (lower.includes("invalidusageofpurearg")) {
     return {
       title: "Transaction builder error",
@@ -122,6 +137,18 @@ function mapApiCode(body: ApiErrorBody): FriendlyError | null {
           "The premium required for this strategy exceeds your requested budget.",
         action: body.action ?? "Increase the budget or pick a different style.",
         severity: "blocking",
+        debug: body.debug?.stderr,
+      };
+    case "PREMIUM_EXCEEDS_SLIPPAGE_CAP":
+      return {
+        title: body.title ?? "Price moved beyond your limit",
+        message:
+          body.message ??
+          "The live premium moved above the limit you approved in the preview.",
+        action:
+          body.action ??
+          "Preview the strategy again to review the latest price before opening it.",
+        severity: "caution",
         debug: body.debug?.stderr,
       };
     case "UNSUPPORTED_NETWORK":
