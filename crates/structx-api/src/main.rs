@@ -3,7 +3,6 @@ mod intent_positions;
 mod open_execution_audit;
 mod position_ledger;
 mod proposal_store;
-#[allow(dead_code)]
 mod storage;
 
 use axum::{
@@ -13,9 +12,11 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
+
 use deepbook_client::{
     DeepBookClient, DeepBookConfig, FreshnessConfig, MarketSnapshot, ObjectOwnerKind,
     SuiObjectInfo, SuiRpcClient, DEFAULT_SUI_TESTNET_RPC_URL, PREDICT_MANAGER_TYPE,
+    PREDICT_SERVER_URL,
 };
 use intent_audit::{
     infer_execution_status, infer_manager_id_from_execution, make_audit_id,
@@ -31,23 +32,25 @@ use proposal_store::DiskProposalStore;
 use serde::{Deserialize, Serialize};
 use std::{
     collections::HashMap,
-    env, fs,
+    env,
     net::SocketAddr,
-    path::{Path as StdPath, PathBuf},
+    path::PathBuf,
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
-use structx_core::{build_redeem_tx_kind, ManagerPositionRead, MintObjectRefs};
+use structx_core::{
+    build_mint_tx_kind, build_redeem_tx_kind, BinaryDirection, DisplayPrice, ManagerPositionRead,
+    MintObjectRefs, QuoteCall, QuoteFunction, QuotePlan, QuoteTarget, Strike,
+};
+use structx_service as service;
 use structx_service::{
     load_catalog_status, plan_from_intent, quote_intent_plan,
     refresh_catalog_from_existing_markets_json, DiskMarketStore, ExpiryPreference, MarketCategory,
     MarketKind, MarketSearchQuery, MarketStatus, MarketStore, QuoteIntentPlanRequest, RiskStyle,
     UserIntentRequest,
 };
-use tokio::{process::Command, sync::Mutex};
+use tokio::sync::Mutex;
 use tower_http::cors::CorsLayer;
-
-const DEFAULT_PREDICT_SERVER_URL: &str = "https://predict-server.testnet.mystenlabs.com";
 
 const PREDICT_PACKAGE_ID: &str =
     "0xf5ea2b3749c65d6e56507cc35388719aadb28f9cab873696a2f8687f5c785138";
@@ -59,10 +62,11 @@ const DUSDC_COIN_TYPE: &str =
 
 #[derive(Debug, Clone)]
 struct AppState {
-    cli_bin: PathBuf,
     compiled: Arc<Mutex<HashMap<String, serde_json::Value>>>,
-    audits_dir: PathBuf,
-    audit_lock: Arc<Mutex<()>>,
+    /// Persistent map from lower-cased wallet address -> PredictManager object id.
+    /// Backed by a JSON file at `managers_path` so the same wallet sees its
+    /// previously created manager across browsers, devices, and localStorage
+    /// resets.
     managers: Arc<Mutex<HashMap<String, String>>>,
     managers_path: PathBuf,
     markets_refresh: Arc<Mutex<MarketsRefreshState>>,
@@ -149,11 +153,37 @@ fn save_managers(path: &std::path::Path, map: &HashMap<String, String>) -> std::
     Ok(())
 }
 
+#[derive(Debug, Deserialize)]
+struct BuildOpenStrategyRequest {
+    owner: String,
+    #[serde(rename = "managerId")]
+    manager_id: String,
+    #[serde(rename = "compiledStrategyId")]
+    compiled_strategy_id: String,
+    #[serde(rename = "maxPremiumRaw")]
+    max_premium_raw: String,
+    #[serde(rename = "slippageBps")]
+    slippage_bps: u16,
+}
+
+#[derive(Debug, Deserialize)]
+struct AuditOpenStrategyRequest {
+    owner: String,
+    #[serde(rename = "managerId")]
+    manager_id: String,
+    #[serde(rename = "compiledStrategyId")]
+    compiled_strategy_id: String,
+    digest: String,
+    effects: serde_json::Value,
+    events: Vec<serde_json::Value>,
+    #[serde(rename = "objectChanges")]
+    object_changes: Vec<serde_json::Value>,
+}
+
 #[derive(Debug, Serialize)]
 struct HealthResponse {
     ok: bool,
     service: &'static str,
-    cli_bin: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -165,30 +195,62 @@ struct CliResponse {
 }
 
 #[derive(Debug, Deserialize)]
-struct LivePriceQuery {
-    #[serde(default = "default_live_asset")]
-    asset: String,
-
-    #[serde(rename = "oracleId")]
-    oracle_id: Option<String>,
-}
-
-fn default_live_asset() -> String {
-    "BTC".to_string()
-}
-
-#[derive(Debug, Serialize)]
-struct LivePriceResponse {
-    ok: bool,
-    asset: String,
-    source: String,
-    price_raw: Option<String>,
-    price: Option<String>,
-    updated_at_ms: Option<u64>,
-    stale: bool,
-    oracle_id: Option<String>,
-    raw: serde_json::Value,
-    warnings: Vec<String>,
+struct CompileStrategyRequest {
+    owner: String,
+    strategy: String,
+    #[serde(rename = "budgetDUSDC")]
+    budget_dusdc: String,
+    style: String,
+    #[serde(rename = "expiryPreference")]
+    expiry_preference: String,
+    #[serde(rename = "slippageBps")]
+    slippage_bps: u16,
+    #[serde(rename = "bucketStepUsd")]
+    bucket_step_usd: Option<f64>,
+    #[serde(rename = "customK1Price")]
+    custom_k1_price: Option<f64>,
+    #[serde(rename = "customK2Price")]
+    custom_k2_price: Option<f64>,
+    #[serde(rename = "customK3Price")]
+    custom_k3_price: Option<f64>,
+    #[serde(rename = "customK4Price")]
+    custom_k4_price: Option<f64>,
+    #[serde(rename = "portfolioExposureDUSDC")]
+    portfolio_exposure_dusdc: Option<f64>,
+    #[serde(rename = "overHedgeCapBps")]
+    over_hedge_cap_bps: Option<u16>,
+    #[serde(rename = "deadZoneBps")]
+    dead_zone_bps: Option<u16>,
+    #[serde(rename = "convexGammaBps")]
+    convex_gamma_bps: Option<u16>,
+    #[serde(rename = "moonshotRangeWeightBps")]
+    moonshot_range_weight_bps: Option<u16>,
+    #[serde(rename = "moonshotTailGammaBps")]
+    moonshot_tail_gamma_bps: Option<u16>,
+    #[serde(rename = "downsideRangeWeightBps")]
+    downside_range_weight_bps: Option<u16>,
+    #[serde(rename = "downsideTailGammaBps")]
+    downside_tail_gamma_bps: Option<u16>,
+    #[serde(rename = "upsideNearRangeWeightBps")]
+    upside_near_range_weight_bps: Option<u16>,
+    #[serde(rename = "upsideUpperRangeWeightBps")]
+    upside_upper_range_weight_bps: Option<u16>,
+    #[serde(rename = "upsideTailGammaBps")]
+    upside_tail_gamma_bps: Option<u16>,
+    #[serde(rename = "downsideNearRangeWeightBps")]
+    downside_near_range_weight_bps: Option<u16>,
+    #[serde(rename = "downsideLowerRangeWeightBps")]
+    downside_lower_range_weight_bps: Option<u16>,
+    #[serde(rename = "downsideStepTailGammaBps")]
+    downside_step_tail_gamma_bps: Option<u16>,
+    #[serde(rename = "condorCenterWeightBps")]
+    condor_center_weight_bps: Option<u16>,
+    #[serde(rename = "barrierSide")]
+    barrier_side: Option<String>,
+    #[serde(rename = "barrierNearRangeWeightBps")]
+    barrier_near_range_weight_bps: Option<u16>,
+    #[serde(rename = "barrierTailGammaBps")]
+    barrier_tail_gamma_bps: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -258,113 +320,6 @@ struct IntentPositionsQuery {
 }
 
 #[derive(Debug, Deserialize)]
-struct MarketSearchParams {
-    q: Option<String>,
-    quote_asset: Option<String>,
-    require_active: Option<bool>,
-    category: Option<String>,
-    kind: Option<String>,
-    expiry: Option<String>,
-}
-
-#[derive(Debug, Serialize)]
-struct MarketCatalogRefreshResponse {
-    ok: bool,
-    market_count: usize,
-    active_market_count: usize,
-    report: structx_service::CatalogBuildReport,
-}
-
-#[derive(Debug, Deserialize)]
-struct ListPositionsQuery {
-    owner: String,
-    #[serde(rename = "managerId")]
-    manager_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SyncPositionsRequest {
-    owner: String,
-    #[serde(rename = "managerId")]
-    manager_id: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct SyncFromChainRequest {
-    owner: String,
-    #[serde(rename = "managerId")]
-    manager_id: String,
-    #[serde(default, rename = "mintedLegs")]
-    minted_legs: Vec<SyncMintedLeg>,
-    #[serde(default, rename = "redeemedLegs")]
-    redeemed_legs: Vec<SyncRedeemedLeg>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SyncMintedLeg {
-    kind: String,
-    #[serde(default)]
-    direction: Option<String>,
-    #[serde(rename = "oracleId")]
-    oracle_id: String,
-    #[serde(rename = "expiryMs")]
-    expiry_ms: String,
-    #[serde(default, rename = "strikeRaw")]
-    strike_raw: Option<String>,
-    #[serde(default, rename = "lowerRaw")]
-    lower_raw: Option<String>,
-    #[serde(default, rename = "upperRaw")]
-    upper_raw: Option<String>,
-    #[serde(rename = "quantityRaw")]
-    quantity_raw: String,
-    #[serde(rename = "costRaw")]
-    cost_raw: String,
-    #[serde(rename = "sourceDigest")]
-    source_digest: String,
-    #[serde(default, rename = "openedAtUnix")]
-    opened_at_unix: Option<i64>,
-    #[serde(default)]
-    strategy: Option<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SyncRedeemedLeg {
-    kind: String,
-    #[serde(rename = "oracleId")]
-    oracle_id: String,
-    #[serde(rename = "expiryMs")]
-    expiry_ms: String,
-    #[serde(default, rename = "strikeRaw")]
-    strike_raw: Option<String>,
-    #[serde(default, rename = "lowerRaw")]
-    lower_raw: Option<String>,
-    #[serde(default, rename = "upperRaw")]
-    upper_raw: Option<String>,
-    #[serde(rename = "quantityRaw")]
-    quantity_raw: String,
-    #[serde(rename = "payoutRaw")]
-    payout_raw: String,
-    #[serde(rename = "sourceDigest")]
-    source_digest: String,
-}
-
-#[derive(Debug, Deserialize)]
-struct AuditRedeemPositionRequest {
-    owner: String,
-    #[serde(rename = "managerId")]
-    manager_id: String,
-    #[serde(rename = "positionId")]
-    position_id: String,
-    digest: String,
-    #[serde(default)]
-    effects: serde_json::Value,
-    #[serde(default)]
-    events: Vec<serde_json::Value>,
-    #[serde(default, rename = "objectChanges")]
-    object_changes: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
 struct CompileFromIntentRequest {
     owner: String,
     intent: serde_json::Value,
@@ -399,36 +354,10 @@ struct ParsedIntent {
 }
 
 #[derive(Debug, Deserialize)]
-struct BuildOpenStrategyRequest {
+struct FindMintableStrategyRequest {
     owner: String,
     #[serde(rename = "managerId")]
     manager_id: String,
-    #[serde(rename = "compiledStrategyId")]
-    compiled_strategy_id: String,
-    #[serde(rename = "maxPremiumRaw")]
-    max_premium_raw: String,
-    #[serde(rename = "slippageBps")]
-    slippage_bps: u16,
-}
-
-#[derive(Debug, Deserialize)]
-struct AuditOpenStrategyRequest {
-    owner: String,
-    #[serde(rename = "managerId")]
-    manager_id: String,
-    #[serde(rename = "compiledStrategyId")]
-    compiled_strategy_id: String,
-    digest: String,
-    effects: serde_json::Value,
-    events: Vec<serde_json::Value>,
-    #[serde(rename = "objectChanges")]
-    object_changes: Vec<serde_json::Value>,
-}
-
-#[derive(Debug, Deserialize)]
-struct CompileStrategyRequest {
-    owner: String,
-    strategy: String,
     #[serde(rename = "budgetDUSDC")]
     budget_dusdc: String,
     style: String,
@@ -436,51 +365,6 @@ struct CompileStrategyRequest {
     expiry_preference: String,
     #[serde(rename = "slippageBps")]
     slippage_bps: u16,
-
-    #[serde(rename = "portfolioExposureDUSDC")]
-    portfolio_exposure_dusdc: Option<f64>,
-
-    #[serde(rename = "overHedgeCapBps")]
-    over_hedge_cap_bps: Option<u16>,
-
-    #[serde(rename = "deadZoneBps")]
-    dead_zone_bps: Option<u16>,
-
-    #[serde(rename = "convexGammaBps")]
-    convex_gamma_bps: Option<u16>,
-
-    #[serde(rename = "moonshotRangeWeightBps")]
-    moonshot_range_weight_bps: Option<u16>,
-
-    #[serde(rename = "moonshotTailGammaBps")]
-    moonshot_tail_gamma_bps: Option<u16>,
-
-    #[serde(rename = "downsideRangeWeightBps")]
-    downside_range_weight_bps: Option<u16>,
-
-    #[serde(rename = "downsideTailGammaBps")]
-    downside_tail_gamma_bps: Option<u16>,
-
-    #[serde(rename = "downsideNearRangeWeightBps")]
-    downside_near_range_weight_bps: Option<u16>,
-
-    #[serde(rename = "downsideLowerRangeWeightBps")]
-    downside_lower_range_weight_bps: Option<u16>,
-
-    #[serde(rename = "downsideStepTailGammaBps")]
-    downside_step_tail_gamma_bps: Option<u16>,
-
-    #[serde(rename = "condorCenterWeightBps")]
-    condor_center_weight_bps: Option<u16>,
-
-    #[serde(rename = "barrierSide")]
-    barrier_side: Option<String>,
-
-    #[serde(rename = "barrierNearRangeWeightBps")]
-    barrier_near_range_weight_bps: Option<u16>,
-
-    #[serde(rename = "barrierTailGammaBps")]
-    barrier_tail_gamma_bps: Option<u16>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -602,16 +486,6 @@ async fn main() {
         );
     }
 
-    let cli_bin = env::var("STRUCTX_CLI_BIN")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("target/debug/structx-cli"));
-
-    let audits_dir = env::var("STRUCTX_AUDITS_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("artifacts/audits"));
-
-    fs::create_dir_all(&audits_dir).expect("create audits dir");
-
     let managers_path = env::var("STRUCTX_MANAGERS_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("data/managers.json"));
@@ -623,10 +497,7 @@ async fn main() {
     );
 
     let state = Arc::new(AppState {
-        cli_bin,
         compiled: Arc::new(Mutex::new(HashMap::new())),
-        audits_dir,
-        audit_lock: Arc::new(Mutex::new(())),
         managers: Arc::new(Mutex::new(managers_initial)),
         managers_path,
         markets_refresh: Arc::new(Mutex::new(MarketsRefreshState::default())),
@@ -636,7 +507,11 @@ async fn main() {
 
     let app = Router::new()
         .route("/health", get(health))
-        .route("/api/market/live-price", get(live_price))
+        .route("/api/demo-status", post(demo_status))
+        .route("/api/manager-balance", post(manager_balance))
+        .route("/api/manager-balance-json", post(manager_balance_json))
+        .route("/api/manager-positions", post(manager_positions))
+        .route("/api/audit-execution", post(audit_execution))
         .route("/api/intent/plan", post(plan_intent))
         .route("/api/intent/quote", post(quote_intent))
         .route("/api/intent/execute-plan", post(execute_intent_plan))
@@ -646,11 +521,16 @@ async fn main() {
         .route("/api/intent/audits/digest/{digest}", get(get_intent_audit_by_digest))
         .route("/api/intent/positions", get(list_intent_position_overlays))
         .route("/api/intent/parse", post(parse_intent))
+        .route("/api/strategies/compile", post(compile_strategy))
+        .route("/api/strategies/compile-from-intent", post(compile_from_intent))
+        .route("/api/strategies/find-mintable", post(find_mintable_strategy))
+        .route("/api/tx/build-open-strategy", post(build_open_strategy))
+        .route("/api/tx/audit-open-strategy", post(audit_open_strategy))
+        .route("/api/markets", get(list_markets))
         .route("/api/markets/catalog/status", get(get_market_catalog_status))
         .route("/api/markets/catalog/refresh", post(refresh_market_catalog))
         .route("/api/markets/search", get(search_market_catalog))
         .route("/api/markets/catalog/{market_id}", get(get_catalog_market))
-        .route("/api/markets", get(list_markets))
         .route("/api/positions", get(list_positions))
         .route("/api/positions/sync-from-audits", post(sync_positions_from_audits))
         .route("/api/positions/sync-from-chain", post(sync_positions_from_chain))
@@ -659,17 +539,6 @@ async fn main() {
             "/api/managers/{address}",
             get(get_manager_for_address).post(put_manager_for_address),
         )
-        .route("/api/strategies/compile-from-intent", post(compile_from_intent))
-        .route("/api/strategies/compile", post(compile_strategy))
-        .route("/api/tx/build-open-strategy", post(build_open_strategy))
-        .route("/api/tx/audit-open-strategy", post(audit_open_strategy))
-        .route("/api/audits", get(list_audits))
-        .route("/api/audits/{digest}", get(get_audit))
-        .route("/api/demo-status", post(demo_status))
-        .route("/api/manager-balance", post(manager_balance))
-        .route("/api/manager-balance-json", post(manager_balance_json))
-        .route("/api/manager-positions", post(manager_positions))
-        .route("/api/audit-execution", post(audit_execution))
         .route("/api/devinspect-mint-breakout", post(devinspect_mint_breakout))
         .route("/api/devinspect-redeem-breakout", post(devinspect_redeem_breakout))
         .layer(CorsLayer::permissive())
@@ -684,6 +553,335 @@ async fn main() {
     axum::serve(tokio::net::TcpListener::bind(addr).await.expect("bind API listener"), app)
         .await
         .expect("serve API");
+}
+
+async fn build_open_strategy(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<BuildOpenStrategyRequest>,
+) -> impl IntoResponse {
+    let cached_compiled = {
+        let cache = state.compiled.lock().await;
+        cache.get(&req.compiled_strategy_id).cloned()
+    };
+
+    let Some(cached_compiled) = cached_compiled else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "compiledStrategyId not found. Compile the strategy again before building transaction."
+            })),
+        );
+    };
+
+    let max_premium_after_slippage =
+        ceil_mul_bps(&req.max_premium_raw, req.slippage_bps).parse::<u128>().unwrap_or(u128::MAX);
+    let mut excluded_oracle_ids = Vec::new();
+    let mut last_mintability_error: Option<serde_json::Value> = None;
+    let mut attempted_oracle_ids = Vec::new();
+    let mut best_effort_warnings: Vec<String> = Vec::new();
+    let compiled = loop {
+        let refreshed_compiled = match refresh_compiled_strategy(
+            state.as_ref(),
+            &cached_compiled,
+            &req.owner,
+            req.slippage_bps,
+            &excluded_oracle_ids,
+        )
+        .await
+        {
+            Ok(compiled) => compiled,
+            Err((status, value)) => {
+                if let Some(last_error) = last_mintability_error {
+                    return (StatusCode::BAD_REQUEST, Json(last_error));
+                }
+                return (status, Json(value));
+            }
+        };
+
+        let premium_required = refreshed_compiled
+            .get("premiumRequiredRaw")
+            .and_then(serde_json::Value::as_str)
+            .and_then(|v| v.parse::<u128>().ok())
+            .unwrap_or(u128::MAX);
+
+        if premium_required > max_premium_after_slippage {
+            best_effort_warnings.push(format!(
+                "Live premium {} exceeded the preview slippage-adjusted cap {}; best-effort sizing is being used instead of the exact preview amount.",
+                premium_required, max_premium_after_slippage
+            ));
+        }
+
+        let compiled_strategy_id = refreshed_compiled
+            .get("compiledStrategyId")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default();
+
+        let Some(expiry_ms) = compiled_expiry_ms(compiled_strategy_id) else {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "compiledStrategyId missing expiry_ms"
+                })),
+            );
+        };
+
+        match find_best_effort_mintable_compiled(
+            &req.owner,
+            &req.manager_id,
+            &refreshed_compiled,
+            &expiry_ms,
+        )
+        .await
+        {
+            Ok((compiled, mut warnings)) => {
+                best_effort_warnings.append(&mut warnings);
+                break compiled;
+            }
+            Err((status, value)) => {
+                let is_not_mintable = value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .map(|message| message.contains("assert_mintable_ask"))
+                    .unwrap_or(false);
+
+                let oracle_id = refreshed_compiled
+                    .get("oracleId")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                if !oracle_id.is_empty() && !attempted_oracle_ids.contains(&oracle_id) {
+                    attempted_oracle_ids.push(oracle_id.clone());
+                }
+
+                if is_not_mintable
+                    && !oracle_id.is_empty()
+                    && !excluded_oracle_ids.contains(&oracle_id)
+                    && excluded_oracle_ids.len() < 4
+                {
+                    excluded_oracle_ids.push(oracle_id);
+                    last_mintability_error =
+                        Some(enrich_mintability_error(value, &attempted_oracle_ids));
+                    continue;
+                }
+
+                return (status, Json(enrich_mintability_error(value, &attempted_oracle_ids)));
+            }
+        }
+    };
+
+    if let Some(id) = compiled.get("compiledStrategyId").and_then(serde_json::Value::as_str) {
+        state.compiled.lock().await.insert(id.to_string(), compiled.clone());
+    }
+
+    let oracle_id =
+        compiled.get("oracleId").and_then(serde_json::Value::as_str).unwrap_or_default();
+
+    let raw_legs =
+        compiled.get("legs").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+
+    let legs = legs_with_max_costs(raw_legs, req.slippage_bps);
+
+    let mut warnings =
+        compiled.get("warnings").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+    warnings.push(serde_json::Value::String(
+        "Slippage is enforced before transaction build; Predict mint entrypoints do not take max-cost arguments.".to_string(),
+    ));
+    for warning in best_effort_warnings {
+        warnings.push(serde_json::Value::String(warning));
+    }
+
+    let compiled_strategy_id =
+        compiled.get("compiledStrategyId").and_then(serde_json::Value::as_str).unwrap_or_default();
+
+    let Some(expiry_ms) = compiled_expiry_ms(compiled_strategy_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "compiledStrategyId missing expiry_ms"
+            })),
+        );
+    };
+
+    (
+        StatusCode::OK,
+        Json(serde_json::json!({
+            "ok": true,
+            "buildKind": "FRONTEND_TRANSACTION_BUILDER",
+            "network": "sui:testnet",
+            "compiledStrategyId": compiled.get("compiledStrategyId").cloned().unwrap_or(serde_json::Value::Null),
+            "expiryMs": expiry_ms,
+            "owner": req.owner,
+            "managerId": req.manager_id,
+            "predictPackageId": PREDICT_PACKAGE_ID,
+            "predictObjectId": PREDICT_OBJECT_ID,
+            "clockObjectId": CLOCK_OBJECT_ID,
+            "dusdcCoinType": DUSDC_COIN_TYPE,
+            "oracleId": oracle_id,
+            "slippageBps": req.slippage_bps,
+            "summary": {
+                "strategy": compiled.get("strategy").cloned().unwrap_or(serde_json::Value::Null),
+                "premiumRequiredRaw": compiled.get("premiumRequiredRaw").cloned().unwrap_or(serde_json::Value::Null),
+                "premiumRequiredDisplay": compiled.get("premiumRequiredDisplay").cloned().unwrap_or(serde_json::Value::Null),
+                "legs": legs
+            },
+            "warnings": warnings
+        })),
+    )
+}
+
+async fn audit_open_strategy(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<AuditOpenStrategyRequest>,
+) -> impl IntoResponse {
+    let raw_compiled_strategy = {
+        let cache = state.compiled.lock().await;
+        cache.get(&req.compiled_strategy_id).cloned()
+    }
+    .unwrap_or_else(|| {
+        serde_json::json!({
+            "compiledStrategyId": req.compiled_strategy_id,
+        })
+    });
+
+    let input = OpenExecutionAuditInput {
+        source: OpenExecutionAuditSource::AdvancedMode,
+        proposal_id: None,
+        user_address: Some(req.owner.clone()),
+        manager_id: Some(req.manager_id.clone()),
+        tx_digest: req.digest.clone(),
+        execution_result: serde_json::json!({
+            "digest": req.digest,
+            "effects": req.effects,
+            "events": req.events,
+            "objectChanges": req.object_changes,
+        }),
+        raw_compiled_strategy,
+        intent_proposal: None,
+    };
+
+    match audit_open_execution(input).await {
+        Ok(outcome) => {
+            let status = if outcome.ok { StatusCode::OK } else { StatusCode::BAD_REQUEST };
+
+            let body = serde_json::json!({
+                "ok": outcome.ok,
+                "digest": outcome.tx_digest,
+                "explorerUrl": outcome.explorer_url,
+                "executionStatus": outcome.execution_status,
+                "compiledStrategyId": outcome.compiled_strategy_id,
+                "artifactPath": outcome.artifact_path,
+                "totalCostRaw": outcome.total_cost_raw,
+                "totalCostDisplay": outcome.total_cost_display,
+                "managerId": outcome.manager_id,
+                "managerBalanceRaw": outcome.manager_balance_raw,
+                "managerBalanceDisplay": outcome.manager_balance_display,
+                "mintedLegs": outcome.minted_legs,
+                "positionVerification": outcome.position_verification,
+                "positionIds": outcome.position_ids,
+                "ledgerSyncStatus": outcome.ledger_sync_status,
+                "warnings": outcome.warnings,
+                "debug": outcome.raw_audit_result,
+            });
+
+            (status, Json(body))
+        }
+        Err(err) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(api_error(
+                "AUDIT_FAILED",
+                "Audit failed",
+                &format!("Failed to audit open execution: {err}"),
+                "Try opening the strategy again.",
+                None,
+                None,
+            )),
+        ),
+    }
+}
+
+fn json_value_as_u128_string(value: &serde_json::Value) -> Option<String> {
+    if let Some(s) = value.as_str() {
+        if s.parse::<u128>().is_ok() {
+            return Some(s.to_string());
+        }
+    }
+    if let Some(u) = value.as_u64() {
+        return Some(u.to_string());
+    }
+    None
+}
+
+fn format_dusdc_raw_u128(raw: u128) -> String {
+    let whole = raw / 1_000_000;
+    let frac = raw % 1_000_000;
+
+    if frac == 0 {
+        format!("{whole}.00 dUSDC")
+    } else {
+        let mut frac_string = format!("{frac:06}");
+        while frac_string.ends_with('0') {
+            frac_string.pop();
+        }
+        format!("{whole}.{frac_string} dUSDC")
+    }
+}
+
+fn api_error(
+    code: &str,
+    title: &str,
+    message: &str,
+    action: &str,
+    stdout: Option<&str>,
+    stderr: Option<&str>,
+) -> serde_json::Value {
+    let mut debug = serde_json::Map::new();
+    if let Some(stdout) = stdout {
+        debug.insert("stdout".to_string(), serde_json::Value::String(stdout.to_string()));
+    }
+    if let Some(stderr) = stderr {
+        debug.insert("stderr".to_string(), serde_json::Value::String(stderr.to_string()));
+    }
+    serde_json::json!({
+        "ok": false,
+        "code": code,
+        "title": title,
+        "message": message,
+        "action": action,
+        "debug": serde_json::Value::Object(debug)
+    })
+}
+
+async fn parse_intent(Json(req): Json<ParseIntentRequest>) -> impl IntoResponse {
+    let parsed = match parse_intent_with_openai_or_fallback(&req).await {
+        Ok(parsed) => parsed,
+        Err(err) => {
+            let mut fallback = deterministic_parse_intent(&req);
+            fallback.warnings.push(format!("AI parser failed; deterministic fallback used: {err}"));
+            fallback
+        }
+    };
+
+    if !parsed.missing_fields.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "missingFields": parsed.missing_fields,
+                "clarifyingQuestion": build_clarifying_question(&parsed),
+                "fallbackIntent": parsed
+            })),
+        );
+    }
+
+    (
+        StatusCode::OK,
+        Json(serde_json::to_value(parsed).unwrap_or_else(
+            |_| serde_json::json!({"ok": false, "error": "failed to serialize parsed intent"}),
+        )),
+    )
 }
 
 async fn plan_intent(Json(req): Json<IntentPlanApiRequest>) -> impl IntoResponse {
@@ -1071,6 +1269,1140 @@ async fn ensure_market_catalog_ready(store: &DiskMarketStore) -> Result<(), Stri
         .map_err(|err| format!("failed to refresh market catalog from live markets: {err}"))
 }
 
+async fn compile_strategy(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CompileStrategyRequest>,
+) -> impl IntoResponse {
+    match compile_strategy_service_value(&req).await {
+        Ok(final_value) => {
+            if let Some(id) =
+                final_value.get("compiledStrategyId").and_then(serde_json::Value::as_str)
+            {
+                state.compiled.lock().await.insert(id.to_string(), final_value.clone());
+            }
+
+            (StatusCode::OK, Json(final_value))
+        }
+        Err((status, value)) => (status, Json(value)),
+    }
+}
+
+async fn compile_from_intent(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<CompileFromIntentRequest>,
+) -> impl IntoResponse {
+    let Some(strategy) = req.intent.get("recommendedStrategy").and_then(serde_json::Value::as_str)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "INTENT_INVALID",
+                "Intent missing strategy",
+                "The parsed intent did not include a recommended strategy.",
+                "Generate the strategy again.",
+                None,
+                None,
+            )),
+        );
+    };
+
+    let Some(style) = req.intent.get("recommendedStyle").and_then(serde_json::Value::as_str) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "INTENT_INVALID",
+                "Intent missing style",
+                "The parsed intent did not include a recommended style.",
+                "Generate the strategy again.",
+                None,
+                None,
+            )),
+        );
+    };
+
+    let Some(budget_dusdc) = req.intent.get("budgetDUSDC").and_then(serde_json::Value::as_str)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(api_error(
+                "INTENT_INVALID",
+                "Intent missing budget",
+                "The parsed intent did not include a dUSDC budget.",
+                "Enter a budget and try again.",
+                None,
+                None,
+            )),
+        );
+    };
+
+    let mut compiled = match compile_strategy_service_value(&CompileStrategyRequest {
+        owner: req.owner.clone(),
+        strategy: strategy.to_string(),
+        budget_dusdc: budget_dusdc.to_string(),
+        style: style.to_string(),
+        expiry_preference: "nearest_active".to_string(),
+        slippage_bps: 100,
+        bucket_step_usd: None,
+        custom_k1_price: None,
+        custom_k2_price: None,
+        custom_k3_price: None,
+        custom_k4_price: None,
+        portfolio_exposure_dusdc: None,
+        over_hedge_cap_bps: None,
+        dead_zone_bps: None,
+        convex_gamma_bps: None,
+        moonshot_range_weight_bps: None,
+        moonshot_tail_gamma_bps: None,
+        downside_range_weight_bps: None,
+        downside_tail_gamma_bps: None,
+        upside_near_range_weight_bps: None,
+        upside_upper_range_weight_bps: None,
+        upside_tail_gamma_bps: None,
+        downside_near_range_weight_bps: None,
+        downside_lower_range_weight_bps: None,
+        downside_step_tail_gamma_bps: None,
+        condor_center_weight_bps: None,
+        barrier_side: None,
+        barrier_near_range_weight_bps: None,
+        barrier_tail_gamma_bps: None,
+    })
+    .await
+    {
+        Ok(compiled) => compiled,
+        Err((status, value)) => return (status, Json(value)),
+    };
+
+    if let Some(obj) = compiled.as_object_mut() {
+        obj.insert(
+            "recommendation".to_string(),
+            serde_json::json!({
+                "source": "AI_INTENT_PLUS_DETERMINISTIC_COMPILER",
+                "intent": req.intent,
+                "reasoningSummary": req
+                    .intent
+                    .get("reasoningSummary")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::String("Strategy selected from parsed user intent.".to_string())),
+                "confidence": req
+                    .intent
+                    .get("confidence")
+                    .cloned()
+                    .unwrap_or_else(|| serde_json::Value::from(0.65))
+            }),
+        );
+    }
+
+    if let Some(id) = compiled.get("compiledStrategyId").and_then(serde_json::Value::as_str) {
+        state.compiled.lock().await.insert(id.to_string(), compiled.clone());
+    }
+
+    (StatusCode::OK, Json(compiled))
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn compile_strategy_json_value(
+    owner: &str,
+    strategy: &str,
+    budget_dusdc: &str,
+    style: &str,
+    expiry_preference: &str,
+    slippage_bps: u16,
+    bucket_step_usd: Option<f64>,
+    custom_k1_price: Option<f64>,
+    custom_k2_price: Option<f64>,
+    custom_k3_price: Option<f64>,
+    custom_k4_price: Option<f64>,
+    portfolio_exposure_dusdc: Option<f64>,
+    over_hedge_cap_bps: Option<u16>,
+    dead_zone_bps: Option<u16>,
+    convex_gamma_bps: Option<u16>,
+    moonshot_range_weight_bps: Option<u16>,
+    moonshot_tail_gamma_bps: Option<u16>,
+    downside_range_weight_bps: Option<u16>,
+    downside_tail_gamma_bps: Option<u16>,
+    upside_near_range_weight_bps: Option<u16>,
+    upside_upper_range_weight_bps: Option<u16>,
+    upside_tail_gamma_bps: Option<u16>,
+    downside_near_range_weight_bps: Option<u16>,
+    downside_lower_range_weight_bps: Option<u16>,
+    downside_step_tail_gamma_bps: Option<u16>,
+    condor_center_weight_bps: Option<u16>,
+    barrier_side: Option<String>,
+    barrier_near_range_weight_bps: Option<u16>,
+    barrier_tail_gamma_bps: Option<u16>,
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    let requested = normalize_strategy_id(strategy);
+    let needs_template = false;
+    let args = service::CompileStrategyJsonArgs {
+        server_url: env::var("STRUCTX_PREDICT_SERVER_URL")
+            .unwrap_or_else(|_| PREDICT_SERVER_URL.to_string()),
+        predict_id: env::var("STRUCTX_PREDICT_ID")
+            .unwrap_or_else(|_| PREDICT_OBJECT_ID.to_string()),
+        rpc_url: env::var("STRUCTX_RPC_URL")
+            .unwrap_or_else(|_| DEFAULT_SUI_TESTNET_RPC_URL.to_string()),
+        owner: owner.to_string(),
+        strategy: requested.clone(),
+        budget_dusdc: budget_dusdc.to_string(),
+        style: style.to_string(),
+        expiry_preference: expiry_preference.to_string(),
+        slippage_bps,
+        bucket_step: DisplayPrice(bucket_step_usd.unwrap_or(250.0)),
+        custom_k1_price: custom_k1_price.map(DisplayPrice),
+        custom_k2_price: custom_k2_price.map(DisplayPrice),
+        custom_k3_price: custom_k3_price.map(DisplayPrice),
+        custom_k4_price: custom_k4_price.map(DisplayPrice),
+        levels_each_side: 4,
+        max_quote_market_attempts: 5,
+        portfolio_exposure_dusdc: portfolio_exposure_dusdc.unwrap_or(5_000.0),
+        over_hedge_cap_bps: over_hedge_cap_bps.unwrap_or(12_000),
+        convex_gamma_bps: convex_gamma_bps.unwrap_or(15_000),
+        dead_zone_bps: dead_zone_bps.unwrap_or(200),
+        moonshot_range_weight_bps: moonshot_range_weight_bps.unwrap_or(6_000),
+        moonshot_tail_gamma_bps: moonshot_tail_gamma_bps.unwrap_or(15_000),
+        downside_range_weight_bps: downside_range_weight_bps.unwrap_or(6_000),
+        downside_tail_gamma_bps: downside_tail_gamma_bps.unwrap_or(15_000),
+        upside_near_range_weight_bps: upside_near_range_weight_bps.unwrap_or(4_000),
+        upside_upper_range_weight_bps: upside_upper_range_weight_bps.unwrap_or(3_500),
+        upside_tail_gamma_bps: upside_tail_gamma_bps.unwrap_or(15_000),
+        downside_near_range_weight_bps: downside_near_range_weight_bps.unwrap_or(4_000),
+        downside_lower_range_weight_bps: downside_lower_range_weight_bps.unwrap_or(3_500),
+        downside_step_tail_gamma_bps: downside_step_tail_gamma_bps.unwrap_or(15_000),
+        condor_center_weight_bps: condor_center_weight_bps.unwrap_or(6_000),
+        barrier_side: barrier_side.unwrap_or_else(|| "up".to_string()),
+        barrier_near_range_weight_bps: barrier_near_range_weight_bps.unwrap_or(7_000),
+        barrier_tail_gamma_bps: barrier_tail_gamma_bps.unwrap_or(15_000),
+        exclude_oracle_ids: Vec::new(),
+    };
+
+    let value = service::compile_strategy_json_value(args).await.map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": err.to_string(),
+            }),
+        )
+    })?;
+
+    if needs_template {
+        apply_strategy_template(&value, &requested)
+    } else {
+        Ok(value)
+    }
+}
+
+async fn compile_strategy_service_value(
+    req: &CompileStrategyRequest,
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    compile_strategy_json_value(
+        &req.owner,
+        &req.strategy,
+        &req.budget_dusdc,
+        &req.style,
+        &req.expiry_preference,
+        req.slippage_bps,
+        req.bucket_step_usd,
+        req.custom_k1_price,
+        req.custom_k2_price,
+        req.custom_k3_price,
+        req.custom_k4_price,
+        req.portfolio_exposure_dusdc,
+        req.over_hedge_cap_bps,
+        req.dead_zone_bps,
+        req.convex_gamma_bps,
+        req.moonshot_range_weight_bps,
+        req.moonshot_tail_gamma_bps,
+        req.downside_range_weight_bps,
+        req.downside_tail_gamma_bps,
+        req.upside_near_range_weight_bps,
+        req.upside_upper_range_weight_bps,
+        req.upside_tail_gamma_bps,
+        req.downside_near_range_weight_bps,
+        req.downside_lower_range_weight_bps,
+        req.downside_step_tail_gamma_bps,
+        req.condor_center_weight_bps,
+        req.barrier_side.clone(),
+        req.barrier_near_range_weight_bps,
+        req.barrier_tail_gamma_bps,
+    )
+    .await
+}
+
+async fn parse_intent_with_openai_or_fallback(
+    req: &ParseIntentRequest,
+) -> Result<ParsedIntent, Box<dyn std::error::Error + Send + Sync>> {
+    let api_key = match env::var("OPENAI_API_KEY") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(deterministic_parse_intent(req)),
+    };
+
+    let model = env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
+    let schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": [
+            "asset",
+            "goal",
+            "budgetDUSDC",
+            "riskPreference",
+            "timePreference",
+            "recommendedStrategy",
+            "recommendedStyle",
+            "confidence",
+            "reasoningSummary",
+            "missingFields",
+            "warnings"
+        ],
+        "properties": {
+            "asset": { "type": "string", "enum": ["BTC"] },
+            "goal": {
+                "type": "string",
+                "enum": [
+                    "downside_protection",
+                    "upside_speculation",
+                    "two_sided_breakout",
+                    "range_income",
+                    "unknown"
+                ]
+            },
+            "budgetDUSDC": { "type": "string" },
+            "riskPreference": {
+                "type": "string",
+                "enum": ["conservative", "balanced", "aggressive"]
+            },
+            "timePreference": {
+                "type": "string",
+                "enum": ["nearest_active", "today", "this_week"]
+            },
+            "recommendedStrategy": {
+                "type": "string",
+                "enum": [
+                    "BREAKOUT_PROTECTION",
+                    "PORTFOLIO_CRASH_SHIELD",
+                    "CONVEX_TAIL_LADDER",
+                    "EXPIRY_MOVE_NOTE",
+                    "MOONSHOT_UPSIDE",
+                    "UPSIDE_STEP_LADDER",
+                    "DOWNSIDE_CONVEXITY",
+                    "DOWNSIDE_STEP_LADDER",
+                    "CENTER_BAND_CONDOR",
+                    "NEAR_BARRIER_PROXY",
+                    "SMART_BUDGET_SELECTOR"
+                ]
+            },
+            "recommendedStyle": {
+                "type": "string",
+                "enum": ["tail-heavy", "balanced", "higher-hit-rate"]
+            },
+            "confidence": {
+                "type": "number",
+                "minimum": 0,
+                "maximum": 1
+            },
+            "reasoningSummary": { "type": "string" },
+            "missingFields": { "type": "array", "items": { "type": "string" } },
+            "warnings": { "type": "array", "items": { "type": "string" } }
+        }
+    });
+
+    let input = format!(
+        r#"
+You are the StructX intent parser.
+
+StructX is a non-custodial structured payoff builder on DeepBook Predict testnet.
+You do not give financial advice.
+You only convert user intent into strict JSON for deterministic compiler logic.
+Supported asset: BTC only.
+Supported strategies for this milestone:
+- BREAKOUT_PROTECTION
+- PORTFOLIO_CRASH_SHIELD
+- CONVEX_TAIL_LADDER
+- EXPIRY_MOVE_NOTE
+- MOONSHOT_UPSIDE
+- UPSIDE_STEP_LADDER
+- DOWNSIDE_CONVEXITY
+- DOWNSIDE_STEP_LADDER
+- CENTER_BAND_CONDOR
+- SMART_BUDGET_SELECTOR
+Supported expiry preference: nearest_active.
+
+Rules:
+- If the user asks StructX to choose, optimize, recommend, or pick the best strategy, recommendedStrategy = SMART_BUDGET_SELECTOR.
+- If the user wants protection, crash hedge, dump protection, or downside coverage, goal = downside_protection and recommendedStrategy = PORTFOLIO_CRASH_SHIELD.
+- If the user wants to get paid when BTC expires far away from the current price, recommendedStrategy = EXPIRY_MOVE_NOTE.
+- If the user wants a condor, center band, or nearby range with smaller outside wings, goal = range_income and recommendedStrategy = CENTER_BAND_CONDOR.
+- If the user wants BTC to grind higher, step up, or go progressively higher, goal = upside_speculation and recommendedStrategy = UPSIDE_STEP_LADDER.
+- If the user wants BTC to grind lower, step down, or go progressively lower, goal = downside_protection and recommendedStrategy = DOWNSIDE_STEP_LADDER.
+- If the user wants a big move either direction, volatility, or breakout, goal = two_sided_breakout and recommendedStrategy = CONVEX_TAIL_LADDER unless the phrasing is generic enough for BREAKOUT_PROTECTION.
+- If the user wants moonshot/upside/rally exposure, goal = upside_speculation and recommendedStrategy = MOONSHOT_UPSIDE.
+- conservative -> higher-hit-rate unless user explicitly asks for tail.
+- aggressive/max payout -> tail-heavy.
+- balanced/default -> balanced.
+- If budget is missing, include missingFields [\"budgetDUSDC\"].
+- If budget is provided separately, use that.
+- Never invent unsupported strategies.
+- Always include testnet and not-financial-advice warnings.
+
+Owner: {owner}
+User message: {message}
+Provided budgetDUSDC: {budget}
+Provided riskPreference: {risk}
+Provided timePreference: {time}
+"#,
+        owner = req.owner,
+        message = req.message,
+        budget = req.budget_dusdc.clone().unwrap_or_default(),
+        risk = req.risk_preference.clone().unwrap_or_default(),
+        time = req.time_preference.clone().unwrap_or_default(),
+    );
+
+    let body = serde_json::json!({
+        "model": model,
+        "input": input,
+        "text": {
+            "format": {
+                "type": "json_schema",
+                "name": "structx_intent",
+                "strict": true,
+                "schema": schema
+            }
+        }
+    });
+
+    let response = reqwest::Client::new()
+        .post("https://api.openai.com/v1/responses")
+        .bearer_auth(api_key)
+        .json(&body)
+        .send()
+        .await?
+        .error_for_status()?
+        .json::<serde_json::Value>()
+        .await?;
+
+    let text = extract_openai_text(&response)
+        .ok_or_else(|| "OpenAI response missing structured output text".to_string())?;
+    let value: serde_json::Value = serde_json::from_str(&text)?;
+    let mut parsed = parsed_intent_from_value(req, value)?;
+    validate_and_rewrite_intent(&mut parsed);
+    Ok(parsed)
+}
+
+fn extract_openai_text(response: &serde_json::Value) -> Option<String> {
+    let output = response.get("output")?.as_array()?;
+    for item in output {
+        let content = item.get("content")?.as_array()?;
+        for part in content {
+            if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
+                return Some(text.to_string());
+            }
+        }
+    }
+    None
+}
+
+fn parsed_intent_from_value(
+    req: &ParseIntentRequest,
+    value: serde_json::Value,
+) -> Result<ParsedIntent, Box<dyn std::error::Error + Send + Sync>> {
+    let mut parsed = ParsedIntent {
+        ok: true,
+        intent_id: format!("intent_{}", stable_intent_id(&req.owner, &req.message)),
+        owner: req.owner.clone(),
+        raw_message: req.message.clone(),
+        asset: value.get("asset").and_then(serde_json::Value::as_str).unwrap_or("BTC").to_string(),
+        goal: value
+            .get("goal")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("two_sided_breakout")
+            .to_string(),
+        budget_dusdc: value
+            .get("budgetDUSDC")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        risk_preference: value
+            .get("riskPreference")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("balanced")
+            .to_string(),
+        time_preference: value
+            .get("timePreference")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("nearest_active")
+            .to_string(),
+        recommended_strategy: value
+            .get("recommendedStrategy")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("BREAKOUT_PROTECTION")
+            .to_string(),
+        recommended_style: value
+            .get("recommendedStyle")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("balanced")
+            .to_string(),
+        confidence: value.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.65),
+        reasoning_summary: value
+            .get("reasoningSummary")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("Strategy selected from parsed user intent.")
+            .to_string(),
+        missing_fields: value
+            .get("missingFields")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items.iter().filter_map(serde_json::Value::as_str).map(ToOwned::to_owned).collect()
+            })
+            .unwrap_or_default(),
+        warnings: value
+            .get("warnings")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| {
+                items.iter().filter_map(serde_json::Value::as_str).map(ToOwned::to_owned).collect()
+            })
+            .unwrap_or_default(),
+    };
+
+    if parsed.budget_dusdc.is_empty() {
+        if let Some(budget) = &req.budget_dusdc {
+            parsed.budget_dusdc = budget.clone();
+        }
+    }
+
+    Ok(parsed)
+}
+
+fn deterministic_parse_intent(req: &ParseIntentRequest) -> ParsedIntent {
+    let msg = req.message.to_lowercase();
+    let (goal, recommended_strategy) = if contains_any(
+        &msg,
+        &["choose for me", "best strategy", "optimize", "smart", "recommend", "pick for me"],
+    ) {
+        ("two_sided_breakout", "SMART_BUDGET_SELECTOR")
+    } else if contains_any(&msg, &["near barrier", "barrier", "close to target", "near target"]) {
+        ("two_sided_breakout", "NEAR_BARRIER_PROXY")
+    } else if contains_any(
+        &msg,
+        &["expires far", "far from current", "expiry move", "terminal move"],
+    ) {
+        ("two_sided_breakout", "EXPIRY_MOVE_NOTE")
+    } else if contains_any(
+        &msg,
+        &[
+            "condor",
+            "center band",
+            "near current with wings",
+            "range with wings",
+            "nearby with protection",
+        ],
+    ) {
+        ("range_income", "CENTER_BAND_CONDOR")
+    } else if contains_any(
+        &msg,
+        &["portfolio", "hedge my", "protect my", "protection", "insurance"],
+    ) {
+        ("downside_protection", "PORTFOLIO_CRASH_SHIELD")
+    } else if contains_any(
+        &msg,
+        &["grind lower", "step down", "staged downside", "progressively lower", "keeps going down"],
+    ) {
+        ("downside_protection", "DOWNSIDE_STEP_LADDER")
+    } else if contains_any(
+        &msg,
+        &["bearish", "downside", "breakdown", "dump", "crash", "sell-off", "selldown"],
+    ) {
+        ("downside_protection", "DOWNSIDE_CONVEXITY")
+    } else if contains_any(
+        &msg,
+        &["grind higher", "step up", "staged upside", "progressively higher", "keeps going up"],
+    ) {
+        ("upside_speculation", "UPSIDE_STEP_LADDER")
+    } else if contains_any(&msg, &["moon", "upside", "rally", "pump", "breaks up", "breakout up"]) {
+        ("upside_speculation", "MOONSHOT_UPSIDE")
+    } else if contains_any(
+        &msg,
+        &["big move", "breakout", "volatile", "volatility", "either direction", "move a lot"],
+    ) {
+        ("two_sided_breakout", "CONVEX_TAIL_LADDER")
+    } else {
+        ("two_sided_breakout", "SMART_BUDGET_SELECTOR")
+    };
+
+    let risk =
+        req.risk_preference.clone().unwrap_or_else(|| infer_risk_preference(&msg).to_string());
+    let style = style_from_goal_and_risk(goal, &risk).to_string();
+    let budget = req.budget_dusdc.clone().unwrap_or_default();
+
+    let mut missing_fields = Vec::new();
+    if budget.trim().is_empty() {
+        missing_fields.push("budgetDUSDC".to_string());
+    }
+
+    let mut parsed = ParsedIntent {
+        ok: missing_fields.is_empty(),
+        intent_id: format!("intent_{}", stable_intent_id(&req.owner, &req.message)),
+        owner: req.owner.clone(),
+        raw_message: req.message.clone(),
+        asset: "BTC".to_string(),
+        goal: goal.to_string(),
+        budget_dusdc: budget,
+        risk_preference: normalize_risk(&risk).to_string(),
+        time_preference: req
+            .time_preference
+            .clone()
+            .unwrap_or_else(|| "nearest_active".to_string()),
+        recommended_strategy: recommended_strategy.to_string(),
+        recommended_style: style,
+        confidence: 0.62,
+        reasoning_summary: reasoning_for_recommendation(goal, recommended_strategy).to_string(),
+        missing_fields,
+        warnings: vec![
+            "AI-assisted strategy discovery is not financial advice.".to_string(),
+            "DeepBook Predict integration is testnet-only.".to_string(),
+            "Final premium, payoff, and transaction are produced by deterministic StructX compiler logic.".to_string(),
+        ],
+    };
+
+    validate_and_rewrite_intent(&mut parsed);
+    parsed
+}
+
+fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
+    parsed.asset = "BTC".to_string();
+    parsed.risk_preference = normalize_risk(&parsed.risk_preference).to_string();
+
+    if !matches!(
+        parsed.recommended_strategy.as_str(),
+        "BREAKOUT_PROTECTION"
+            | "PORTFOLIO_CRASH_SHIELD"
+            | "CONVEX_TAIL_LADDER"
+            | "EXPIRY_MOVE_NOTE"
+            | "MOONSHOT_UPSIDE"
+            | "UPSIDE_STEP_LADDER"
+            | "DOWNSIDE_CONVEXITY"
+            | "DOWNSIDE_STEP_LADDER"
+            | "CENTER_BAND_CONDOR"
+            | "NEAR_BARRIER_PROXY"
+            | "SMART_BUDGET_SELECTOR"
+    ) {
+        parsed.recommended_strategy = "SMART_BUDGET_SELECTOR".to_string();
+    }
+
+    if !matches!(parsed.time_preference.as_str(), "nearest_active" | "today" | "this_week") {
+        parsed.time_preference = "nearest_active".to_string();
+    }
+
+    if !matches!(parsed.recommended_style.as_str(), "tail-heavy" | "balanced" | "higher-hit-rate") {
+        parsed.recommended_style =
+            style_from_goal_and_risk(&parsed.goal, &parsed.risk_preference).to_string();
+    }
+
+    let has_valid_budget =
+        parsed.budget_dusdc.trim().parse::<f64>().map(|value| value > 0.0).unwrap_or(false);
+
+    if !has_valid_budget && !parsed.missing_fields.iter().any(|field| field == "budgetDUSDC") {
+        parsed.missing_fields.push("budgetDUSDC".to_string());
+    }
+
+    if !parsed
+        .warnings
+        .iter()
+        .any(|warning| warning.to_lowercase().contains("not financial advice"))
+    {
+        parsed.warnings.push("AI-assisted strategy discovery is not financial advice.".to_string());
+    }
+
+    if !parsed.warnings.iter().any(|warning| warning.to_lowercase().contains("testnet")) {
+        parsed.warnings.push("DeepBook Predict integration is testnet-only.".to_string());
+    }
+
+    parsed.ok = parsed.missing_fields.is_empty();
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn infer_risk_preference(message: &str) -> &'static str {
+    if contains_any(message, &["safe", "safer", "conservative", "higher probability", "likely"]) {
+        "conservative"
+    } else if contains_any(message, &["aggressive", "max payout", "lottery", "tail", "cheap"]) {
+        "aggressive"
+    } else {
+        "balanced"
+    }
+}
+
+fn normalize_risk(value: &str) -> &'static str {
+    match value {
+        "conservative" => "conservative",
+        "aggressive" => "aggressive",
+        _ => "balanced",
+    }
+}
+
+fn style_from_goal_and_risk(goal: &str, risk: &str) -> &'static str {
+    match (goal, risk) {
+        (_, "conservative") => "higher-hit-rate",
+        (_, "aggressive") => "tail-heavy",
+        ("downside_protection", _) => "tail-heavy",
+        ("upside_speculation", _) => "tail-heavy",
+        ("two_sided_breakout", _) => "balanced",
+        _ => "balanced",
+    }
+}
+
+fn reasoning_for_recommendation(goal: &str, recommended_strategy: &str) -> &'static str {
+    match recommended_strategy {
+        "PORTFOLIO_CRASH_SHIELD" => {
+            "Portfolio-Aware Crash Shield is recommended because it targets downside protection against deeper BTC sell-offs while keeping risk defined by premium."
+        }
+        "CONVEX_TAIL_LADDER" => {
+            "Convex Tail Ladder is recommended because it buys two-sided terminal move exposure, with more payoff allocated to larger expiry moves."
+        }
+        "EXPIRY_MOVE_NOTE" => {
+            "Expiry Move Note is recommended because it expresses a view that BTC will settle meaningfully away from the current oracle price at expiry."
+        }
+        "MOONSHOT_UPSIDE" => {
+            "Moonshot Upside is recommended because it keeps risk defined while concentrating payoff into upside expiry outcomes above the upper band."
+        }
+        "UPSIDE_STEP_LADDER" => {
+            "Upside Step Ladder is recommended because it stages defined-risk upside payout across a grind-higher range, a breakout range, and a continuation tail."
+        }
+        "DOWNSIDE_STEP_LADDER" => {
+            "Downside Step Ladder is recommended because it stages defined-risk bearish payout across a mild breakdown range, a lower breakdown range, and a continuation tail."
+        }
+        "CENTER_BAND_CONDOR" => {
+            "Center Band Condor is recommended because it concentrates payout near the center band while still keeping smaller outside wings on both sides."
+        }
+        "DOWNSIDE_CONVEXITY" => {
+            "Downside Convexity is recommended because it concentrates defined-risk payoff into bearish expiry outcomes below the lower breakdown band."
+        }
+        "SMART_BUDGET_SELECTOR" => {
+            "Smart Budget Selector is recommended because it compares multiple executable strategy candidates and chooses the best fit for your budget and style."
+        }
+        _ => match goal {
+            "downside_protection" => {
+                "Breakout Protection is recommended because it can allocate more exposure to downside tail protection while keeping risk defined by the premium."
+            }
+            "upside_speculation" => {
+                "Breakout Protection is recommended for this milestone because the breakout structure can still express upside participation with defined risk."
+            }
+            "two_sided_breakout" => {
+                "Breakout Protection is recommended because the user is expressing a large-move view without requiring a single direction."
+            }
+            _ => {
+                "Breakout Protection is recommended as the currently supported defined-risk strategy."
+            }
+        },
+    }
+}
+
+fn build_clarifying_question(parsed: &ParsedIntent) -> String {
+    if parsed.missing_fields.iter().any(|field| field == "budgetDUSDC") {
+        "How much dUSDC do you want to allocate?".to_string()
+    } else {
+        "Can you clarify your budget, goal, and preferred time horizon?".to_string()
+    }
+}
+
+fn stable_intent_id(owner: &str, message: &str) -> String {
+    let mut hash: u64 = 0xcbf29ce484222325;
+    for byte in owner.bytes().chain(message.bytes()) {
+        hash ^= byte as u64;
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    format!("{hash:x}")
+}
+
+fn normalize_strategy_id(strategy: &str) -> String {
+    let upper = strategy.trim().to_uppercase();
+    match upper.as_str() {
+        "BREAKOUT_PROTECTION"
+        | "PORTFOLIO_CRASH_SHIELD"
+        | "CONVEX_TAIL_LADDER"
+        | "MOONSHOT_UPSIDE"
+        | "UPSIDE_STEP_LADDER"
+        | "DOWNSIDE_CONVEXITY"
+        | "DOWNSIDE_STEP_LADDER"
+        | "CENTER_BAND_CONDOR"
+        | "EXPIRY_MOVE_NOTE"
+        | "SMART_BUDGET_SELECTOR" => upper,
+        "CRASH_INSURANCE" => "PORTFOLIO_CRASH_SHIELD".to_string(),
+        _ => "BREAKOUT_PROTECTION".to_string(),
+    }
+}
+
+fn strategy_allowed_roles(strategy: &str) -> &'static [&'static str] {
+    match strategy {
+        // Downside-only structures.
+        "CRASH_INSURANCE" | "PORTFOLIO_CRASH_SHIELD" | "DOWNSIDE_CONVEXITY" => {
+            &["extreme_downside", "moderate_downside"]
+        }
+        // Upside-only structure.
+        "MOONSHOT_UPSIDE" => &["moderate_upside", "extreme_upside"],
+        // Range / expiry-move structure keeps only the two RANGE legs.
+        "EXPIRY_MOVE_NOTE" => &["moderate_downside", "moderate_upside"],
+        // Four-leg presets reuse the full Breakout payoff (DOWN + 2 RANGE + UP).
+        // BREAKOUT_PROTECTION, CONVEX_TAIL_LADDER, SMART_BUDGET_SELECTOR and any
+        // unknown strategy fall through here so the underlying compile is
+        // returned unchanged.
+        _ => &["extreme_downside", "moderate_downside", "moderate_upside", "extreme_upside"],
+    }
+}
+
+fn role_for_payoff_bucket(idx: usize) -> Option<&'static str> {
+    match idx {
+        0 => Some("extreme_downside"),
+        1 => Some("moderate_downside"),
+        2 => None,
+        3 => Some("moderate_upside"),
+        4 => Some("extreme_upside"),
+        _ => None,
+    }
+}
+
+fn format_signed_dusdc(raw: i128) -> String {
+    if raw >= 0 {
+        format_dusdc_raw_u128(raw as u128)
+    } else {
+        format!("-{}", format_dusdc_raw_u128((-raw) as u128))
+    }
+}
+
+fn apply_strategy_template(
+    compiled: &serde_json::Value,
+    strategy: &str,
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    let allowed = strategy_allowed_roles(strategy);
+
+    let mut out = compiled.clone();
+    let obj = out.as_object_mut().ok_or_else(|| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            api_error(
+                "COMPILE_FAILED",
+                "Compile failed",
+                "Compile response was not a JSON object.",
+                "Retry.",
+                None,
+                None,
+            ),
+        )
+    })?;
+
+    // Filter legs by role.
+    let original_legs =
+        obj.get("legs").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+
+    let kept_legs: Vec<serde_json::Value> = original_legs
+        .into_iter()
+        .filter(|leg| {
+            let role = leg.get("role").and_then(serde_json::Value::as_str).unwrap_or("");
+            allowed.contains(&role)
+        })
+        .collect();
+
+    if kept_legs.is_empty() {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            api_error(
+                "COMPILE_FAILED",
+                "No legs available",
+                "The compiled strategy returned no legs that match this preset.",
+                "Try a different budget or style.",
+                None,
+                None,
+            ),
+        ));
+    }
+
+    let new_premium: u128 = kept_legs
+        .iter()
+        .filter_map(|leg| {
+            leg.get("premiumRaw")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| v.parse::<u128>().ok())
+        })
+        .sum();
+    let new_max_gross: u128 = kept_legs
+        .iter()
+        .filter_map(|leg| {
+            leg.get("quantityRaw")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| v.parse::<u128>().ok())
+        })
+        .max()
+        .unwrap_or(0);
+    let new_max_loss = new_premium;
+    let new_max_net = new_max_gross.saturating_sub(new_premium);
+
+    // Recompute payoff table — keep the same 5 buckets so the UI is consistent.
+    let payoff_table =
+        obj.get("payoffTable").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
+
+    let kept_role_set: std::collections::HashSet<String> = kept_legs
+        .iter()
+        .filter_map(|leg| {
+            leg.get("role").and_then(serde_json::Value::as_str).map(|s| s.to_string())
+        })
+        .collect();
+
+    let new_payoff_table: Vec<serde_json::Value> = payoff_table
+        .into_iter()
+        .enumerate()
+        .map(|(idx, mut row)| {
+            let bucket_role = role_for_payoff_bucket(idx);
+            let leg_pays = match bucket_role {
+                Some(role) => kept_role_set.contains(role),
+                None => false,
+            };
+            let original_gross = row
+                .get("grossPayoutRaw")
+                .and_then(serde_json::Value::as_str)
+                .and_then(|v| v.parse::<u128>().ok())
+                .unwrap_or(0);
+            let new_gross: u128 = if leg_pays { original_gross } else { 0 };
+            let new_net: i128 = new_gross as i128 - new_premium as i128;
+            if let Some(map) = row.as_object_mut() {
+                map.insert(
+                    "grossPayoutRaw".to_string(),
+                    serde_json::Value::String(new_gross.to_string()),
+                );
+                map.insert(
+                    "grossPayoutDisplay".to_string(),
+                    serde_json::Value::String(format!(
+                        "{} dUSDC",
+                        format_dusdc_raw_u128(new_gross).trim_end_matches(" dUSDC")
+                    )),
+                );
+                map.insert("netPnlRaw".to_string(), serde_json::Value::String(new_net.to_string()));
+                map.insert(
+                    "netPnlDisplay".to_string(),
+                    serde_json::Value::String(format!(
+                        "{} dUSDC",
+                        format_signed_dusdc(new_net).trim_end_matches(" dUSDC")
+                    )),
+                );
+            }
+            row
+        })
+        .collect();
+
+    // Update strategy + financial summary fields.
+    obj.insert("strategy".to_string(), serde_json::Value::String(strategy.to_string()));
+    obj.insert(
+        "selectionMode".to_string(),
+        serde_json::Value::String("preset_filtered".to_string()),
+    );
+    obj.insert("presetTemplate".to_string(), serde_json::Value::String(strategy.to_string()));
+    obj.insert("legs".to_string(), serde_json::Value::Array(kept_legs));
+    obj.insert("payoffTable".to_string(), serde_json::Value::Array(new_payoff_table));
+    obj.insert(
+        "premiumRequiredRaw".to_string(),
+        serde_json::Value::String(new_premium.to_string()),
+    );
+    obj.insert(
+        "premiumRequiredDisplay".to_string(),
+        serde_json::Value::String(format_dusdc_raw_u128(new_premium)),
+    );
+    obj.insert("maxLossRaw".to_string(), serde_json::Value::String(new_max_loss.to_string()));
+    obj.insert(
+        "maxLossDisplay".to_string(),
+        serde_json::Value::String(format_dusdc_raw_u128(new_max_loss)),
+    );
+    obj.insert(
+        "maxGrossPayoutRaw".to_string(),
+        serde_json::Value::String(new_max_gross.to_string()),
+    );
+    obj.insert(
+        "maxGrossPayoutDisplay".to_string(),
+        serde_json::Value::String(format_dusdc_raw_u128(new_max_gross)),
+    );
+    obj.insert("maxNetPayoutRaw".to_string(), serde_json::Value::String(new_max_net.to_string()));
+    obj.insert(
+        "maxNetPayoutDisplay".to_string(),
+        serde_json::Value::String(format_dusdc_raw_u128(new_max_net)),
+    );
+
+    // Replace the first segment of the id with the strategy slug while keeping
+    // the rest of the identifier intact so compiled_expiry_ms still parses.
+    if let Some(original_id) = obj.get("compiledStrategyId").and_then(serde_json::Value::as_str) {
+        let suffix = original_id.split_once(':').map(|(_, rest)| rest).unwrap_or("");
+        let strategy_slug = strategy.to_lowercase();
+        let new_id =
+            if suffix.is_empty() { strategy_slug } else { format!("{}:{}", strategy_slug, suffix) };
+        obj.insert("compiledStrategyId".to_string(), serde_json::Value::String(new_id));
+    }
+
+    Ok(out)
+}
+
+async fn find_mintable_strategy(
+    State(state): State<Arc<AppState>>,
+    Json(req): Json<FindMintableStrategyRequest>,
+) -> impl IntoResponse {
+    let compile_request = CompileStrategyRequest {
+        owner: req.owner.clone(),
+        strategy: "BREAKOUT_PROTECTION".to_string(),
+        budget_dusdc: req.budget_dusdc.clone(),
+        style: req.style.clone(),
+        expiry_preference: req.expiry_preference.clone(),
+        slippage_bps: req.slippage_bps,
+        bucket_step_usd: None,
+        custom_k1_price: None,
+        custom_k2_price: None,
+        custom_k3_price: None,
+        custom_k4_price: None,
+        portfolio_exposure_dusdc: None,
+        over_hedge_cap_bps: None,
+        convex_gamma_bps: None,
+        dead_zone_bps: None,
+        moonshot_range_weight_bps: None,
+        moonshot_tail_gamma_bps: None,
+        downside_range_weight_bps: None,
+        downside_tail_gamma_bps: None,
+        upside_near_range_weight_bps: None,
+        upside_upper_range_weight_bps: None,
+        upside_tail_gamma_bps: None,
+        downside_near_range_weight_bps: None,
+        downside_lower_range_weight_bps: None,
+        downside_step_tail_gamma_bps: None,
+        condor_center_weight_bps: None,
+        barrier_side: None,
+        barrier_near_range_weight_bps: None,
+        barrier_tail_gamma_bps: None,
+    };
+
+    let compiled = match compile_strategy_service_value(&compile_request).await {
+        Ok(compiled) => compiled,
+        Err((status, value)) => return (status, Json(value)),
+    };
+
+    let Some(compiled_strategy_id) =
+        compiled.get("compiledStrategyId").and_then(serde_json::Value::as_str)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "compiled response missing compiledStrategyId"
+            })),
+        );
+    };
+
+    let Some(expiry_ms) = compiled_expiry_ms(compiled_strategy_id) else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "compiled strategy id is missing expiry information"
+            })),
+        );
+    };
+
+    match find_best_effort_mintable_compiled(&req.owner, &req.manager_id, &compiled, &expiry_ms)
+        .await
+    {
+        Ok((mintable_compiled, extra_warnings)) => {
+            if let Some(id) =
+                mintable_compiled.get("compiledStrategyId").and_then(serde_json::Value::as_str)
+            {
+                state.compiled.lock().await.insert(id.to_string(), mintable_compiled.clone());
+            }
+
+            let mut warnings = vec![
+                "Executable means mint checks passed at the time of checking; wallet signing can still fail if market state changes."
+                    .to_string(),
+                "Quote success alone is not treated as executable.".to_string(),
+            ];
+            warnings.extend(extra_warnings);
+
+            (
+                StatusCode::OK,
+                Json(serde_json::json!({
+                    "ok": true,
+                    "executable": true,
+                    "network": "sui:testnet",
+                    "owner": req.owner,
+                    "managerId": req.manager_id,
+                    "budgetDisplay": req.budget_dusdc,
+                    "compiled": mintable_compiled,
+                    "mintDevInspect": {
+                        "status": "success",
+                        "stdout": "Direct backend mintability checks passed for the compiled strategy."
+                    },
+                    "failures": [],
+                    "warnings": warnings,
+                })),
+            )
+        }
+        Err((_status, value)) => (
+            StatusCode::OK,
+            Json(serde_json::json!({
+                "ok": true,
+                "executable": false,
+                "network": "sui:testnet",
+                "owner": req.owner,
+                "managerId": req.manager_id,
+                "message": value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("No currently mintable breakout candidate found."),
+                "details": value,
+                "failures": [],
+                "warnings": [
+                    "Strategy unavailable right now under current Predict market conditions.",
+                    "Quote success does not imply mintability."
+                ]
+            })),
+        ),
+    }
+}
+
+async fn health() -> Json<HealthResponse> {
+    Json(HealthResponse { ok: true, service: "structx-api" })
+}
+
+/// GET /api/managers/:address — returns the PredictManager id previously
+/// stored for this wallet, or null if none has been persisted yet.
+///
+/// Cached for 30s in the browser via `Cache-Control: private, max-age=30`.
+/// The manager-id mapping changes only when the user creates a new manager,
+/// and on that path we explicitly POST + invalidate the frontend cache, so
+/// the 30s window is safe and removes redundant round-trips when the user
+/// navigates between strategy pages within a session.
+#[derive(Debug, Deserialize)]
+struct ListPositionsQuery {
+    owner: String,
+    #[serde(rename = "managerId")]
+    manager_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncPositionsRequest {
+    owner: String,
+    #[serde(rename = "managerId")]
+    manager_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct MarketSearchParams {
+    q: Option<String>,
+    quote_asset: Option<String>,
+    require_active: Option<bool>,
+    category: Option<String>,
+    kind: Option<String>,
+    expiry: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct MarketCatalogRefreshResponse {
+    ok: bool,
+    market_count: usize,
+    active_market_count: usize,
+    report: structx_service::CatalogBuildReport,
+}
+
 /// GET /api/markets — fetch the active DeepBook Predict market directory.
 ///
 /// This intentionally does not shell out to the CLI. The API persists the last
@@ -1108,6 +2440,50 @@ async fn list_markets(State(state): State<Arc<AppState>>) -> impl IntoResponse {
             })),
         ),
     }
+}
+
+fn build_markets_envelope(markets: &[MarketSnapshot]) -> serde_json::Value {
+    let usable = markets.iter().filter(|market| market.structx_status.is_usable()).count();
+    let deepbook_only = markets
+        .iter()
+        .filter(|market| match &market.structx_status {
+            deepbook_client::StructxMarketStatus::Rejected { reasons, .. } => {
+                !reasons.is_empty()
+                    && reasons.iter().all(|reason| {
+                        matches!(reason, deepbook_client::MarketRejectionReason::NonBtc)
+                    })
+            }
+            _ => false,
+        })
+        .count();
+    let warnings = markets
+        .iter()
+        .filter(|market| {
+            matches!(
+                market.structx_status,
+                deepbook_client::StructxMarketStatus::UsableWithWarnings(_)
+            )
+        })
+        .count();
+    let asset_count = markets
+        .iter()
+        .filter_map(|market| market.underlying())
+        .map(|asset| asset.to_ascii_uppercase())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
+
+    serde_json::json!({
+        "ok": true,
+        "asset": "ALL",
+        "network": "sui:testnet",
+        "totalCount": markets.len(),
+        "usableCount": usable,
+        "deepbookOnlyCount": deepbook_only,
+        "warningsCount": warnings,
+        "assetCount": asset_count,
+        "structxSupportedAsset": "BTC",
+        "markets": markets,
+    })
 }
 
 fn markets_cache_age(record: &MarketsCacheRecord) -> Duration {
@@ -1369,50 +2745,10 @@ async fn load_existing_markets_json() -> Result<serde_json::Value, String> {
     Ok(build_markets_envelope(&markets))
 }
 
-fn build_markets_envelope(markets: &[MarketSnapshot]) -> serde_json::Value {
-    let usable = markets.iter().filter(|market| market.structx_status.is_usable()).count();
-    let deepbook_only = markets
-        .iter()
-        .filter(|market| match &market.structx_status {
-            deepbook_client::StructxMarketStatus::Rejected { reasons, .. } => {
-                !reasons.is_empty()
-                    && reasons.iter().all(|reason| {
-                        matches!(reason, deepbook_client::MarketRejectionReason::NonBtc)
-                    })
-            }
-            _ => false,
-        })
-        .count();
-    let warnings = markets
-        .iter()
-        .filter(|market| {
-            matches!(
-                market.structx_status,
-                deepbook_client::StructxMarketStatus::UsableWithWarnings(_)
-            )
-        })
-        .count();
-    let asset_count = markets
-        .iter()
-        .filter_map(|market| market.underlying())
-        .map(|asset| asset.to_ascii_uppercase())
-        .collect::<std::collections::BTreeSet<_>>()
-        .len();
-
-    serde_json::json!({
-        "ok": true,
-        "asset": "ALL",
-        "network": "sui:testnet",
-        "totalCount": markets.len(),
-        "usableCount": usable,
-        "deepbookOnlyCount": deepbook_only,
-        "warningsCount": warnings,
-        "assetCount": asset_count,
-        "structxSupportedAsset": "BTC",
-        "markets": markets,
-    })
-}
-
+/// GET /api/positions?owner=&managerId= — read the disk-backed ledger and
+/// return all known positions plus an aggregate summary. This endpoint never
+/// hits Sui RPC; valuation refresh is a separate explicit action (later
+/// slice) so loading the page is always fast.
 async fn list_positions(Query(q): Query<ListPositionsQuery>) -> impl IntoResponse {
     let mut ledger = match PositionLedger::load(&q.owner, &q.manager_id) {
         Ok(l) => l,
@@ -1645,6 +2981,13 @@ fn position_to_redeem_read(
     }
 }
 
+/// POST /api/positions/sync-from-audits — rebuild the ledger by re-reading
+/// every persisted audit record for this (owner, managerId). Useful when
+/// disk state is lost or when an audit was missed (e.g. backend crash
+/// between mint and the audit-open call). Idempotent — re-applying the
+/// same audit digest is a no-op because apply_mint merges same-key legs
+/// only when the source_digest is new, otherwise the merge is the
+/// commutative no-op.
 async fn sync_positions_from_audits(Json(req): Json<SyncPositionsRequest>) -> impl IntoResponse {
     let mut ledger = PositionLedger::empty(&req.owner, &req.manager_id);
     let mut warnings: Vec<String> = Vec::new();
@@ -1735,6 +3078,65 @@ async fn sync_positions_from_audits(Json(req): Json<SyncPositionsRequest>) -> im
     )
 }
 
+#[derive(Debug, Deserialize)]
+struct SyncFromChainRequest {
+    owner: String,
+    #[serde(rename = "managerId")]
+    manager_id: String,
+    #[serde(default, rename = "mintedLegs")]
+    minted_legs: Vec<SyncMintedLeg>,
+    #[serde(default, rename = "redeemedLegs")]
+    redeemed_legs: Vec<SyncRedeemedLeg>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncMintedLeg {
+    kind: String,
+    #[serde(default)]
+    direction: Option<String>,
+    #[serde(rename = "oracleId")]
+    oracle_id: String,
+    #[serde(rename = "expiryMs")]
+    expiry_ms: String,
+    #[serde(default, rename = "strikeRaw")]
+    strike_raw: Option<String>,
+    #[serde(default, rename = "lowerRaw")]
+    lower_raw: Option<String>,
+    #[serde(default, rename = "upperRaw")]
+    upper_raw: Option<String>,
+    #[serde(rename = "quantityRaw")]
+    quantity_raw: String,
+    #[serde(rename = "costRaw")]
+    cost_raw: String,
+    #[serde(rename = "sourceDigest")]
+    source_digest: String,
+    #[serde(default, rename = "openedAtUnix")]
+    opened_at_unix: Option<i64>,
+    #[serde(default)]
+    strategy: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncRedeemedLeg {
+    kind: String,
+    #[serde(rename = "oracleId")]
+    oracle_id: String,
+    #[serde(rename = "expiryMs")]
+    expiry_ms: String,
+    #[serde(default, rename = "strikeRaw")]
+    strike_raw: Option<String>,
+    #[serde(default, rename = "lowerRaw")]
+    lower_raw: Option<String>,
+    #[serde(default, rename = "upperRaw")]
+    upper_raw: Option<String>,
+    #[serde(rename = "quantityRaw")]
+    quantity_raw: String,
+    #[serde(rename = "payoutRaw")]
+    payout_raw: String,
+    #[serde(rename = "sourceDigest")]
+    source_digest: String,
+}
+
 fn parse_leg_kind(s: &str) -> Option<LegKind> {
     match s {
         "UP" => Some(LegKind::Up),
@@ -1744,6 +3146,12 @@ fn parse_leg_kind(s: &str) -> Option<LegKind> {
     }
 }
 
+/// POST /api/positions/sync-from-chain
+///
+/// Accept already-extracted mint/redeem events from the frontend's chain
+/// walk and apply them to the ledger. Idempotent: legs whose `sourceDigest`
+/// already appears in `audit_digests` / `redeem_digests` are skipped, so a
+/// user can re-run the sync without double-counting.
 async fn sync_positions_from_chain(Json(req): Json<SyncFromChainRequest>) -> impl IntoResponse {
     let mut ledger = match PositionLedger::load(&req.owner, &req.manager_id) {
         Ok(l) => l,
@@ -1762,6 +3170,13 @@ async fn sync_positions_from_chain(Json(req): Json<SyncFromChainRequest>) -> imp
     let mut applied_redeems = 0usize;
     let mut warnings: Vec<String> = Vec::new();
 
+    // Snapshot the set of digests already applied to this ledger BEFORE the
+    // loop. A previously-applied tx-digest is skipped wholesale. We don't
+    // mutate this set inside the loop, so when one tx mints multiple legs
+    // (different keys, same digest), every leg in the batch still applies.
+    //
+    // We own the strings (not borrow into `ledger.audit_digests`) so the
+    // immutable borrow ends here and `apply_mint` can take `&mut ledger`.
     let known_mint_digests: std::collections::HashSet<String> =
         ledger.audit_digests.iter().cloned().collect();
     let known_redeem_digests: std::collections::HashSet<String> =
@@ -1858,6 +3273,28 @@ async fn sync_positions_from_chain(Json(req): Json<SyncFromChainRequest>) -> imp
     )
 }
 
+#[derive(Debug, Deserialize)]
+struct AuditRedeemPositionRequest {
+    owner: String,
+    #[serde(rename = "managerId")]
+    manager_id: String,
+    #[serde(rename = "positionId")]
+    position_id: String,
+    digest: String,
+    #[serde(default)]
+    effects: serde_json::Value,
+    #[serde(default)]
+    events: Vec<serde_json::Value>,
+    #[serde(default, rename = "objectChanges")]
+    object_changes: Vec<serde_json::Value>,
+}
+
+/// POST /api/tx/audit-redeem-position
+///
+/// Called by the frontend after a wallet-signed close transaction succeeds.
+/// Walks the parsed PositionRedeemed / RangeRedeemed events, applies the
+/// realized quantity + payout to the position ledger, persists a redeem
+/// record for disaster recovery, and returns the updated ledger.
 async fn audit_redeem_position(Json(req): Json<AuditRedeemPositionRequest>) -> impl IntoResponse {
     let execution_status = req
         .effects
@@ -1950,6 +3387,10 @@ async fn audit_redeem_position(Json(req): Json<AuditRedeemPositionRequest>) -> i
     (StatusCode::BAD_REQUEST, Json(body))
 }
 
+/// Walk parsed Sui events and lift PositionRedeemed / RangeRedeemed entries
+/// into typed RedeemedLeg structs the ledger understands. Tolerates partial
+/// data; missing fields default to None/0 so a malformed event doesn't break
+/// the rest of the audit.
 fn parse_redeemed_legs_from_events(events: &[serde_json::Value]) -> Vec<RedeemedLeg> {
     let mut out = Vec::new();
     for event in events {
@@ -2028,1518 +3469,6 @@ fn redeemed_legs_to_json(legs: &[RedeemedLeg]) -> Vec<serde_json::Value> {
         .collect()
 }
 
-fn json_value_as_u128_string(value: &serde_json::Value) -> Option<String> {
-    if let Some(s) = value.as_str() {
-        Some(s.to_string())
-    } else if let Some(n) = value.as_u64() {
-        Some(n.to_string())
-    } else if let Some(n) = value.as_i64() {
-        u128::try_from(n).ok().map(|v| v.to_string())
-    } else {
-        None
-    }
-}
-
-async fn compile_from_intent(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CompileFromIntentRequest>,
-) -> impl IntoResponse {
-    let Some(strategy) = req.intent.get("recommendedStrategy").and_then(serde_json::Value::as_str)
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "intent missing recommendedStrategy"
-            })),
-        );
-    };
-
-    let Some(style) = req.intent.get("recommendedStyle").and_then(serde_json::Value::as_str) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "intent missing recommendedStyle"
-            })),
-        );
-    };
-
-    let Some(budget_dusdc) = req.intent.get("budgetDUSDC").and_then(serde_json::Value::as_str)
-    else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "intent missing budgetDUSDC"
-            })),
-        );
-    };
-
-    let args = vec![
-        "compile-strategy-json".to_string(),
-        "--owner".to_string(),
-        req.owner.clone(),
-        "--strategy".to_string(),
-        strategy.to_string(),
-        "--budget-dusdc".to_string(),
-        budget_dusdc.to_string(),
-        "--style".to_string(),
-        style.to_string(),
-        "--expiry-preference".to_string(),
-        "nearest_active".to_string(),
-        "--slippage-bps".to_string(),
-        "100".to_string(),
-    ];
-
-    match run_cli_value(&state, args).await {
-        Ok(mut compiled) => {
-            if let Some(obj) = compiled.as_object_mut() {
-                obj.insert(
-                    "recommendation".to_string(),
-                    serde_json::json!({
-                        "source": "AI_INTENT_PLUS_DETERMINISTIC_COMPILER",
-                        "intent": req.intent,
-                        "reasoningSummary": req.intent
-                            .get("reasoningSummary")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::String(
-                                "Strategy selected from parsed user intent.".to_string()
-                            )),
-                        "confidence": req.intent
-                            .get("confidence")
-                            .cloned()
-                            .unwrap_or(serde_json::Value::from(0.65))
-                    }),
-                );
-            }
-
-            if let Some(id) = compiled.get("compiledStrategyId").and_then(serde_json::Value::as_str)
-            {
-                state.compiled.lock().await.insert(id.to_string(), compiled.clone());
-            }
-
-            (StatusCode::OK, Json(compiled))
-        }
-        Err((status, value)) => (status, Json(value)),
-    }
-}
-
-async fn parse_intent(Json(req): Json<ParseIntentRequest>) -> impl IntoResponse {
-    let parsed = match parse_intent_with_openai_or_fallback(&req).await {
-        Ok(parsed) => parsed,
-        Err(err) => {
-            let mut fallback = deterministic_parse_intent(&req);
-            fallback.warnings.push(format!("AI parser failed; deterministic fallback used: {err}"));
-            fallback
-        }
-    };
-
-    if !parsed.missing_fields.is_empty() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "missingFields": parsed.missing_fields,
-                "clarifyingQuestion": build_clarifying_question(&parsed),
-                "fallbackIntent": parsed
-            })),
-        );
-    }
-
-    (StatusCode::OK, Json(serde_json::to_value(parsed).unwrap()))
-}
-
-async fn live_price(Query(query): Query<LivePriceQuery>) -> impl IntoResponse {
-    let server_url = std::env::var("PREDICT_SERVER_URL")
-        .unwrap_or_else(|_| DEFAULT_PREDICT_SERVER_URL.to_string());
-
-    let client = reqwest::Client::new();
-
-    let mut warnings = Vec::new();
-    let mut raw_payload = serde_json::Value::Null;
-    let mut source = "prices/latest".to_string();
-
-    let latest_url = format!("{}/prices/latest", server_url.trim_end_matches('/'));
-
-    let latest_result =
-        client.get(&latest_url).send().await.and_then(|response| response.error_for_status());
-
-    match latest_result {
-        Ok(response) => match response.json::<serde_json::Value>().await {
-            Ok(value) => {
-                raw_payload = value;
-            }
-            Err(err) => {
-                warnings.push(format!("failed to parse /prices/latest JSON: {err}"));
-            }
-        },
-        Err(err) => {
-            warnings.push(format!("failed to fetch /prices/latest: {err}"));
-        }
-    }
-
-    if raw_payload.is_null() {
-        if let Some(oracle_id) = &query.oracle_id {
-            let oracle_url =
-                format!("{}/oracles/{}/state", server_url.trim_end_matches('/'), oracle_id);
-
-            match client.get(&oracle_url).send().await {
-                Ok(response) => match response.error_for_status() {
-                    Ok(response) => match response.json::<serde_json::Value>().await {
-                        Ok(value) => {
-                            source = "oracles/:oracle_id/state".to_string();
-                            raw_payload = value;
-                        }
-                        Err(err) => {
-                            warnings.push(format!("failed to parse oracle state JSON: {err}"));
-                        }
-                    },
-                    Err(err) => warnings.push(format!("oracle state HTTP error: {err}")),
-                },
-                Err(err) => warnings.push(format!("failed to fetch oracle state: {err}")),
-            }
-        }
-    }
-
-    let asset = query.asset.to_uppercase();
-
-    let price_raw = extract_price_raw_for_asset(&raw_payload, &asset)
-        .or_else(|| extract_first_price_like_raw(&raw_payload));
-
-    let updated_at_ms = extract_timestamp_ms(&raw_payload);
-
-    let stale = updated_at_ms
-        .map(|ts| {
-            let now_ms = unix_now_secs().saturating_mul(1000);
-            now_ms.saturating_sub(ts) > 60_000
-        })
-        .unwrap_or(true);
-
-    if price_raw.is_none() {
-        warnings.push("could not find a BTC price in DeepBook Predict payload".to_string());
-    }
-
-    let response = LivePriceResponse {
-        ok: price_raw.is_some(),
-        asset,
-        source,
-        price_raw: price_raw.map(|value| value.to_string()),
-        price: price_raw.map(format_price_e9),
-        updated_at_ms,
-        stale,
-        oracle_id: query.oracle_id,
-        raw: raw_payload,
-        warnings,
-    };
-
-    let status = if response.ok { StatusCode::OK } else { StatusCode::BAD_REQUEST };
-
-    (status, Json(response))
-}
-
-async fn health(State(state): State<Arc<AppState>>) -> Json<HealthResponse> {
-    Json(HealthResponse {
-        ok: true,
-        service: "structx-api",
-        cli_bin: state.cli_bin.to_string_lossy().to_string(),
-    })
-}
-
-async fn compile_strategy(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<CompileStrategyRequest>,
-) -> impl IntoResponse {
-    let mut args = vec![
-        "compile-strategy-json".to_string(),
-        "--owner".to_string(),
-        req.owner,
-        "--strategy".to_string(),
-        req.strategy,
-        "--budget-dusdc".to_string(),
-        req.budget_dusdc,
-        "--style".to_string(),
-        req.style,
-        "--expiry-preference".to_string(),
-        req.expiry_preference,
-        "--slippage-bps".to_string(),
-        req.slippage_bps.to_string(),
-    ];
-
-    if let Some(value) = req.portfolio_exposure_dusdc {
-        args.push("--portfolio-exposure-dusdc".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.over_hedge_cap_bps {
-        args.push("--over-hedge-cap-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.dead_zone_bps {
-        args.push("--dead-zone-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.convex_gamma_bps {
-        args.push("--convex-gamma-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.moonshot_range_weight_bps {
-        args.push("--moonshot-range-weight-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.moonshot_tail_gamma_bps {
-        args.push("--moonshot-tail-gamma-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.downside_range_weight_bps {
-        args.push("--downside-range-weight-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.downside_tail_gamma_bps {
-        args.push("--downside-tail-gamma-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.downside_near_range_weight_bps {
-        args.push("--downside-near-range-weight-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.downside_lower_range_weight_bps {
-        args.push("--downside-lower-range-weight-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.downside_step_tail_gamma_bps {
-        args.push("--downside-step-tail-gamma-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.condor_center_weight_bps {
-        args.push("--condor-center-weight-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.barrier_side {
-        args.push("--barrier-side".to_string());
-        args.push(value);
-    }
-
-    if let Some(value) = req.barrier_near_range_weight_bps {
-        args.push("--barrier-near-range-weight-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    if let Some(value) = req.barrier_tail_gamma_bps {
-        args.push("--barrier-tail-gamma-bps".to_string());
-        args.push(value.to_string());
-    }
-
-    match run_cli_value(&state, args).await {
-        Ok(value) => {
-            if let Some(id) = value.get("compiledStrategyId").and_then(serde_json::Value::as_str) {
-                state.compiled.lock().await.insert(id.to_string(), value.clone());
-            }
-
-            (StatusCode::OK, Json(value))
-        }
-        Err((status, value)) => (status, Json(value)),
-    }
-}
-
-async fn demo_status(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<DemoStatusRequest>,
-) -> impl IntoResponse {
-    run_cli_json(
-        state,
-        vec![
-            "demo-status".to_string(),
-            "--manager-id".to_string(),
-            req.manager_id,
-            "--sender".to_string(),
-            req.sender,
-            "--from-execution-json".to_string(),
-            req.from_execution_json,
-        ],
-    )
-    .await
-}
-
-async fn manager_balance_json(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ManagerBalanceRequest>,
-) -> impl IntoResponse {
-    let output = Command::new(&state.cli_bin)
-        .args(["manager-balance", "--manager-id", req.manager_id.as_str()])
-        .output()
-        .await;
-
-    let Ok(output) = output else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "failed to run manager-balance CLI"
-            })),
-        );
-    };
-
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
-
-    if !output.status.success() {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "stdout": stdout,
-                "stderr": stderr
-            })),
-        );
-    }
-
-    let Some(balance_raw) = extract_balance_raw_from_stdout(&stdout) else {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false,
-                "stdout": stdout,
-                "stderr": "failed to parse balance raw"
-            })),
-        );
-    };
-
-    let display = format_dusdc_raw(balance_raw);
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "balanceRaw": balance_raw.to_string(),
-            "balanceDisplay": display,
-            "stdout": stdout
-        })),
-    )
-}
-
-async fn manager_balance(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ManagerBalanceRequest>,
-) -> impl IntoResponse {
-    run_cli_json(
-        state,
-        vec!["manager-balance".to_string(), "--manager-id".to_string(), req.manager_id],
-    )
-    .await
-}
-
-async fn manager_positions(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<ManagerPositionsRequest>,
-) -> impl IntoResponse {
-    run_cli_json(
-        state,
-        vec![
-            "manager-positions".to_string(),
-            "--manager-id".to_string(),
-            req.manager_id,
-            "--sender".to_string(),
-            req.sender,
-            "--from-execution-json".to_string(),
-            req.from_execution_json,
-        ],
-    )
-    .await
-}
-
-async fn audit_execution(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<AuditExecutionRequest>,
-) -> impl IntoResponse {
-    run_cli_json(
-        state,
-        vec![
-            "audit-execution".to_string(),
-            "--from-execution-json".to_string(),
-            req.from_execution_json,
-        ],
-    )
-    .await
-}
-
-async fn devinspect_mint_breakout(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<DevinspectMintBreakoutRequest>,
-) -> impl IntoResponse {
-    let mut args = vec![
-        "devinspect-mint-breakout".to_string(),
-        "--manager-id".to_string(),
-        req.manager_id,
-        "--sender".to_string(),
-        req.sender,
-        "--max-total-mint-cost-raw".to_string(),
-        req.max_total_mint_cost_raw.to_string(),
-        "--slippage-bps".to_string(),
-        req.slippage_bps.to_string(),
-        "--max-quote-market-attempts".to_string(),
-        req.max_quote_market_attempts.to_string(),
-    ];
-
-    if req.write_execute_script {
-        args.push("--write-execute-script".to_string());
-    }
-
-    run_cli_json(state, args).await
-}
-
-async fn devinspect_redeem_breakout(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<DevinspectRedeemBreakoutRequest>,
-) -> impl IntoResponse {
-    let mut args = vec![
-        "devinspect-redeem-breakout".to_string(),
-        "--manager-id".to_string(),
-        req.manager_id,
-        "--sender".to_string(),
-        req.sender,
-        "--from-execution-json".to_string(),
-        req.from_execution_json,
-    ];
-
-    if req.auto_size_down {
-        args.push("--auto-size-down".to_string());
-    }
-
-    if req.write_execute_script {
-        args.push("--write-execute-script".to_string());
-    }
-
-    if req.allow_zero_payout_script {
-        args.push("--allow-zero-payout-script".to_string());
-    }
-
-    run_cli_json(state, args).await
-}
-
-async fn build_open_strategy(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<BuildOpenStrategyRequest>,
-) -> impl IntoResponse {
-    let compiled = {
-        let cache = state.compiled.lock().await;
-        cache.get(&req.compiled_strategy_id).cloned()
-    };
-
-    let Some(compiled) = compiled else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "compiledStrategyId not found. Compile the strategy again before building transaction."
-            })),
-        );
-    };
-
-    let premium_required = compiled
-        .get("premiumRequiredRaw")
-        .and_then(serde_json::Value::as_str)
-        .and_then(|v| v.parse::<u128>().ok())
-        .unwrap_or(u128::MAX);
-
-    let max_premium = req.max_premium_raw.parse::<u128>().unwrap_or(0);
-
-    if premium_required > max_premium {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "premium exceeds maxPremiumRaw",
-                "premiumRequiredRaw": premium_required.to_string(),
-                "maxPremiumRaw": max_premium.to_string()
-            })),
-        );
-    }
-
-    let oracle_id =
-        compiled.get("oracleId").and_then(serde_json::Value::as_str).unwrap_or_default();
-
-    let raw_legs =
-        compiled.get("legs").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
-
-    let legs = legs_with_max_costs(raw_legs, req.slippage_bps);
-
-    let Some(expiry_ms) = compiled_expiry_ms(&req.compiled_strategy_id) else {
-        return (
-            StatusCode::BAD_REQUEST,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": "compiledStrategyId missing expiry_ms"
-            })),
-        );
-    };
-
-    let warnings =
-        compiled.get("warnings").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
-
-    let mut response_warnings = warnings;
-    if !response_warnings
-        .iter()
-        .any(|warning| warning.as_str() == Some("Live oracle pricing can change between preview and wallet signing; dry-run immediately before opening."))
-    {
-        response_warnings.push(serde_json::Value::String(
-            "Live oracle pricing can change between preview and wallet signing; dry-run immediately before opening.".to_string(),
-        ));
-    }
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "buildKind": "FRONTEND_TRANSACTION_BUILDER",
-            "network": "sui:testnet",
-            "compiledStrategyId": req.compiled_strategy_id,
-            "expiryMs": expiry_ms,
-            "owner": req.owner,
-            "managerId": req.manager_id,
-            "predictPackageId": PREDICT_PACKAGE_ID,
-            "predictObjectId": PREDICT_OBJECT_ID,
-            "clockObjectId": CLOCK_OBJECT_ID,
-            "dusdcCoinType": DUSDC_COIN_TYPE,
-            "oracleId": oracle_id,
-            "slippageBps": req.slippage_bps,
-            "summary": {
-                "strategy": compiled.get("strategy").cloned().unwrap_or(serde_json::Value::Null),
-                "premiumRequiredRaw": compiled.get("premiumRequiredRaw").cloned().unwrap_or(serde_json::Value::Null),
-                "premiumRequiredDisplay": compiled.get("premiumRequiredDisplay").cloned().unwrap_or(serde_json::Value::Null),
-                "legs": legs
-            },
-            "warnings": response_warnings
-
-        })),
-    )
-}
-
-async fn audit_open_strategy(
-    State(state): State<Arc<AppState>>,
-    Json(req): Json<AuditOpenStrategyRequest>,
-) -> impl IntoResponse {
-    let _guard = state.audit_lock.lock().await;
-
-    let digest = sanitize_digest(&req.digest);
-
-    let artifact = serde_json::json!({
-        "digest": req.digest,
-        "effects": req.effects,
-        "events": req.events,
-        "objectChanges": req.object_changes
-    });
-
-    let artifact_path = audit_artifact_path(&state.audits_dir, &digest);
-
-    let bytes = match serde_json::to_vec_pretty(&artifact) {
-        Ok(bytes) => bytes,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("failed to serialize audit artifact: {err}")
-                })),
-            );
-        }
-    };
-
-    if let Err(err) = tokio::fs::write(&artifact_path, bytes).await {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("failed to write audit artifact: {err}")
-            })),
-        );
-    }
-
-    let args = vec![
-        "demo-status".to_string(),
-        "--manager-id".to_string(),
-        req.manager_id.clone(),
-        "--sender".to_string(),
-        req.owner.clone(),
-        "--from-execution-json".to_string(),
-        artifact_path.to_string_lossy().to_string(),
-    ];
-
-    let audit_output = match Command::new(&state.cli_bin).args(args).output().await {
-        Ok(output) => output,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("failed to run audit CLI: {err}")
-                })),
-            );
-        }
-    };
-
-    let ok = audit_output.status.success();
-    let stdout = String::from_utf8_lossy(&audit_output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&audit_output.stderr).to_string();
-
-    let record = serde_json::json!({
-        "ok": ok,
-        "digest": req.digest,
-        "compiledStrategyId": req.compiled_strategy_id,
-        "owner": req.owner,
-        "managerId": req.manager_id,
-        "createdAtUnix": unix_now_secs(),
-        "artifactPath": artifact_path.to_string_lossy(),
-        "stdout": stdout,
-        "stderr": stderr,
-        "summary": extract_audit_summary(&stdout)
-    });
-
-    let record_path = audit_record_path(&state.audits_dir, &digest);
-
-    if let Err(err) =
-        tokio::fs::write(&record_path, serde_json::to_vec_pretty(&record).unwrap_or_default()).await
-    {
-        return (
-            StatusCode::INTERNAL_SERVER_ERROR,
-            Json(serde_json::json!({
-                "ok": false,
-                "error": format!("failed to write audit record: {err}")
-            })),
-        );
-    }
-
-    let status = if ok { StatusCode::OK } else { StatusCode::BAD_REQUEST };
-
-    (status, Json(record))
-}
-
-async fn list_audits(State(state): State<Arc<AppState>>) -> impl IntoResponse {
-    let mut records = Vec::new();
-
-    let read_dir = match fs::read_dir(&state.audits_dir) {
-        Ok(read_dir) => read_dir,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("failed to read audits dir: {err}")
-                })),
-            );
-        }
-    };
-
-    for entry in read_dir.flatten() {
-        let path = entry.path();
-
-        if !path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .map(|name| name.ends_with(".record.json"))
-            .unwrap_or(false)
-        {
-            continue;
-        }
-
-        let Ok(bytes) = fs::read(&path) else {
-            continue;
-        };
-
-        let Ok(value) = serde_json::from_slice::<serde_json::Value>(&bytes) else {
-            continue;
-        };
-
-        records.push(value);
-    }
-
-    records.sort_by(|a, b| {
-        let a_time = a.get("createdAtUnix").and_then(serde_json::Value::as_u64).unwrap_or(0);
-        let b_time = b.get("createdAtUnix").and_then(serde_json::Value::as_u64).unwrap_or(0);
-
-        b_time.cmp(&a_time)
-    });
-
-    (
-        StatusCode::OK,
-        Json(serde_json::json!({
-            "ok": true,
-            "count": records.len(),
-            "audits": records
-        })),
-    )
-}
-
-async fn get_audit(
-    State(state): State<Arc<AppState>>,
-    Path(digest): Path<String>,
-) -> impl IntoResponse {
-    let digest = sanitize_digest(&digest);
-    let path = audit_record_path(&state.audits_dir, &digest);
-
-    let bytes = match fs::read(&path) {
-        Ok(bytes) => bytes,
-        Err(_) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": "audit not found"
-                })),
-            );
-        }
-    };
-
-    let value = match serde_json::from_slice::<serde_json::Value>(&bytes) {
-        Ok(value) => value,
-        Err(err) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(serde_json::json!({
-                    "ok": false,
-                    "error": format!("failed to parse audit record: {err}")
-                })),
-            );
-        }
-    };
-
-    (StatusCode::OK, Json(value))
-}
-
-fn extract_price_raw_for_asset(value: &serde_json::Value, asset: &str) -> Option<u64> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for (key, child) in map {
-                let key_upper = key.to_uppercase();
-
-                if key_upper == asset
-                    || key_upper == format!("{asset}/USD")
-                    || key_upper == format!("{asset}-USD")
-                    || key_upper.contains(asset)
-                {
-                    if let Some(price) = extract_first_price_like_raw(child) {
-                        return Some(price);
-                    }
-                }
-            }
-
-            for child in map.values() {
-                if let Some(price) = extract_price_raw_for_asset(child, asset) {
-                    return Some(price);
-                }
-            }
-
-            None
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                if let Some(price) = extract_price_raw_for_asset(item, asset) {
-                    return Some(price);
-                }
-            }
-
-            None
-        }
-        _ => None,
-    }
-}
-
-fn extract_first_price_like_raw(value: &serde_json::Value) -> Option<u64> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for key in [
-                "price_raw",
-                "priceRaw",
-                "raw_price",
-                "rawPrice",
-                "oracle_price",
-                "oraclePrice",
-                "latest_price",
-                "latestPrice",
-                "price",
-                "value",
-            ] {
-                if let Some(raw) = map.get(key).and_then(json_number_or_string_u64) {
-                    return normalize_price_to_e9(raw);
-                }
-            }
-
-            for child in map.values() {
-                if let Some(price) = extract_first_price_like_raw(child) {
-                    return Some(price);
-                }
-            }
-
-            None
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                if let Some(price) = extract_first_price_like_raw(item) {
-                    return Some(price);
-                }
-            }
-
-            None
-        }
-        _ => json_number_or_string_u64(value).and_then(normalize_price_to_e9),
-    }
-}
-
-fn extract_timestamp_ms(value: &serde_json::Value) -> Option<u64> {
-    match value {
-        serde_json::Value::Object(map) => {
-            for key in [
-                "updated_at_ms",
-                "updatedAtMs",
-                "timestamp_ms",
-                "timestampMs",
-                "price_timestamp_ms",
-                "priceTimestampMs",
-                "last_updated_ms",
-                "lastUpdatedMs",
-            ] {
-                if let Some(ts) = map.get(key).and_then(json_number_or_string_u64) {
-                    return Some(ts);
-                }
-            }
-
-            for key in ["updated_at", "updatedAt", "timestamp", "lastUpdated"] {
-                if let Some(ts) = map.get(key).and_then(json_number_or_string_u64) {
-                    if ts < 10_000_000_000 {
-                        return Some(ts.saturating_mul(1000));
-                    }
-
-                    return Some(ts);
-                }
-            }
-
-            for child in map.values() {
-                if let Some(ts) = extract_timestamp_ms(child) {
-                    return Some(ts);
-                }
-            }
-
-            None
-        }
-        serde_json::Value::Array(items) => {
-            for item in items {
-                if let Some(ts) = extract_timestamp_ms(item) {
-                    return Some(ts);
-                }
-            }
-
-            None
-        }
-        _ => None,
-    }
-}
-
-fn json_number_or_string_u64(value: &serde_json::Value) -> Option<u64> {
-    match value {
-        serde_json::Value::Number(number) => number.as_u64(),
-        serde_json::Value::String(value) => {
-            if let Ok(raw) = value.parse::<u64>() {
-                Some(raw)
-            } else if let Ok(float) = value.parse::<f64>() {
-                Some((float * 1_000_000_000.0) as u64)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn normalize_price_to_e9(raw: u64) -> Option<u64> {
-    if raw == 0 {
-        return None;
-    }
-
-    if raw < 1_000_000 {
-        return raw.checked_mul(1_000_000_000);
-    }
-
-    Some(raw)
-}
-
-fn format_price_e9(raw: u64) -> String {
-    let whole = raw / 1_000_000_000;
-    let frac = raw % 1_000_000_000;
-    let cents = frac / 10_000_000;
-
-    format!("${whole}.{cents:02}")
-}
-
-fn sanitize_digest(value: &str) -> String {
-    value
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric() || *ch == '_' || *ch == '-')
-        .collect::<String>()
-}
-
-fn audit_artifact_path(audits_dir: &StdPath, digest: &str) -> PathBuf {
-    audits_dir.join(format!("structx_audit_{digest}.json"))
-}
-
-fn audit_record_path(audits_dir: &StdPath, digest: &str) -> PathBuf {
-    audits_dir.join(format!("structx_audit_{digest}.record.json"))
-}
-
-fn unix_now_secs() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_secs())
-        .unwrap_or_default()
-}
-
-fn extract_audit_summary(stdout: &str) -> serde_json::Value {
-    serde_json::json!({
-        "executionStatus": find_stdout_value(stdout, "execution status:"),
-        "totalCost": find_stdout_value(stdout, "total cost:"),
-        "managerBalance": find_stdout_value(stdout, "balance:"),
-        "positionVerification": if stdout.contains("Position verification: ok") {
-            "ok"
-        } else if stdout.contains("Position verification: partial") {
-            "partial"
-        } else if stdout.contains("Position verification") {
-            "failed"
-        } else {
-            "unknown"
-        },
-        "mintedLegCount": stdout.matches("PositionMinted").count() + stdout.matches("RangeMinted").count()
-    })
-}
-
-fn find_stdout_value(stdout: &str, prefix: &str) -> Option<String> {
-    stdout.lines().find_map(|line| {
-        let trimmed = line.trim();
-
-        if trimmed.to_lowercase().starts_with(prefix) {
-            Some(trimmed[(trimmed.find(':')? + 1)..].trim().to_string())
-        } else {
-            None
-        }
-    })
-}
-
-fn ceil_mul_bps(raw: &str, bps: u16) -> String {
-    let value = raw.parse::<u128>().unwrap_or(0);
-    let multiplier = 10_000u128 + bps as u128;
-
-    let out = value.saturating_mul(multiplier).saturating_add(9_999) / 10_000;
-
-    out.to_string()
-}
-
-fn compiled_expiry_ms(compiled_strategy_id: &str) -> Option<String> {
-    // breakout:{owner}:{oracle}:{expiry_ms}:{premium}:{style}
-    compiled_strategy_id.split(':').nth(3).map(ToOwned::to_owned)
-}
-
-fn legs_with_max_costs(legs: Vec<serde_json::Value>, slippage_bps: u16) -> Vec<serde_json::Value> {
-    legs.into_iter()
-        .map(|mut leg| {
-            if let Some(obj) = leg.as_object_mut() {
-                let premium_raw =
-                    obj.get("premiumRaw").and_then(serde_json::Value::as_str).unwrap_or("0");
-
-                obj.insert(
-                    "maxCostRaw".to_string(),
-                    serde_json::Value::String(ceil_mul_bps(premium_raw, slippage_bps)),
-                );
-            }
-
-            leg
-        })
-        .collect()
-}
-
-fn extract_balance_raw_from_stdout(stdout: &str) -> Option<u64> {
-    for line in stdout.lines() {
-        let trimmed = line.trim();
-
-        if let Some(rest) = trimmed.strip_prefix("balance raw:") {
-            return rest.trim().parse::<u64>().ok();
-        }
-    }
-
-    None
-}
-
-fn format_dusdc_raw(raw: u64) -> String {
-    let whole = raw / 1_000_000;
-    let frac = raw % 1_000_000;
-
-    if frac == 0 {
-        format!("{whole}.00 dUSDC")
-    } else {
-        let mut frac_string = format!("{frac:06}");
-        while frac_string.ends_with('0') {
-            frac_string.pop();
-        }
-        format!("{whole}.{frac_string} dUSDC")
-    }
-}
-
-async fn parse_intent_with_openai_or_fallback(
-    req: &ParseIntentRequest,
-) -> Result<ParsedIntent, Box<dyn std::error::Error + Send + Sync>> {
-    let api_key = match std::env::var("OPENAI_API_KEY") {
-        Ok(value) if !value.trim().is_empty() => value,
-        _ => return Ok(deterministic_parse_intent(req)),
-    };
-
-    let model = std::env::var("OPENAI_MODEL").unwrap_or_else(|_| "gpt-4o-mini".to_string());
-
-    let schema = serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": [
-            "asset",
-            "goal",
-            "budgetDUSDC",
-            "riskPreference",
-            "timePreference",
-            "recommendedStrategy",
-            "recommendedStyle",
-            "confidence",
-            "reasoningSummary",
-            "missingFields",
-            "warnings"
-        ],
-        "properties": {
-            "asset": {
-                "type": "string",
-                "enum": ["BTC"]
-            },
-            "goal": {
-                "type": "string",
-                "enum": [
-                    "downside_protection",
-                    "upside_speculation",
-                    "two_sided_breakout",
-                    "range_income",
-                    "unknown"
-                ]
-            },
-            "budgetDUSDC": {
-                "type": "string"
-            },
-            "riskPreference": {
-                "type": "string",
-                "enum": ["conservative", "balanced", "aggressive"]
-            },
-            "timePreference": {
-                "type": "string",
-                "enum": ["nearest_active", "today", "this_week"]
-            },
-            "recommendedStrategy": {
-                "type": "string",
-                "enum": ["BREAKOUT_PROTECTION", "NEAR_BARRIER_PROXY"]
-            },
-            "recommendedStyle": {
-                "type": "string",
-                "enum": ["tail-heavy", "balanced", "higher-hit-rate"]
-            },
-            "confidence": {
-                "type": "number",
-                "minimum": 0,
-                "maximum": 1
-            },
-            "reasoningSummary": {
-                "type": "string"
-            },
-            "missingFields": {
-                "type": "array",
-                "items": { "type": "string" }
-            },
-            "warnings": {
-                "type": "array",
-                "items": { "type": "string" }
-            }
-        }
-    });
-
-    let input = format!(
-        r#"
-You are the StructX intent parser.
-
-StructX is a non-custodial structured payoff builder on DeepBook Predict testnet.
-You do not give financial advice.
-You only convert user intent into strict JSON for deterministic compiler logic.
-Supported asset: BTC only.
-Supported strategies for this milestone: BREAKOUT_PROTECTION and NEAR_BARRIER_PROXY.
-Supported expiry preference: nearest_active.
-
-Rules:
-- If the user wants protection, crash hedge, dump protection, or downside coverage, goal = downside_protection.
-- If the user wants a big move either direction, volatility, or breakout, goal = two_sided_breakout.
-- If the user wants moonshot/upside/rally exposure, goal = upside_speculation.
-- If the user mentions a near barrier, barrier, close target, or near target, recommendedStrategy = NEAR_BARRIER_PROXY.
-- conservative -> higher-hit-rate unless user explicitly asks for tail.
-- aggressive/max payout -> tail-heavy.
-- balanced/default -> balanced.
-- If budget is missing, include missingFields ["budgetDUSDC"].
-- If budget is provided separately, use that.
-- Never invent unsupported strategies.
-- Always include testnet and not-financial-advice warnings.
-
-Owner: {owner}
-User message: {message}
-Provided budgetDUSDC: {budget}
-Provided riskPreference: {risk}
-Provided timePreference: {time}
-"#,
-        owner = req.owner,
-        message = req.message,
-        budget = req.budget_dusdc.clone().unwrap_or_default(),
-        risk = req.risk_preference.clone().unwrap_or_default(),
-        time = req.time_preference.clone().unwrap_or_default(),
-    );
-
-    let body = serde_json::json!({
-        "model": model,
-        "input": input,
-        "text": {
-            "format": {
-                "type": "json_schema",
-                "name": "structx_intent",
-                "strict": true,
-                "schema": schema
-            }
-        }
-    });
-
-    let client = reqwest::Client::new();
-    let response = client
-        .post("https://api.openai.com/v1/responses")
-        .bearer_auth(api_key)
-        .json(&body)
-        .send()
-        .await?
-        .error_for_status()?
-        .json::<serde_json::Value>()
-        .await?;
-
-    let text = extract_openai_text(&response).ok_or_else(|| {
-        std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "OpenAI response missing structured output text",
-        )
-    })?;
-
-    let value: serde_json::Value = serde_json::from_str(&text)?;
-    let mut parsed = parsed_intent_from_value(req, value)?;
-    validate_and_rewrite_intent(&mut parsed);
-
-    Ok(parsed)
-}
-
-fn extract_openai_text(response: &serde_json::Value) -> Option<String> {
-    let output = response.get("output")?.as_array()?;
-
-    for item in output {
-        let content = item.get("content")?.as_array()?;
-
-        for part in content {
-            if let Some(text) = part.get("text").and_then(serde_json::Value::as_str) {
-                return Some(text.to_string());
-            }
-        }
-    }
-
-    None
-}
-
-fn parsed_intent_from_value(
-    req: &ParseIntentRequest,
-    value: serde_json::Value,
-) -> Result<ParsedIntent, Box<dyn std::error::Error + Send + Sync>> {
-    let mut parsed = ParsedIntent {
-        ok: true,
-        intent_id: format!("intent_{}", stable_intent_id(&req.owner, &req.message)),
-        owner: req.owner.clone(),
-        raw_message: req.message.clone(),
-        asset: value.get("asset").and_then(serde_json::Value::as_str).unwrap_or("BTC").to_string(),
-        goal: value
-            .get("goal")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("two_sided_breakout")
-            .to_string(),
-        budget_dusdc: value
-            .get("budgetDUSDC")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("")
-            .to_string(),
-        risk_preference: value
-            .get("riskPreference")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("balanced")
-            .to_string(),
-        time_preference: value
-            .get("timePreference")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("nearest_active")
-            .to_string(),
-        recommended_strategy: value
-            .get("recommendedStrategy")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("BREAKOUT_PROTECTION")
-            .to_string(),
-        recommended_style: value
-            .get("recommendedStyle")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("balanced")
-            .to_string(),
-        confidence: value.get("confidence").and_then(serde_json::Value::as_f64).unwrap_or(0.65),
-        reasoning_summary: value
-            .get("reasoningSummary")
-            .and_then(serde_json::Value::as_str)
-            .unwrap_or("Strategy selected from parsed user intent.")
-            .to_string(),
-        missing_fields: value
-            .get("missingFields")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items.iter().filter_map(serde_json::Value::as_str).map(ToOwned::to_owned).collect()
-            })
-            .unwrap_or_default(),
-        warnings: value
-            .get("warnings")
-            .and_then(serde_json::Value::as_array)
-            .map(|items| {
-                items.iter().filter_map(serde_json::Value::as_str).map(ToOwned::to_owned).collect()
-            })
-            .unwrap_or_default(),
-    };
-
-    if parsed.budget_dusdc.is_empty() {
-        if let Some(budget) = &req.budget_dusdc {
-            parsed.budget_dusdc = budget.clone();
-        }
-    }
-
-    Ok(parsed)
-}
-
-fn deterministic_parse_intent(req: &ParseIntentRequest) -> ParsedIntent {
-    let msg = req.message.to_lowercase();
-
-    let recommended_strategy =
-        if contains_any(&msg, &["near barrier", "barrier", "close to target", "near target"]) {
-            "NEAR_BARRIER_PROXY"
-        } else if contains_any(
-            &msg,
-            &["expires far", "far from current", "expiry move", "terminal move"],
-        ) {
-            "EXPIRY_MOVE_NOTE"
-        } else if contains_any(
-            &msg,
-            &[
-                "protect",
-                "protection",
-                "hedge",
-                "downside",
-                "dump",
-                "crash",
-                "sell-off",
-                "selldown",
-            ],
-        ) {
-            "PORTFOLIO_CRASH_SHIELD"
-        } else if contains_any(
-            &msg,
-            &["moon", "upside", "rally", "pump", "breaks up", "breakout up"],
-        ) {
-            "CONVEX_TAIL_LADDER"
-        } else if contains_any(
-            &msg,
-            &["big move", "breakout", "volatile", "volatility", "either direction", "move a lot"],
-        ) {
-            "CONVEX_TAIL_LADDER"
-        } else {
-            "BREAKOUT_PROTECTION"
-        };
-
-    let goal = if contains_any(
-        &msg,
-        &["protect", "protection", "hedge", "downside", "dump", "crash", "sell-off", "selldown"],
-    ) {
-        "downside_protection"
-    } else if contains_any(&msg, &["moon", "upside", "rally", "pump", "breaks up", "breakout up"]) {
-        "upside_speculation"
-    } else {
-        "two_sided_breakout"
-    };
-
-    let risk =
-        req.risk_preference.clone().unwrap_or_else(|| infer_risk_preference(&msg).to_string());
-
-    let style = style_from_goal_and_risk(goal, &risk).to_string();
-
-    let budget = req.budget_dusdc.clone().unwrap_or_default();
-
-    let mut missing_fields = Vec::new();
-    if budget.trim().is_empty() {
-        missing_fields.push("budgetDUSDC".to_string());
-    }
-
-    ParsedIntent {
-        ok: missing_fields.is_empty(),
-        intent_id: format!("intent_{}", stable_intent_id(&req.owner, &req.message)),
-        owner: req.owner.clone(),
-        raw_message: req.message.clone(),
-        asset: "BTC".to_string(),
-        goal: goal.to_string(),
-        budget_dusdc: budget,
-        risk_preference: normalize_risk(&risk).to_string(),
-        time_preference: req
-            .time_preference
-            .clone()
-            .unwrap_or_else(|| "nearest_active".to_string()),
-        recommended_strategy: recommended_strategy.to_string(),
-        recommended_style: style,
-        confidence: 0.62,
-        reasoning_summary: reasoning_for_goal(goal).to_string(),
-        missing_fields,
-        warnings: vec![
-            "AI-assisted strategy discovery is not financial advice.".to_string(),
-            "DeepBook Predict integration is testnet-only.".to_string(),
-            "Final premium, payoff, and transaction are produced by deterministic StructX compiler logic."
-                .to_string(),
-        ],
-    }
-}
-
-fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
-    parsed.asset = "BTC".to_string();
-    if !matches!(
-        parsed.recommended_strategy.as_str(),
-        "BREAKOUT_PROTECTION"
-            | "PORTFOLIO_CRASH_SHIELD"
-            | "CONVEX_TAIL_LADDER"
-            | "EXPIRY_MOVE_NOTE"
-            | "MOONSHOT_UPSIDE"
-            | "DOWNSIDE_CONVEXITY"
-            | "DOWNSIDE_STEP_LADDER"
-            | "CENTER_BAND_CONDOR"
-            | "NEAR_BARRIER_PROXY"
-            | "RANGE_CONVICTION"
-            | "SMART_BUDGET_SELECTOR"
-    ) {
-        parsed.recommended_strategy = "BREAKOUT_PROTECTION".to_string();
-    }
-
-    parsed.risk_preference = normalize_risk(&parsed.risk_preference).to_string();
-
-    if !matches!(parsed.time_preference.as_str(), "nearest_active" | "today" | "this_week") {
-        parsed.time_preference = "nearest_active".to_string();
-    }
-
-    if !matches!(parsed.recommended_style.as_str(), "tail-heavy" | "balanced" | "higher-hit-rate") {
-        parsed.recommended_style =
-            style_from_goal_and_risk(&parsed.goal, &parsed.risk_preference).to_string();
-    }
-
-    if parsed.budget_dusdc.trim().is_empty()
-        && !parsed.missing_fields.contains(&"budgetDUSDC".to_string())
-    {
-        parsed.missing_fields.push("budgetDUSDC".to_string());
-    }
-
-    if !parsed
-        .warnings
-        .iter()
-        .any(|warning| warning.to_lowercase().contains("not financial advice"))
-    {
-        parsed.warnings.push("AI-assisted strategy discovery is not financial advice.".to_string());
-    }
-
-    if !parsed.warnings.iter().any(|warning| warning.to_lowercase().contains("testnet")) {
-        parsed.warnings.push("DeepBook Predict integration is testnet-only.".to_string());
-    }
-
-    parsed.ok = parsed.missing_fields.is_empty();
-}
-
-fn contains_any(value: &str, needles: &[&str]) -> bool {
-    needles.iter().any(|needle| value.contains(needle))
-}
-
-fn infer_risk_preference(message: &str) -> &'static str {
-    if contains_any(message, &["safe", "safer", "conservative", "higher probability", "likely"]) {
-        "conservative"
-    } else if contains_any(message, &["aggressive", "max payout", "lottery", "tail", "cheap"]) {
-        "aggressive"
-    } else {
-        "balanced"
-    }
-}
-
-fn normalize_risk(value: &str) -> &'static str {
-    match value {
-        "conservative" => "conservative",
-        "aggressive" => "aggressive",
-        _ => "balanced",
-    }
-}
-
-fn style_from_goal_and_risk(goal: &str, risk: &str) -> &'static str {
-    match (goal, risk) {
-        (_, "conservative") => "higher-hit-rate",
-        (_, "aggressive") => "tail-heavy",
-        ("downside_protection", _) => "tail-heavy",
-        ("upside_speculation", _) => "tail-heavy",
-        ("two_sided_breakout", _) => "balanced",
-        _ => "balanced",
-    }
-}
-
-fn reasoning_for_goal(goal: &str) -> &'static str {
-    match goal {
-        "downside_protection" => {
-            "Breakout Protection is recommended because it can allocate more exposure to downside tail protection while keeping risk defined by the premium."
-        }
-        "upside_speculation" => {
-            "Breakout Protection is recommended for this milestone because Moonshot Upside execution is not yet live, while the breakout structure can still express upside participation."
-        }
-        "two_sided_breakout" => {
-            "Breakout Protection is recommended because the user is expressing a large-move view without requiring a single direction."
-        }
-        _ => "Breakout Protection is recommended as the currently supported defined-risk strategy.",
-    }
-}
-
-fn build_clarifying_question(parsed: &ParsedIntent) -> String {
-    if parsed.missing_fields.iter().any(|field| field == "budgetDUSDC") {
-        "How much dUSDC do you want to allocate?".to_string()
-    } else {
-        "Can you clarify your budget, goal, and preferred time horizon?".to_string()
-    }
-}
-
-fn stable_intent_id(owner: &str, message: &str) -> String {
-    let mut hash: u64 = 0xcbf29ce484222325;
-
-    for byte in owner.bytes().chain(message.bytes()) {
-        hash ^= byte as u64;
-        hash = hash.wrapping_mul(0x100000001b3);
-    }
-
-    format!("{hash:x}")
-}
-
 async fn get_manager_for_address(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
@@ -3559,7 +3488,9 @@ async fn get_manager_for_address(
 }
 
 /// POST /api/managers/:address — persists the given PredictManager id for
-/// this wallet. Body: `{ "managerId": "0x..." }`
+/// this wallet. Body: `{ "managerId": "0x..." }`. Idempotent — re-posting the
+/// same id is a no-op. Re-posting a different id overwrites (we trust the
+/// caller to send the freshly created/discovered manager).
 async fn put_manager_for_address(
     State(state): State<Arc<AppState>>,
     Path(address): Path<String>,
@@ -3583,8 +3514,9 @@ async fn put_manager_for_address(
         let mut map = state.managers.lock().await;
         prior = map.insert(key.clone(), manager_id.clone());
         if let Err(err) = save_managers(&state.managers_path, &map) {
-            // Roll back the in memory insert so the in memory map stays in
-            // sync with what's on disk
+            // Roll back the in-memory insert so the in-memory map stays in
+            // sync with what's on disk (otherwise a restart would lose the
+            // entry and the client would think it was stored).
             match prior {
                 Some(ref old) => {
                     map.insert(key.clone(), old.clone());
@@ -3617,6 +3549,668 @@ async fn put_manager_for_address(
     let body = Json(ManagerLookupResponse { ok: true, address: key, manager_id: Some(manager_id) });
     let headers = [(header::CACHE_CONTROL, "no-store")];
     Ok((headers, body))
+}
+
+async fn refresh_compiled_strategy(
+    _state: &AppState,
+    cached_compiled: &serde_json::Value,
+    owner: &str,
+    slippage_bps: u16,
+    exclude_oracle_ids: &[String],
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    if matches!(
+        cached_compiled.get("selectionMode").and_then(serde_json::Value::as_str),
+        Some("mintable_probe" | "best_effort_scaled" | "preset_filtered")
+    ) {
+        return Ok(cached_compiled.clone());
+    }
+
+    let strategy = cached_compiled
+        .get("strategy")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("BREAKOUT_PROTECTION");
+    let style =
+        cached_compiled.get("style").and_then(serde_json::Value::as_str).unwrap_or("balanced");
+    let budget_raw = cached_compiled
+        .get("budgetRaw")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "cached compiled strategy is missing budgetRaw"
+                }),
+            )
+        })?;
+
+    let mut args = service::CompileStrategyJsonArgs {
+        server_url: env::var("STRUCTX_PREDICT_SERVER_URL")
+            .unwrap_or_else(|_| PREDICT_SERVER_URL.to_string()),
+        predict_id: env::var("STRUCTX_PREDICT_ID")
+            .unwrap_or_else(|_| PREDICT_OBJECT_ID.to_string()),
+        rpc_url: env::var("STRUCTX_RPC_URL")
+            .unwrap_or_else(|_| DEFAULT_SUI_TESTNET_RPC_URL.to_string()),
+        owner: owner.to_string(),
+        strategy: strategy.to_string(),
+        budget_dusdc: dusdc_raw_to_decimal_string(budget_raw),
+        style: style.to_string(),
+        expiry_preference: "nearest_active".to_string(),
+        slippage_bps,
+        bucket_step: DisplayPrice(250.0),
+        custom_k1_price: None,
+        custom_k2_price: None,
+        custom_k3_price: None,
+        custom_k4_price: None,
+        levels_each_side: 4,
+        max_quote_market_attempts: 5,
+        portfolio_exposure_dusdc: 5_000.0,
+        over_hedge_cap_bps: 12_000,
+        convex_gamma_bps: 15_000,
+        dead_zone_bps: 200,
+        moonshot_range_weight_bps: 6_000,
+        moonshot_tail_gamma_bps: 15_000,
+        downside_range_weight_bps: 6_000,
+        downside_tail_gamma_bps: 15_000,
+        upside_near_range_weight_bps: 4_000,
+        upside_upper_range_weight_bps: 3_500,
+        upside_tail_gamma_bps: 15_000,
+        downside_near_range_weight_bps: 4_000,
+        downside_lower_range_weight_bps: 3_500,
+        downside_step_tail_gamma_bps: 15_000,
+        condor_center_weight_bps: 6_000,
+        barrier_side: "up".to_string(),
+        barrier_near_range_weight_bps: 7_000,
+        barrier_tail_gamma_bps: 15_000,
+        exclude_oracle_ids: exclude_oracle_ids.to_vec(),
+    };
+
+    if let Some(advanced) = cached_compiled.get("advanced") {
+        if let Some(value) =
+            advanced.get("portfolioExposureDUSDC").and_then(serde_json::Value::as_f64)
+        {
+            args.portfolio_exposure_dusdc = value;
+        }
+
+        if let Some(value) = advanced.get("overHedgeCapBps").and_then(serde_json::Value::as_u64) {
+            args.over_hedge_cap_bps = value as u16;
+        }
+
+        if let Some(value) = advanced.get("deadZoneBps").and_then(serde_json::Value::as_u64) {
+            args.dead_zone_bps = value as u16;
+        }
+
+        if let Some(value) = advanced.get("convexGammaBps").and_then(serde_json::Value::as_u64) {
+            args.convex_gamma_bps = value as u16;
+        }
+
+        if let Some(value) =
+            advanced.get("moonshotRangeWeightBps").and_then(serde_json::Value::as_u64)
+        {
+            args.moonshot_range_weight_bps = value as u16;
+        }
+
+        if let Some(value) =
+            advanced.get("moonshotTailGammaBps").and_then(serde_json::Value::as_u64)
+        {
+            args.moonshot_tail_gamma_bps = value as u16;
+        }
+
+        if let Some(value) =
+            advanced.get("downsideRangeWeightBps").and_then(serde_json::Value::as_u64)
+        {
+            args.downside_range_weight_bps = value as u16;
+        }
+
+        if let Some(value) =
+            advanced.get("downsideTailGammaBps").and_then(serde_json::Value::as_u64)
+        {
+            args.downside_tail_gamma_bps = value as u16;
+        }
+
+        if let Some(value) =
+            advanced.get("upsideNearRangeWeightBps").and_then(serde_json::Value::as_u64)
+        {
+            args.upside_near_range_weight_bps = value as u16;
+        }
+
+        if let Some(value) =
+            advanced.get("upsideUpperRangeWeightBps").and_then(serde_json::Value::as_u64)
+        {
+            args.upside_upper_range_weight_bps = value as u16;
+        }
+
+        if let Some(value) = advanced.get("upsideTailGammaBps").and_then(serde_json::Value::as_u64)
+        {
+            args.upside_tail_gamma_bps = value as u16;
+        }
+
+        if let Some(value) =
+            advanced.get("downsideNearRangeWeightBps").and_then(serde_json::Value::as_u64)
+        {
+            args.downside_near_range_weight_bps = value as u16;
+        }
+
+        if let Some(value) =
+            advanced.get("downsideLowerRangeWeightBps").and_then(serde_json::Value::as_u64)
+        {
+            args.downside_lower_range_weight_bps = value as u16;
+        }
+
+        if let Some(value) =
+            advanced.get("downsideStepTailGammaBps").and_then(serde_json::Value::as_u64)
+        {
+            args.downside_step_tail_gamma_bps = value as u16;
+        }
+
+        if let Some(value) =
+            advanced.get("condorCenterWeightBps").and_then(serde_json::Value::as_u64)
+        {
+            args.condor_center_weight_bps = value as u16;
+        }
+    }
+
+    service::compile_strategy_json_value(args).await.map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": err.to_string(),
+            }),
+        )
+    })
+}
+
+async fn assert_compiled_plan_mintable(
+    owner: &str,
+    manager_id: &str,
+    compiled: &serde_json::Value,
+    expiry_ms: &str,
+) -> Result<(), (StatusCode, serde_json::Value)> {
+    let plan = compiled_quote_plan(compiled, expiry_ms)?;
+    let rpc =
+        SuiRpcClient::new(DEFAULT_SUI_TESTNET_RPC_URL, Duration::from_secs(20)).map_err(|err| {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("failed to initialize Sui RPC client: {err}")
+                }),
+            )
+        })?;
+
+    let predict = resolve_sui_object(&rpc, PREDICT_OBJECT_ID).await?;
+    let manager = resolve_sui_object(&rpc, manager_id).await?;
+    let oracle = resolve_sui_object(
+        &rpc,
+        compiled.get("oracleId").and_then(serde_json::Value::as_str).unwrap_or_default(),
+    )
+    .await?;
+    let clock = resolve_sui_object(&rpc, CLOCK_OBJECT_ID).await?;
+
+    validate_predict_manager_object(&manager)?;
+    validate_quote_object_refs(&predict, &oracle, &clock)?;
+
+    let tx_kind = build_mint_tx_kind(
+        &plan,
+        MintObjectRefs { predict: &predict, manager: &manager, oracle: &oracle, clock: &clock },
+        owner,
+    )
+    .map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("failed to build mint transaction: {err}")
+            }),
+        )
+    })?;
+
+    let response = rpc
+        .dev_inspect_transaction_kind(&tx_kind.sender, &tx_kind.tx_kind_b64)
+        .await
+        .map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("mint preflight RPC failed: {err}")
+                }),
+            )
+        })?;
+
+    let status = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("status"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown");
+
+    if status != "success" {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": devinspect_failure_summary(&response),
+                "details": response
+            }),
+        ));
+    }
+
+    Ok(())
+}
+
+async fn find_best_effort_mintable_compiled(
+    owner: &str,
+    manager_id: &str,
+    compiled: &serde_json::Value,
+    expiry_ms: &str,
+) -> Result<(serde_json::Value, Vec<String>), (StatusCode, serde_json::Value)> {
+    match assert_compiled_plan_mintable(owner, manager_id, compiled, expiry_ms).await {
+        Ok(()) => return Ok((compiled.clone(), Vec::new())),
+        Err((status, value)) if !is_mintable_ask_failure(&value) => {
+            return Err((status, value));
+        }
+        Err(_) => {}
+    }
+
+    let scale_bps_ladder = [
+        9500u16, 9000, 8500, 8000, 7500, 7000, 6500, 6000, 5500, 5000, 4500, 4000, 3500, 3000,
+        2500, 2000, 1500, 1000, 750, 500, 250, 100, 50, 25, 10, 5, 1,
+    ];
+
+    let mut last_error: Option<(StatusCode, serde_json::Value)> = None;
+
+    for scale_bps in scale_bps_ladder {
+        let adjusted = scale_compiled_quantities(compiled, scale_bps)?;
+
+        match assert_compiled_plan_mintable(owner, manager_id, &adjusted, expiry_ms).await {
+            Ok(()) => {
+                return Ok((
+                    adjusted,
+                    vec![format!(
+                        "Best-effort execution reduced the live mint size to {}% of the previewed quantities so the transaction could pass mintability checks.",
+                        format_bps_percent(scale_bps)
+                    )],
+                ));
+            }
+            Err((status, value)) if is_mintable_ask_failure(&value) => {
+                last_error = Some((status, value));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    if let Some((_, value)) = last_error {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": format!(
+                    "No mintable size was found for this compiled strategy, even after shrinking the live quantities. Last failure: {}",
+                    value
+                        .get("error")
+                        .and_then(serde_json::Value::as_str)
+                        .unwrap_or("unknown mintability error")
+                ),
+                "details": value
+            }),
+        ));
+    }
+
+    Err((
+        StatusCode::BAD_REQUEST,
+        serde_json::json!({
+            "ok": false,
+            "error": "No mintable size was found for this compiled strategy."
+        }),
+    ))
+}
+
+fn compiled_quote_plan(
+    compiled: &serde_json::Value,
+    expiry_ms: &str,
+) -> Result<QuotePlan, (StatusCode, serde_json::Value)> {
+    let oracle_id = compiled
+        .get("oracleId")
+        .and_then(serde_json::Value::as_str)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "ok": false,
+                    "error": "compiled strategy is missing oracleId"
+                }),
+            )
+        })?
+        .to_string();
+
+    let expiry_ms = expiry_ms.parse::<i64>().map_err(|err| {
+        (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": format!("invalid expiryMs in compiled strategy: {err}")
+            }),
+        )
+    })?;
+
+    let legs = compiled.get("legs").and_then(serde_json::Value::as_array).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": "compiled strategy is missing legs"
+            }),
+        )
+    })?;
+
+    let mut calls = Vec::with_capacity(legs.len());
+    let mut max_payout_quantity = 0u64;
+
+    for leg in legs {
+        let kind = leg.get("kind").and_then(serde_json::Value::as_str).unwrap_or("");
+        let quantity = json_u64_string(leg, "quantityRaw")?;
+        max_payout_quantity = max_payout_quantity.max(quantity);
+
+        match kind {
+            "DOWN" => {
+                calls.push(QuoteCall::Binary {
+                    function: QuoteFunction::GetTradeAmounts,
+                    oracle_id: oracle_id.clone(),
+                    expiry_ms,
+                    direction: BinaryDirection::Down,
+                    strike: Strike { raw: json_u64_string(leg, "strikeRaw")? },
+                    quantity,
+                });
+            }
+            "UP" => {
+                calls.push(QuoteCall::Binary {
+                    function: QuoteFunction::GetTradeAmounts,
+                    oracle_id: oracle_id.clone(),
+                    expiry_ms,
+                    direction: BinaryDirection::Up,
+                    strike: Strike { raw: json_u64_string(leg, "strikeRaw")? },
+                    quantity,
+                });
+            }
+            "RANGE" => {
+                calls.push(QuoteCall::Range {
+                    function: QuoteFunction::GetRangeTradeAmounts,
+                    oracle_id: oracle_id.clone(),
+                    expiry_ms,
+                    lower: Strike { raw: json_u64_string(leg, "lowerRaw")? },
+                    upper: Strike { raw: json_u64_string(leg, "upperRaw")? },
+                    quantity,
+                });
+            }
+            other => {
+                return Err((
+                    StatusCode::BAD_REQUEST,
+                    serde_json::json!({
+                        "ok": false,
+                        "error": format!("unsupported compiled leg kind: {other}")
+                    }),
+                ));
+            }
+        }
+    }
+
+    Ok(QuotePlan {
+        target: QuoteTarget::default(),
+        oracle_id,
+        expiry_ms,
+        calls,
+        max_payout_quantity,
+    })
+}
+
+fn json_u64_string(
+    value: &serde_json::Value,
+    key: &str,
+) -> Result<u64, (StatusCode, serde_json::Value)> {
+    value
+        .get(key)
+        .and_then(serde_json::Value::as_str)
+        .ok_or_else(|| {
+            (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("compiled strategy is missing {key}")
+                }),
+            )
+        })?
+        .parse::<u64>()
+        .map_err(|err| {
+            (
+                StatusCode::BAD_REQUEST,
+                serde_json::json!({
+                    "ok": false,
+                    "error": format!("invalid {key}: {err}")
+                }),
+            )
+        })
+}
+
+fn ceil_mul_bps(raw: &str, bps: u16) -> String {
+    let value = raw.parse::<u128>().unwrap_or(0);
+    let multiplier = 10_000u128 + bps as u128;
+
+    let out = value.saturating_mul(multiplier).saturating_add(9_999) / 10_000;
+
+    out.to_string()
+}
+
+fn scale_compiled_quantities(
+    compiled: &serde_json::Value,
+    scale_bps: u16,
+) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    let mut adjusted = compiled.clone();
+    let original_id = compiled
+        .get("compiledStrategyId")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("compiled");
+    let selection_mode = adjusted.as_object_mut().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": "compiled strategy must be a JSON object"
+            }),
+        )
+    })?;
+
+    if let Some(legs) = selection_mode.get_mut("legs").and_then(serde_json::Value::as_array_mut) {
+        for leg in legs {
+            scale_compiled_leg(leg, scale_bps)?;
+        }
+    }
+
+    scale_compiled_amount_field(selection_mode, "budgetRaw", "budgetDisplay", scale_bps);
+    scale_compiled_amount_field(
+        selection_mode,
+        "premiumRequiredRaw",
+        "premiumRequiredDisplay",
+        scale_bps,
+    );
+    scale_compiled_amount_field(selection_mode, "maxLossRaw", "maxLossDisplay", scale_bps);
+    scale_compiled_amount_field(
+        selection_mode,
+        "maxGrossPayoutRaw",
+        "maxGrossPayoutDisplay",
+        scale_bps,
+    );
+    scale_compiled_amount_field(
+        selection_mode,
+        "maxNetPayoutRaw",
+        "maxNetPayoutDisplay",
+        scale_bps,
+    );
+
+    selection_mode.insert(
+        "compiledStrategyId".to_string(),
+        serde_json::Value::String(format!("{original_id}:best_effort_{scale_bps}")),
+    );
+    selection_mode.insert(
+        "selectionMode".to_string(),
+        serde_json::Value::String("best_effort_scaled".to_string()),
+    );
+    selection_mode.insert(
+        "bestEffortScaleBps".to_string(),
+        serde_json::Value::Number(serde_json::Number::from(scale_bps)),
+    );
+
+    Ok(adjusted)
+}
+
+fn scale_compiled_leg(
+    leg: &mut serde_json::Value,
+    scale_bps: u16,
+) -> Result<(), (StatusCode, serde_json::Value)> {
+    let obj = leg.as_object_mut().ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": "compiled leg must be a JSON object"
+            }),
+        )
+    })?;
+
+    let quantity_raw = obj
+        .get("quantityRaw")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    let scaled_quantity = scale_nonzero_u64(quantity_raw, scale_bps);
+    obj.insert("quantityRaw".to_string(), serde_json::Value::String(scaled_quantity.to_string()));
+    obj.insert(
+        "quantityDisplay".to_string(),
+        serde_json::Value::String(scaled_quantity.to_string()),
+    );
+
+    if let Some(premium_raw) = obj
+        .get("premiumRaw")
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        let scaled_premium = scale_nonzero_u64(premium_raw, scale_bps);
+        obj.insert("premiumRaw".to_string(), serde_json::Value::String(scaled_premium.to_string()));
+        obj.insert(
+            "premiumDisplay".to_string(),
+            serde_json::Value::String(format_dusdc_raw(scaled_premium)),
+        );
+    }
+
+    Ok(())
+}
+
+fn scale_compiled_amount_field(
+    compiled: &mut serde_json::Map<String, serde_json::Value>,
+    raw_key: &str,
+    display_key: &str,
+    scale_bps: u16,
+) {
+    let Some(raw_value) = compiled
+        .get(raw_key)
+        .and_then(serde_json::Value::as_str)
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return;
+    };
+
+    let scaled = scale_nonzero_u64(raw_value, scale_bps);
+    compiled.insert(raw_key.to_string(), serde_json::Value::String(scaled.to_string()));
+    compiled.insert(display_key.to_string(), serde_json::Value::String(format_dusdc_raw(scaled)));
+}
+
+fn scale_nonzero_u64(value: u64, scale_bps: u16) -> u64 {
+    if value == 0 {
+        return 0;
+    }
+
+    let scaled = ((value as u128) * (scale_bps as u128)) / 10_000u128;
+    scaled.max(1).min(u64::MAX as u128) as u64
+}
+
+fn is_mintable_ask_failure(value: &serde_json::Value) -> bool {
+    value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(|message| {
+            message.contains("assert_mintable_ask")
+                || message.contains("EAskPriceOutOfBounds")
+                || message.contains("code 7")
+        })
+        .unwrap_or(false)
+}
+
+fn format_bps_percent(scale_bps: u16) -> String {
+    let whole = scale_bps / 100;
+    let frac = scale_bps % 100;
+
+    if frac == 0 {
+        whole.to_string()
+    } else {
+        format!("{whole}.{frac:02}").trim_end_matches('0').trim_end_matches('.').to_string()
+    }
+}
+
+fn compiled_expiry_ms(compiled_strategy_id: &str) -> Option<String> {
+    compiled_strategy_id.split(':').nth(3).map(ToOwned::to_owned)
+}
+
+fn legs_with_max_costs(legs: Vec<serde_json::Value>, slippage_bps: u16) -> Vec<serde_json::Value> {
+    legs.into_iter()
+        .map(|mut leg| {
+            if let Some(obj) = leg.as_object_mut() {
+                let premium_raw =
+                    obj.get("premiumRaw").and_then(serde_json::Value::as_str).unwrap_or("0");
+
+                obj.insert(
+                    "maxCostRaw".to_string(),
+                    serde_json::Value::String(ceil_mul_bps(premium_raw, slippage_bps)),
+                );
+            }
+
+            leg
+        })
+        .collect()
+}
+
+fn format_dusdc_raw(raw: u64) -> String {
+    let whole = raw / 1_000_000;
+    let frac = raw % 1_000_000;
+
+    if frac == 0 {
+        format!("{whole}.00 dUSDC")
+    } else {
+        let mut frac_string = format!("{frac:06}");
+        while frac_string.ends_with('0') {
+            frac_string.pop();
+        }
+        format!("{whole}.{frac_string} dUSDC")
+    }
+}
+
+fn dusdc_raw_to_decimal_string(raw: u64) -> String {
+    let whole = raw / 1_000_000;
+    let frac = raw % 1_000_000;
+
+    if frac == 0 {
+        whole.to_string()
+    } else {
+        let mut frac_string = format!("{frac:06}");
+
+        while frac_string.ends_with('0') {
+            frac_string.pop();
+        }
+
+        format!("{whole}.{frac_string}")
+    }
 }
 
 async fn resolve_sui_object(
@@ -3723,78 +4317,301 @@ fn validate_predict_manager_object(
     Ok(())
 }
 
-async fn run_cli_value(
-    state: &AppState,
-    args: Vec<String>,
-) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
-    match Command::new(&state.cli_bin).args(&args).output().await {
-        Ok(output) => {
-            let code = output.status.code();
-            let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-            let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+fn devinspect_failure_summary(response: &serde_json::Value) -> String {
+    let status_error = response
+        .get("effects")
+        .and_then(|effects| effects.get("status"))
+        .and_then(|status| status.get("error"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown status error");
 
-            if output.status.success() {
-                serde_json::from_str::<serde_json::Value>(&stdout).map_err(|err| {
-                    (
-                        StatusCode::INTERNAL_SERVER_ERROR,
-                        serde_json::json!({
-                            "ok": false,
-                            "code": code,
-                            "stdout": stdout,
-                            "stderr": format!("CLI returned non-JSON stdout: {err}; stderr: {stderr}")
-                        }),
-                    )
-                })
-            } else {
-                Err((
-                    StatusCode::BAD_REQUEST,
-                    serde_json::json!({
-                        "ok": false,
-                        "code": code,
-                        "stdout": stdout,
-                        "stderr": stderr
-                    }),
-                ))
+    let abort_module = response
+        .get("effects")
+        .and_then(|effects| effects.get("abortError"))
+        .and_then(|abort| abort.get("module_id"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown module");
+
+    let abort_function = response
+        .get("effects")
+        .and_then(|effects| effects.get("abortError"))
+        .and_then(|abort| abort.get("function"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unknown function");
+
+    let abort_code = response
+        .get("effects")
+        .and_then(|effects| effects.get("abortError"))
+        .and_then(|abort| abort.get("error_code"))
+        .and_then(serde_json::Value::as_u64)
+        .map(|code| code.to_string())
+        .unwrap_or_else(|| "unknown".to_string());
+
+    format!(
+        "devInspect failed: {status_error}; abort={abort_module}::{abort_function} code {abort_code}"
+    )
+}
+
+fn enrich_mintability_error(
+    mut value: serde_json::Value,
+    attempted_oracle_ids: &[String],
+) -> serde_json::Value {
+    if let Some(obj) = value.as_object_mut() {
+        if let Some(error) = obj.get("error").and_then(serde_json::Value::as_str) {
+            if error.contains("assert_mintable_ask") {
+                let attempted = if attempted_oracle_ids.is_empty() {
+                    "none".to_string()
+                } else {
+                    attempted_oracle_ids.join(", ")
+                };
+
+                obj.insert(
+                    "error".to_string(),
+                    serde_json::Value::String(format!(
+                        "No currently mintable breakout candidate was found. Tried oracle candidates: {attempted}. Last failure: {error}"
+                    )),
+                );
+                obj.insert(
+                    "attemptedOracleIds".to_string(),
+                    serde_json::Value::Array(
+                        attempted_oracle_ids
+                            .iter()
+                            .cloned()
+                            .map(serde_json::Value::String)
+                            .collect(),
+                    ),
+                );
             }
         }
-        Err(err) => Err((
-            StatusCode::INTERNAL_SERVER_ERROR,
-            serde_json::json!({
-                "ok": false,
-                "code": null,
-                "stdout": "",
-                "stderr": format!("failed to run CLI: {err}")
+    }
+
+    value
+}
+
+async fn demo_status(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<DemoStatusRequest>,
+) -> impl IntoResponse {
+    match service::position_service::demo_status_json_value(
+        Some(DEFAULT_SUI_TESTNET_RPC_URL.to_string()),
+        &req.manager_id,
+        &req.sender,
+        std::path::Path::new(&req.from_execution_json),
+        false,
+    )
+    .await
+    {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(CliResponse {
+                ok: true,
+                code: Some(0),
+                stdout: serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string()),
+                stderr: String::new(),
             }),
-        )),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(CliResponse {
+                ok: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: err.to_string(),
+            }),
+        ),
     }
 }
 
-async fn run_cli_json(state: Arc<AppState>, args: Vec<String>) -> impl IntoResponse {
-    match Command::new(&state.cli_bin).args(&args).output().await {
-        Ok(output) => {
-            let code = output.status.code();
-            let ok = output.status.success();
-
-            let body = CliResponse {
-                ok,
-                code,
-                stdout: String::from_utf8_lossy(&output.stdout).to_string(),
-                stderr: String::from_utf8_lossy(&output.stderr).to_string(),
-            };
-
-            let status = if ok { StatusCode::OK } else { StatusCode::BAD_REQUEST };
-
-            (status, Json(body))
-        }
-        Err(err) => {
-            let body = CliResponse {
+async fn manager_balance(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<ManagerBalanceRequest>,
+) -> impl IntoResponse {
+    match service::manager_balance_json_value(
+        DEFAULT_SUI_TESTNET_RPC_URL.to_string(),
+        req.manager_id,
+        "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    )
+    .await
+    {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(CliResponse {
+                ok: true,
+                code: Some(0),
+                stdout: serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string()),
+                stderr: String::new(),
+            }),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(CliResponse {
                 ok: false,
-                code: None,
+                code: Some(1),
                 stdout: String::new(),
-                stderr: format!("failed to run CLI: {err}"),
-            };
+                stderr: err.to_string(),
+            }),
+        ),
+    }
+}
 
-            (StatusCode::INTERNAL_SERVER_ERROR, Json(body))
-        }
+async fn manager_balance_json(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<ManagerBalanceRequest>,
+) -> impl IntoResponse {
+    match service::manager_balance_json_value(
+        DEFAULT_SUI_TESTNET_RPC_URL.to_string(),
+        req.manager_id,
+        "0x0000000000000000000000000000000000000000000000000000000000000000".to_string(),
+    )
+    .await
+    {
+        Ok(value) => (StatusCode::OK, Json(value)),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": err.to_string(),
+            })),
+        ),
+    }
+}
+
+async fn manager_positions(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<ManagerPositionsRequest>,
+) -> impl IntoResponse {
+    match service::position_service::manager_positions_json_value(
+        Some(DEFAULT_SUI_TESTNET_RPC_URL.to_string()),
+        &req.manager_id,
+        std::path::Path::new(&req.from_execution_json),
+        &req.sender,
+        false,
+    )
+    .await
+    {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(CliResponse {
+                ok: true,
+                code: Some(0),
+                stdout: serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string()),
+                stderr: String::new(),
+            }),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(CliResponse {
+                ok: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: err.to_string(),
+            }),
+        ),
+    }
+}
+
+async fn audit_execution(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<AuditExecutionRequest>,
+) -> impl IntoResponse {
+    match service::audit_service::audit_execution_json_value(std::path::Path::new(
+        &req.from_execution_json,
+    )) {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(CliResponse {
+                ok: true,
+                code: Some(0),
+                stdout: serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string()),
+                stderr: String::new(),
+            }),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(CliResponse {
+                ok: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: err.to_string(),
+            }),
+        ),
+    }
+}
+
+async fn devinspect_mint_breakout(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<DevinspectMintBreakoutRequest>,
+) -> impl IntoResponse {
+    match service::devinspect_service::devinspect_mint_breakout_json_value(
+        service::devinspect_service::DevinspectMintBreakoutJsonArgs {
+            server_url: PREDICT_SERVER_URL.to_string(),
+            predict_id: PREDICT_OBJECT_ID.to_string(),
+            rpc_url: DEFAULT_SUI_TESTNET_RPC_URL.to_string(),
+            manager_id: req.manager_id,
+            sender: req.sender,
+            max_total_mint_cost_raw: req.max_total_mint_cost_raw,
+            slippage_bps: req.slippage_bps,
+            max_quote_market_attempts: req.max_quote_market_attempts,
+            write_execute_script: req.write_execute_script,
+        },
+    )
+    .await
+    {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(CliResponse {
+                ok: true,
+                code: Some(0),
+                stdout: serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string()),
+                stderr: String::new(),
+            }),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(CliResponse {
+                ok: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: err.to_string(),
+            }),
+        ),
+    }
+}
+
+async fn devinspect_redeem_breakout(
+    State(_state): State<Arc<AppState>>,
+    Json(req): Json<DevinspectRedeemBreakoutRequest>,
+) -> impl IntoResponse {
+    match service::devinspect_service::devinspect_redeem_breakout_json_value(
+        service::devinspect_service::DevinspectRedeemBreakoutJsonArgs {
+            rpc_url: DEFAULT_SUI_TESTNET_RPC_URL.to_string(),
+            manager_id: req.manager_id,
+            sender: req.sender,
+            from_execution_json: PathBuf::from(req.from_execution_json),
+            auto_size_down: req.auto_size_down,
+            write_execute_script: req.write_execute_script,
+            allow_zero_payout_script: req.allow_zero_payout_script,
+        },
+    )
+    .await
+    {
+        Ok(value) => (
+            StatusCode::OK,
+            Json(CliResponse {
+                ok: true,
+                code: Some(0),
+                stdout: serde_json::to_string_pretty(&value).unwrap_or_else(|_| "{}".to_string()),
+                stderr: String::new(),
+            }),
+        ),
+        Err(err) => (
+            StatusCode::BAD_REQUEST,
+            Json(CliResponse {
+                ok: false,
+                code: Some(1),
+                stdout: String::new(),
+                stderr: err.to_string(),
+            }),
+        ),
     }
 }
