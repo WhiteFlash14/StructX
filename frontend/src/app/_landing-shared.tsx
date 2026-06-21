@@ -161,10 +161,18 @@ html, body {
     scroll-behavior: auto !important;
   }
 }
-.landing :is(button, a, [role="button"], [role="tab"]):focus-visible,
-.landing :is(input, textarea, select):focus-visible {
-  outline: 2px solid var(--sx-teal-dark);
+.landing :is(button, a, [role="button"], [role="tab"], select):focus-visible {
+  outline: 2px solid var(--sx-navy);
   outline-offset: 2px;
+  border-radius: 8px;
+}
+/* Text fields match :focus-visible on a plain mouse click too, so a bright
+   ring fires every time someone clicks in. Keep a quiet, on-brand ring for
+   the bare cases; styled wrappers (search, form controls) suppress it and
+   show the state on the container instead. */
+.landing :is(input, textarea):focus-visible {
+  outline: 2px solid var(--sx-navy);
+  outline-offset: 1px;
   border-radius: 8px;
 }
 
@@ -1299,6 +1307,17 @@ html, body {
   font-weight: 500;
   pointer-events: none;
 }
+/* Themed Select inside a workbench field: match the .wb-input look. */
+.wb-field .sx-select {
+  width: 100%;
+}
+.wb-field .sx-select-trigger {
+  width: 100%;
+  height: 42px;
+  border-radius: 12px;
+  padding: 0 12px 0 14px;
+  font-size: 14px;
+}
 .wb-seg {
   display: grid;
   grid-template-columns: repeat(3, 1fr);
@@ -2292,37 +2311,39 @@ html, body {
 
 /* ===== Strategies toolbar (search + filters + sort) ===== */
 .strategies-toolbar {
+  display: grid;
+  gap: 12px;
+  margin-bottom: 18px;
+}
+.strategies-toolbar-top {
   display: flex;
-  flex-wrap: wrap;
   align-items: center;
-  gap: 10px;
-  margin-bottom: 14px;
-  padding: 8px;
-  background: var(--sx-surface);
-  border: 1px solid var(--sx-border);
-  border-radius: 999px;
+  gap: 12px;
 }
 .strategies-toolbar-search {
   position: relative;
   display: flex;
   align-items: center;
   gap: 10px;
-  height: 36px;
-  padding: 0 14px;
-  background: var(--sx-bg);
+  height: 46px;
+  padding: 0 8px 0 16px;
+  background: var(--sx-surface);
   border: 1px solid var(--sx-border);
-  border-radius: 999px;
+  border-radius: 14px;
   color: var(--sx-navy-muted);
-  flex: 1 1 260px;
+  flex: 1 1 auto;
   min-width: 0;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  transition: border-color 0.15s ease, box-shadow 0.15s ease;
 }
 .strategies-toolbar-search:hover {
   border-color: var(--sx-border-strong);
 }
+/* The container owns the focus state. The inner input's own ring is
+   suppressed below so we never paint the harsh bright outline a text input
+   triggers on plain mouse click. */
 .strategies-toolbar-search:focus-within {
   border-color: var(--sx-navy);
-  background: var(--sx-surface);
+  box-shadow: 0 0 0 4px rgba(16, 40, 74, 0.07);
 }
 .strategies-toolbar-search svg {
   flex: 0 0 auto;
@@ -2333,12 +2354,15 @@ html, body {
   min-width: 0;
   border: 0;
   background: transparent;
-  outline: none;
-  font-size: 13.5px;
+  font-size: 14px;
   color: var(--sx-navy);
   letter-spacing: -0.005em;
   font-family: inherit;
   height: 100%;
+}
+.strategies-toolbar-search input:focus,
+.strategies-toolbar-search input:focus-visible {
+  outline: none;
 }
 .strategies-toolbar-search input::placeholder {
   color: var(--sx-muted);
@@ -2353,42 +2377,45 @@ html, body {
 .strategies-toolbar-clear {
   display: inline-grid;
   place-items: center;
-  width: 22px;
-  height: 22px;
+  width: 28px;
+  height: 28px;
   border: 0;
   border-radius: 999px;
-  background: transparent;
+  background: var(--sx-surface-soft);
   color: var(--sx-muted);
   cursor: pointer;
+  flex: 0 0 auto;
   transition: background 0.15s ease, color 0.15s ease;
 }
 .strategies-toolbar-clear:hover {
-  background: var(--sx-surface-soft);
+  background: var(--sx-blue-soft);
   color: var(--sx-navy);
 }
 .strategies-toolbar-clear:focus-visible {
-  outline: 2px solid rgba(33, 196, 163, 0.55);
+  outline: 2px solid var(--sx-navy);
   outline-offset: 2px;
 }
 
 .strategies-filters {
   display: flex;
   align-items: center;
-  gap: 2px;
-  padding: 4px;
-  background: var(--sx-bg);
+  gap: 4px;
+  padding: 5px;
+  background: var(--sx-surface);
   border: 1px solid var(--sx-border);
-  border-radius: 999px;
-  flex-wrap: wrap;
+  border-radius: 14px;
+  overflow-x: auto;
+  scrollbar-width: none;
 }
+.strategies-filters::-webkit-scrollbar { display: none; }
 .strategies-filter {
   display: inline-flex;
   align-items: center;
   gap: 7px;
-  height: 28px;
-  padding: 0 13px;
+  height: 32px;
+  padding: 0 14px;
   border: 0;
-  border-radius: 999px;
+  border-radius: 10px;
   background: transparent;
   color: var(--sx-navy-muted);
   font-family: inherit;
@@ -2399,6 +2426,7 @@ html, body {
   transition: background 0.13s ease, color 0.13s ease;
   line-height: 1;
   white-space: nowrap;
+  flex: 0 0 auto;
 }
 .strategies-filter:hover {
   color: var(--sx-navy);
@@ -2412,7 +2440,7 @@ html, body {
   background: #1a3057;
 }
 .strategies-filter:focus-visible {
-  outline: 2px solid rgba(33, 196, 163, 0.55);
+  outline: 2px solid var(--sx-navy);
   outline-offset: 2px;
 }
 .strategies-filter-count {
@@ -2441,11 +2469,10 @@ html, body {
 }
 
 .strategies-sort {
-  position: relative;
   display: inline-flex;
   align-items: center;
-  gap: 8px;
-  margin-left: auto;
+  gap: 10px;
+  flex: 0 0 auto;
 }
 .strategies-sort-label {
   font-family: var(--font-plex-mono), ui-monospace, monospace;
@@ -2454,46 +2481,6 @@ html, body {
   letter-spacing: 0.09em;
   color: var(--sx-muted);
   font-weight: 600;
-}
-.strategies-sort-wrap {
-  position: relative;
-  display: inline-flex;
-  align-items: center;
-}
-.strategies-sort-select {
-  appearance: none;
-  -webkit-appearance: none;
-  -moz-appearance: none;
-  height: 36px;
-  padding: 0 34px 0 16px;
-  border: 1px solid var(--sx-border);
-  border-radius: 999px;
-  background: var(--sx-bg);
-  color: var(--sx-navy);
-  font-family: inherit;
-  font-size: 13px;
-  font-weight: 500;
-  letter-spacing: -0.005em;
-  cursor: pointer;
-  outline: none;
-  transition: border-color 0.15s ease, background 0.15s ease;
-}
-.strategies-sort-select:hover {
-  border-color: var(--sx-border-strong);
-  background: var(--sx-surface);
-}
-.strategies-sort-select:focus-visible {
-  outline: 2px solid rgba(33, 196, 163, 0.55);
-  outline-offset: 2px;
-  border-color: transparent;
-}
-.strategies-sort-caret {
-  position: absolute;
-  right: 10px;
-  top: 50%;
-  transform: translateY(-50%);
-  pointer-events: none;
-  color: var(--sx-navy-muted);
 }
 
 /* ===== Strategies result bar (above the grid) ===== */
@@ -3636,8 +3623,15 @@ html, body {
 }
 .normal-control-input input:focus,
 .normal-control-input select:focus {
-  border-color: var(--sx-teal-dark);
-  box-shadow: 0 0 0 3px rgba(33, 196, 163, 0.18);
+  border-color: var(--sx-navy);
+  box-shadow: 0 0 0 3px rgba(16, 40, 74, 0.07);
+}
+.normal-control-input .sx-select { width: 100%; }
+.normal-control-input .sx-select-trigger {
+  height: 44px;
+  border-radius: 12px;
+  padding: 0 12px 0 14px;
+  font-size: 14px;
 }
 .normal-control-input select {
   appearance: none;
@@ -3814,23 +3808,16 @@ html, body {
   .strategies-hero { padding: 24px 22px 28px; }
   .detail-shell { padding: 28px 22px 96px; }
   .strategies-toolbar {
-    flex-direction: column;
-    align-items: stretch;
-    padding: 8px;
+    gap: 10px;
   }
-  .strategies-toolbar-search { flex: 1 1 100%; }
+  .strategies-toolbar-top {
+    flex-wrap: wrap;
+  }
+  .strategies-toolbar-search { flex: 1 1 100%; order: 1; }
+  .strategies-sort { order: 2; margin-left: auto; }
   .strategies-filters {
-    overflow-x: auto;
-    flex-wrap: nowrap;
     -webkit-overflow-scrolling: touch;
-    scrollbar-width: thin;
   }
-  .strategies-sort {
-    margin-left: 0;
-    width: 100%;
-  }
-  .strategies-sort-wrap { flex: 1; }
-  .strategies-sort-select { width: 100%; }
 }
 @media (max-width: 640px) {
   .landing-nav { display: none; }

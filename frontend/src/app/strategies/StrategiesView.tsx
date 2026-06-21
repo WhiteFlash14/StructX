@@ -13,8 +13,15 @@ import {
   type NewAppMode,
 } from "@/components/landing/NewModeToggle";
 import { NormalModeIntentPanel } from "@/components/intent/NormalModeIntentPanel";
+import { Select } from "@/components/ui/Select";
 import { STRATEGY_CATALOG, type StrategyCatalogEntry } from "@/lib/strategyCatalog";
 import type { StrategyId } from "@/types/structx";
+
+const SORT_OPTIONS = [
+  { value: "recommended", label: "Recommended" },
+  { value: "budget", label: "Lowest min size" },
+  { value: "name", label: "A to Z" },
+] as const;
 
 // Filter taxonomy for the Advanced shelf. Each filter maps to a predicate
 // over the catalog entry. We reuse the existing `categories` metadata and
@@ -434,40 +441,56 @@ export function StrategiesView() {
         ) : (
           <section className="section strategies-grid-section">
             <div className="strategies-toolbar" role="region" aria-label="Filter strategies">
-              <div className="strategies-toolbar-search">
-                <svg
-                  width="16"
-                  height="16"
-                  viewBox="0 0 24 24"
-                  fill="none"
-                  stroke="currentColor"
-                  strokeWidth="1.7"
-                  strokeLinecap="round"
-                  strokeLinejoin="round"
-                  aria-hidden
-                >
-                  <circle cx="11" cy="11" r="7" />
-                  <path d="M16.4 16.4L21 21" />
-                </svg>
-                <input
-                  type="search"
-                  value={query}
-                  onChange={(e) => setQuery(e.target.value)}
-                  placeholder="Search strategies, e.g. crash, breakout, range"
-                  aria-label="Search strategies"
-                />
-                {query && (
-                  <button
-                    type="button"
-                    className="strategies-toolbar-clear"
-                    onClick={() => setQuery("")}
-                    aria-label="Clear search"
+              <div className="strategies-toolbar-top">
+                <div className="strategies-toolbar-search">
+                  <svg
+                    width="16"
+                    height="16"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    strokeWidth="1.7"
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    aria-hidden
                   >
-                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
-                      <path d="M6 6l12 12M18 6L6 18" />
-                    </svg>
-                  </button>
-                )}
+                    <circle cx="11" cy="11" r="7" />
+                    <path d="M16.4 16.4L21 21" />
+                  </svg>
+                  <input
+                    type="search"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search strategies, e.g. crash, breakout, range"
+                    aria-label="Search strategies"
+                  />
+                  {query && (
+                    <button
+                      type="button"
+                      className="strategies-toolbar-clear"
+                      onClick={() => setQuery("")}
+                      aria-label="Clear search"
+                    >
+                      <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+                        <path d="M6 6l12 12M18 6L6 18" />
+                      </svg>
+                    </button>
+                  )}
+                </div>
+
+                <div className="strategies-sort">
+                  <span className="strategies-sort-label" id="strategies-sort-label">
+                    Sort
+                  </span>
+                  <Select
+                    value={sort}
+                    onChange={(v) => setSort(v as SortKey)}
+                    options={SORT_OPTIONS.map((o) => ({ value: o.value, label: o.label }))}
+                    ariaLabel="Sort strategies"
+                    align="end"
+                    size="sm"
+                  />
+                </div>
               </div>
 
               <div className="strategies-filters" role="tablist" aria-label="Strategy categories">
@@ -484,38 +507,6 @@ export function StrategiesView() {
                     <span className="strategies-filter-count">{counts[s.id]}</span>
                   </button>
                 ))}
-              </div>
-
-              <div className="strategies-sort">
-                <label htmlFor="strategies-sort-select" className="strategies-sort-label">
-                  Sort
-                </label>
-                <div className="strategies-sort-wrap">
-                  <select
-                    id="strategies-sort-select"
-                    className="strategies-sort-select"
-                    value={sort}
-                    onChange={(e) => setSort(e.target.value as SortKey)}
-                  >
-                    <option value="recommended">Recommended</option>
-                    <option value="budget">Lowest min size</option>
-                    <option value="name">A to Z</option>
-                  </select>
-                  <svg
-                    className="strategies-sort-caret"
-                    width="12"
-                    height="12"
-                    viewBox="0 0 24 24"
-                    fill="none"
-                    stroke="currentColor"
-                    strokeWidth="2"
-                    strokeLinecap="round"
-                    strokeLinejoin="round"
-                    aria-hidden
-                  >
-                    <path d="M6 9l6 6 6-6" />
-                  </svg>
-                </div>
               </div>
             </div>
 

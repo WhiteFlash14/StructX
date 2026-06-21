@@ -28,6 +28,7 @@ import {
   fetchWalletDusdcBalance,
   requiredManagerReserveRaw,
 } from "@/lib/tx";
+import { Select } from "@/components/ui/Select";
 
 type QuickPrompt = {
   label: string;
@@ -585,17 +586,19 @@ export function NormalModeIntentPanel() {
           <label className="normal-control">
             <span className="normal-control-label">Risk</span>
             <div className="normal-control-input">
-              <select
+              <Select
                 value={riskStyle}
-                onChange={(e) => setRiskStyle(e.target.value as RiskStyle)}
-                aria-label="Risk style"
-              >
-                <option value="conservative">Conservative</option>
-                <option value="balanced">Balanced</option>
-                <option value="aggressive">Aggressive</option>
-                <option value="tail_heavy">Tail heavy</option>
-                <option value="higher_hit_rate">Higher hit rate</option>
-              </select>
+                onChange={(v) => setRiskStyle(v as RiskStyle)}
+                options={[
+                  { value: "conservative", label: "Conservative" },
+                  { value: "balanced", label: "Balanced" },
+                  { value: "aggressive", label: "Aggressive" },
+                  { value: "tail_heavy", label: "Tail heavy" },
+                  { value: "higher_hit_rate", label: "Higher hit rate" },
+                ]}
+                ariaLabel="Risk style"
+                fullWidth
+              />
             </div>
           </label>
 

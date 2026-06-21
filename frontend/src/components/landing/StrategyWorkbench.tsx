@@ -36,6 +36,7 @@ import {
   requiredManagerReserveRaw,
 } from "@/lib/tx";
 import { WorkbenchPreviewSkeleton } from "@/components/landing/WorkbenchPreviewSkeleton";
+import { Select } from "@/components/ui/Select";
 import type {
   AuditResponse,
   CompileResponse,
@@ -1727,20 +1728,17 @@ export function StrategyWorkbench({
             {strategyId === "NEAR_BARRIER_PROXY" && (
               <div className="wb-grid-3">
                 <div className="wb-field">
-                  <label className="wb-label" htmlFor="wb-barrier-side">
-                    Barrier side
-                  </label>
-                  <div className="wb-input-wrap">
-                    <select
-                      id="wb-barrier-side"
-                      className="wb-input"
-                      value={barrierSide}
-                      onChange={(e) => setBarrierSide(e.target.value as "up" | "down")}
-                    >
-                      <option value="up">Up barrier</option>
-                      <option value="down">Down barrier</option>
-                    </select>
-                  </div>
+                  <span className="wb-label">Barrier side</span>
+                  <Select
+                    ariaLabel="Barrier side"
+                    value={barrierSide}
+                    onChange={(v) => setBarrierSide(v as "up" | "down")}
+                    options={[
+                      { value: "up", label: "Up barrier" },
+                      { value: "down", label: "Down barrier" },
+                    ]}
+                    fullWidth
+                  />
                 </div>
                 <div className="wb-field">
                   <label className="wb-label" htmlFor="wb-barrier-near">
