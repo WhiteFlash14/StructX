@@ -1,5 +1,5 @@
 <div align="center">
-  <img src="frontend/public/structx_x_logo_transparent_1x1.png" alt="StructX" width="720" />
+  <img src="frontend/public/structx-logo.png" alt="StructX" width="720" />
 
   <h3>Turn a market view into a defined risk BTC payoff.</h3>
 
@@ -220,7 +220,7 @@ The API listens on `http://127.0.0.1:8787` by default.
 Open a second terminal:
 
 ```bash
-cd tp-main/frontend
+cd frontend/
 npm ci
 npm run dev
 ```
