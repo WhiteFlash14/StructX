@@ -652,14 +652,6 @@ pub struct NearBarrierProxyInput {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RangeConvictionInput {
-    pub budget_raw: u64,
-    pub lower_raw: u64,
-    pub upper_raw: u64,
-    pub range_ask_raw: u64,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ConvexTailLadderInput {
     pub spot_raw: u64,
     pub budget_raw: u64,
@@ -817,48 +809,6 @@ pub fn compile_expiry_move_note(
 
     result.warnings.push(
         "Expiry Move Note is a terminal-settlement product. It does not pay for realized volatility, intraperiod touches, or path-dependent moves."
-            .to_string(),
-    );
-
-    Ok(result)
-}
-
-pub fn compile_range_conviction(
-    input: RangeConvictionInput,
-) -> Result<AdvancedCompileResult, AdvancedStrategyError> {
-    if input.lower_raw >= input.upper_raw {
-        return Err(AdvancedStrategyError::InvalidInput(
-            "range conviction requires lower < upper".to_string(),
-        ));
-    }
-
-    let midpoint_raw = midpoint(input.lower_raw, input.upper_raw)?;
-
-    let leg = AdvancedLegInput {
-        kind: AdvancedLegKind::Range,
-        role: "central_range_conviction",
-        strike_raw: None,
-        lower_raw: Some(input.lower_raw),
-        upper_raw: Some(input.upper_raw),
-        midpoint_raw,
-        ask_price_raw: input.range_ask_raw,
-        base_weight_e6: 1_000_000,
-        max_quantity: None,
-    };
-
-    let mut result = allocate_weighted_budget(
-        AdvancedStrategyKind::RangeConviction,
-        input.budget_raw,
-        vec![leg],
-    )?;
-
-    result.warnings.push(
-        "Range Conviction pays only if BTC settles inside the selected terminal range. It does not pay for staying inside the range during the period."
-            .to_string(),
-    );
-
-    result.warnings.push(
-        "This is a concentrated one-range payoff. It can expire worthless if BTC settles outside the corridor."
             .to_string(),
     );
 
@@ -1722,25 +1672,6 @@ mod tests {
     }
 
     #[test]
-    fn range_conviction_allocates_single_range() {
-        let input = RangeConvictionInput {
-            budget_raw: 50_000_000,
-            lower_raw: 98_000_000_000_000,
-            upper_raw: 102_000_000_000_000,
-            range_ask_raw: 125_000_000,
-        };
-
-        let result = compile_range_conviction(input).unwrap();
-
-        assert_eq!(result.strategy, AdvancedStrategyKind::RangeConviction);
-        assert_eq!(result.legs.len(), 1);
-        assert_eq!(result.legs[0].role, "central_range_conviction");
-        assert_eq!(result.legs[0].kind, AdvancedLegKind::Range);
-        assert!(result.used_budget_raw <= input.budget_raw);
-        assert!(result.legs[0].quantity > 0);
-    }
-
-    #[test]
     fn downside_convexity_allocates_range_and_tail() {
         let input = DownsideConvexityInput {
             spot_raw: 100_000_000_000_000,
@@ -1762,6 +1693,23 @@ mod tests {
         assert!(result.legs.iter().any(|leg| leg.role == "downside_breakdown_zone"));
 
         assert!(result.legs.iter().any(|leg| leg.role == "crash_tail"));
+    }
+
+    #[test]
+    fn downside_convexity_rejects_k1_ge_k2() {
+        let input = DownsideConvexityInput {
+            spot_raw: 100_000_000_000_000,
+            budget_raw: 100_000_000,
+            k1_raw: 98_000_000_000_000,
+            k2_raw: 95_000_000_000_000,
+            down_tail_ask_raw: 70_000_000,
+            lower_range_ask_raw: 120_000_000,
+            range_weight_bps: 6_000,
+            tail_gamma_bps: 15_000,
+        };
+
+        let err = compile_downside_convexity(input).unwrap_err();
+        assert!(matches!(err, AdvancedStrategyError::InvalidInput(_)));
     }
 
     #[test]

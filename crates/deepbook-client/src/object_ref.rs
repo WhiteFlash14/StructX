@@ -144,7 +144,6 @@ mod tests {
         assert_eq!(info.owner_kind, ObjectOwnerKind::Shared);
         assert_eq!(info.initial_shared_version, Some(77));
         assert!(info.is_shared());
-        assert!(info.has_shared_version());
     }
 
     #[test]

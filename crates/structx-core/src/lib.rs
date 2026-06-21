@@ -2,12 +2,12 @@ pub use advanced_strategies::{
     allocate_weighted_budget, compile_center_band_condor, compile_convex_tail_ladder,
     compile_downside_convexity, compile_downside_step_ladder, compile_expiry_move_note,
     compile_moonshot_upside, compile_near_barrier_proxy, compile_portfolio_crash_shield,
-    compile_range_conviction, compile_upside_step_ladder, score_smart_candidate,
+    compile_upside_step_ladder, score_smart_candidate,
     AdvancedCompileResult, AdvancedCompiledLeg, AdvancedLegInput, AdvancedLegKind,
     AdvancedStrategyError, AdvancedStrategyKind, BarrierSide, CenterBandCondorInput,
     ConvexTailLadderInput, DownsideConvexityInput, DownsideStepLadderInput, ExpiryMoveNoteInput,
-    MoonshotUpsideInput, NearBarrierProxyInput, PortfolioCrashShieldInput, RangeConvictionInput,
-    SmartBudgetStyle, SmartCandidateMetrics, SmartCandidateScore, UpsideStepLadderInput,
+    MoonshotUpsideInput, NearBarrierProxyInput, PortfolioCrashShieldInput, SmartBudgetStyle,
+    SmartCandidateMetrics, SmartCandidateScore, UpsideStepLadderInput,
 };
 pub mod advanced_strategies;
 pub use breakout_optimizer::{
@@ -36,8 +36,9 @@ pub use quote_plan::{
 pub use quote_preview::{format_quote_amount, QuoteAssetDisplay, QuotePreview, QuotePreviewLeg};
 pub use quote_tx::{
     build_create_manager_tx_kind, build_manager_balance_tx_kind, build_manager_positions_tx_kind,
-    build_mint_tx_kind, build_quote_tx_kind, build_redeem_precheck_tx_kind, build_redeem_tx_kind,
-    ManagerPositionRead, MintObjectRefs, QuoteObjectRefs, QuoteTxBuildError, QuoteTxKind,
+    build_mint_tx_kind, build_quote_tx_kind, build_redeem_debug_tx_kind,
+    build_redeem_precheck_tx_kind, build_redeem_tx_kind, ManagerPositionRead, MintObjectRefs,
+    QuoteObjectRefs, QuoteTxBuildError, QuoteTxKind,
 };
 pub use selector::{
     select_best_market, select_candidate_markets, MarketSelectionError, SelectedMarket,

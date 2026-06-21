@@ -46,7 +46,10 @@ pub fn select_candidate_markets<'a>(
     candidates.sort_by(|a, b| {
         market_status_rank(&a.market.structx_status)
             .cmp(&market_status_rank(&b.market.structx_status))
-            .then_with(|| a.expiry.cmp(&b.expiry))
+            // For executable strategy flows, prefer farther future expiries over
+            // markets that are close to expiry because near-expiry markets are
+            // more prone to pricing and mintability failures.
+            .then_with(|| b.expiry.cmp(&a.expiry))
     });
 
     candidates
@@ -152,7 +155,7 @@ mod tests {
     }
 
     #[test]
-    fn selects_earliest_usable_market() {
+    fn selects_farthest_usable_market() {
         let markets = vec![
             market("0xlate", Duration::hours(2), StructxMarketStatus::Usable),
             market("0xsoon", Duration::hours(1), StructxMarketStatus::Usable),
@@ -160,7 +163,7 @@ mod tests {
 
         let selected = select_best_market(&markets, PriceScale::E9).expect("market selected");
 
-        assert_eq!(selected.oracle_id, "0xsoon");
+        assert_eq!(selected.oracle_id, "0xlate");
     }
 
     #[test]
