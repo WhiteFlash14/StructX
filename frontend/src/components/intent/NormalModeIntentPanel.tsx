@@ -4,6 +4,7 @@ import {
   useCurrentAccount,
   useSignAndExecuteTransaction,
   useSuiClient,
+  useSuiClientContext,
 } from "@mysten/dapp-kit";
 import { useEffect, useState } from "react";
 
@@ -17,15 +18,19 @@ import {
   invalidateManagerBalance,
   planFromIntent,
   quoteIntentPlan,
+  saveStoredManager,
   type AuditIntentExecutionResponse,
+  type CompiledProposalLeg,
   type ExecutionProposal,
   type IntentExecutePlanResponse,
   type IntentPlanningResponse,
   type RiskStyle,
 } from "@/lib/api";
 import {
+  buildCreateManagerTransaction,
   buildDepositAndOpenStrategyTransaction,
   fetchWalletDusdcBalance,
+  PREDICT_MANAGER_TYPE,
   requiredManagerReserveRaw,
 } from "@/lib/tx";
 import { Select } from "@/components/ui/Select";
@@ -106,6 +111,7 @@ function QuickPromptIcon({ tone }: { tone: QuickPrompt["tone"] }) {
 export function NormalModeIntentPanel() {
   const account = useCurrentAccount();
   const suiClient = useSuiClient();
+  const suiContext = useSuiClientContext();
   const { mutateAsync: signAndExecuteTransaction } = useSignAndExecuteTransaction();
   const [prompt, setPrompt] = useState<string>(QUICK_PROMPTS[0].prompt);
   const [budgetDusdc, setBudgetDusdc] = useState("100");
@@ -115,6 +121,10 @@ export function NormalModeIntentPanel() {
   const [executePlan, setExecutePlan] = useState<IntentExecutePlanResponse | null>(null);
   const [auditResult, setAuditResult] = useState<AuditIntentExecutionResponse | null>(null);
   const [managerId, setManagerId] = useState<string | null>(null);
+  const [managerStatus, setManagerStatus] = useState<
+    "idle" | "checking" | "ready" | "creating" | "error"
+  >("idle");
+  const [managerError, setManagerError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -122,19 +132,41 @@ export function NormalModeIntentPanel() {
     let cancelled = false;
 
     async function loadManager() {
+      setResponse(null);
+      setProposal(null);
+      setExecutePlan(null);
+      setAuditResult(null);
+      setError(null);
+      setManagerError(null);
+
       if (!account?.address) {
         setManagerId(null);
         return;
       }
 
+      setManagerId(null);
+      setManagerStatus("checking");
+
+
       try {
-        const stored = await getStoredManager(account.address);
+        const network = suiContext.network ?? "testnet";
+        const storageKey = `structx:manager:${network}:${account.address.toLowerCase()}`;
+        let cached: string | null = null;
+        try {
+          cached = window.localStorage.getItem(storageKey);
+        } catch {
+          cached = null;
+        }
+
+        const stored = cached ?? (await getStoredManager(account.address));
         if (!cancelled) {
           setManagerId(stored);
+          setManagerStatus(stored ? "ready" : "idle");
         }
       } catch {
         if (!cancelled) {
           setManagerId(null);
+          setManagerStatus("idle");
         }
       }
     }
@@ -144,8 +176,156 @@ export function NormalModeIntentPanel() {
     return () => {
       cancelled = true;
     };
-  }, [account?.address]);
+ }, [account?.address, suiContext.network]);
 
+  async function findHistoricalManagerIds(address: string): Promise<string[]> {
+    const ids = new Set<string>();
+    let cursor: string | null | undefined = null;
+
+    for (let pageIndex = 0; pageIndex < 4; pageIndex += 1) {
+      const page = await suiClient.queryTransactionBlocks({
+        filter: { FromAddress: address },
+        options: { showObjectChanges: true },
+        limit: 50,
+        cursor,
+        order: "descending",
+      });
+
+      for (const tx of page.data) {
+        for (const change of tx.objectChanges ?? []) {
+          if (
+            change.type === "created" &&
+            change.objectType === PREDICT_MANAGER_TYPE &&
+            typeof change.objectId === "string"
+          ) {
+            ids.add(change.objectId);
+          }
+        }
+      }
+
+      if (!page.hasNextPage || !page.nextCursor) break;
+      cursor = page.nextCursor;
+    }
+
+    return Array.from(ids);
+  }
+
+  function persistManager(address: string, id: string) {
+    const network = suiContext.network ?? "testnet";
+    try {
+      window.localStorage.setItem(
+        `structx:manager:${network}:${address.toLowerCase()}`,
+        id,
+      );
+    } catch {
+      // The backend mapping still keeps the manager available when browser
+      // storage is disabled.
+    }
+    void saveStoredManager(address, id);
+    setManagerId(id);
+    setManagerStatus("ready");
+    setManagerError(null);
+  }
+
+  async function ensurePredictManager(address: string): Promise<string> {
+    if (managerId) {
+      invalidateManagerBalance(managerId);
+      const current = await getManagerBalance(managerId);
+      if (current.ok && current.balanceRaw !== undefined) {
+        return managerId;
+      }
+    }
+
+    if ((suiContext.network ?? "testnet") !== "testnet") {
+      throw new Error("Switch your wallet to Sui Testnet before opening a position.");
+    }
+
+    setManagerStatus("checking");
+    setManagerError(null);
+
+    const candidates = new Set<string>();
+    const storageKey = `structx:manager:testnet:${address.toLowerCase()}`;
+    try {
+      const cached = window.localStorage.getItem(storageKey);
+      if (cached?.startsWith("0x")) candidates.add(cached);
+    } catch {
+      // Continue with backend and on-chain discovery.
+    }
+
+    const stored = await getStoredManager(address);
+    if (stored?.startsWith("0x")) candidates.add(stored);
+
+    try {
+      for (const id of await findHistoricalManagerIds(address)) {
+        candidates.add(id);
+      }
+    } catch {
+      // A temporary history lookup failure should not block manager creation.
+    }
+
+    const validManagers: Array<{ id: string; balanceRaw: bigint }> = [];
+    for (const id of candidates) {
+      invalidateManagerBalance(id);
+      try {
+        const balance = await getManagerBalance(id);
+        if (balance.ok && balance.balanceRaw !== undefined) {
+          validManagers.push({ id, balanceRaw: BigInt(balance.balanceRaw) });
+        }
+      } catch {
+        // Ignore stale manager ids and continue checking the other candidates.
+      }
+    }
+
+    if (validManagers.length > 0) {
+      validManagers.sort((left, right) =>
+        left.balanceRaw === right.balanceRaw
+          ? 0
+          : left.balanceRaw > right.balanceRaw
+            ? -1
+            : 1,
+      );
+      const selected = validManagers[0].id;
+      persistManager(address, selected);
+      return selected;
+    }
+
+    setManagerStatus("creating");
+    const createTx = buildCreateManagerTransaction(address);
+    const execution = await signAndExecuteTransaction({
+      transaction: createTx,
+      chain: "sui:testnet",
+    });
+    const confirmed = await suiClient.waitForTransaction({
+      digest: execution.digest,
+      options: { showEffects: true, showObjectChanges: true },
+    });
+
+    if (confirmed.effects?.status?.status !== "success") {
+      throw new Error(
+        confirmed.effects?.status?.error ?? "PredictManager creation failed.",
+      );
+    }
+
+    const created = (confirmed.objectChanges ?? []).find(
+      (change) =>
+        change.type === "created" &&
+        typeof change.objectType === "string" &&
+        change.objectType === PREDICT_MANAGER_TYPE,
+    );
+    const createdId =
+      created && "objectId" in created && typeof created.objectId === "string"
+        ? created.objectId
+        : null;
+
+    if (!createdId) {
+      throw new Error(
+        "The manager transaction succeeded, but its new object id was missing from the Sui response.",
+      );
+    }
+
+    persistManager(address, createdId);
+    return createdId;
+  }
   async function handlePlan() {
     setLoading(true);
     setError(null);
@@ -156,6 +336,12 @@ export function NormalModeIntentPanel() {
 
     try {
       const budget = Number(budgetDusdc);
+      if (!Number.isFinite(budget) || budget <= 0) {
+        throw new Error("Enter a dUSDC budget greater than zero.");
+      }
+      if (budget * 1_000_000_000 > Number.MAX_SAFE_INTEGER) {
+        throw new Error("This budget is too large to process safely.");
+      }
       const result = await planFromIntent({
         userAddress: account?.address,
         prompt,
@@ -277,12 +463,6 @@ export function NormalModeIntentPanel() {
       return;
     }
 
-    if (!managerId) {
-      setError(
-        "No stored PredictManager found for this wallet yet. Create or link a manager in the app workspace first.",
-      );
-      return;
-    }
 
     const compiledStrategyId = executePlan.compiled_strategy_id;
     if (!compiledStrategyId) {
@@ -295,16 +475,31 @@ export function NormalModeIntentPanel() {
     setAuditResult(null);
 
     try {
+      let activeManagerId: string;
+      try {
+        activeManagerId = await ensurePredictManager(account.address);
+      } catch (managerSetupError) {
+        const message =
+          managerSetupError instanceof Error
+            ? managerSetupError.message
+            : String(managerSetupError);
+        setManagerStatus("error");
+        setManagerError(message);
+        throw managerSetupError;
+      }
+
+      setManagerStatus("ready");
+      setManagerError(null);
       const build = await buildOpenStrategy({
         owner: account.address,
-        managerId,
+        managerId:activeManagerId,
         compiledStrategyId,
         maxPremiumRaw: String(executePlan.proposal.total_premium || 0),
         slippageBps: 300,
       });
 
-      invalidateManagerBalance(managerId);
-      const balance = await getManagerBalance(managerId);
+      invalidateManagerBalance(activeManagerId);
+      const balance = await getManagerBalance(activeManagerId);
       if (!balance.ok || balance.balanceRaw === undefined) {
         throw new Error(
           balance.error ?? "Could not read the latest PredictManager balance.",
@@ -366,7 +561,7 @@ export function NormalModeIntentPanel() {
         proposalId: executePlan.proposal_id,
         txDigest: execution.digest,
         userAddress: account.address,
-        managerId,
+        managerId:activeManagerId,
         executionResult: {
           digest: execution.digest,
           effects: confirmed.effects ?? {},
@@ -400,6 +595,42 @@ export function NormalModeIntentPanel() {
   function formatBudgetDisplay(raw?: number | null) {
     if (raw == null) return "Unavailable";
     return `${raw / 1_000_000_000} dUSDC`;
+  }
+
+  function formatBtcPrice(raw?: number | null) {
+    if (raw == null) return null;
+    return `$${raw.toLocaleString(undefined, { maximumFractionDigits: 2 })}`;
+  }
+
+  function humanizeLegKind(kind: string) {
+    switch (kind.toUpperCase()) {
+      case "RANGE":
+        return "Range leg";
+      case "UP":
+        return "Up leg";
+      case "DOWN":
+        return "Down leg";
+      default:
+        return `${kind.replaceAll("_", " ")} leg`;
+    }
+  }
+
+  function legSettlementCondition(leg: CompiledProposalLeg) {
+    const kind = leg.kind.toUpperCase();
+    const strike = formatBtcPrice(leg.strike);
+    const lower = formatBtcPrice(leg.lower);
+    const upper = formatBtcPrice(leg.upper);
+
+    if (kind === "RANGE" && lower && upper) {
+      return `Pays when BTC settles above ${lower} and at or below ${upper}`;
+    }
+    if (kind === "UP" && strike) {
+      return `Pays when BTC settles at or above ${strike}`;
+    }
+    if (kind === "DOWN" && strike) {
+      return `Pays when BTC settles at or below ${strike}`;
+    }
+    return "Its result is determined by BTC's final price at expiry";
   }
 
   function humanizeTemplate(value: string) {
@@ -784,27 +1015,35 @@ export function NormalModeIntentPanel() {
 
                   <div className="normal-stats">
                     <div className="normal-stat">
-                      <span>Premium</span>
+                      <span>Premium. The total cost of opening every leg.</span>
                       <strong>{formatDusdcMicro(proposal.total_premium)}</strong>
                     </div>
                     <div className="normal-stat">
-                      <span>Max loss</span>
+                      <span>Max loss. The most this strategy can lose.</span>
                       <strong>{formatDusdcMicro(proposal.max_loss)}</strong>
                     </div>
                     <div className="normal-stat">
-                      <span>Best-case payout</span>
+                      <span>
+                        Best-case payout. The largest gross amount returned at expiry.
+                      </span>
                       <strong>{formatDusdcMicro(proposal.max_payout)}</strong>
                     </div>
                   </div>
 
                   <div className="normal-card">
                     <div className="normal-card-eyebrow">Legs</div>
+                     <p className="normal-reason">
+                      A leg is one on-chain Predict position inside the strategy.
+                      Its position size is the gross dUSDC returned when that leg wins.
+                    </p>
                     <div className="normal-stats">
                       {proposal.legs.map((leg, idx) => (
                         <div key={`${leg.kind}-${idx}`} className="normal-stat">
-                          <span>{leg.label ?? leg.kind}</span>
+                           <span>
+                            {humanizeLegKind(leg.kind)}. {legSettlementCondition(leg)}.
+                          </span>
                           <strong>
-                            exposure {formatDusdcMicro(leg.quantity)}
+                            Position size {formatDusdcMicro(leg.quantity)}
                           </strong>
                         </div>
                       ))}
@@ -813,7 +1052,12 @@ export function NormalModeIntentPanel() {
 
                   {proposal.payoff_table.length > 0 && (
                     <div className="normal-card">
-                      <div className="normal-card-eyebrow">Payoff</div>
+                      <div className="normal-card-eyebrow">Result at expiry</div>
+                      <p className="normal-reason">
+                        Each value is the net result after subtracting the full
+                        strategy premium. A positive amount is profit, while a
+                        negative amount is loss.
+                      </p>
                       <div className="normal-stats">
                         {proposal.payoff_table.map((row, idx) => (
                           <div key={`${row.label}-${idx}`} className="normal-stat">
@@ -839,8 +1083,17 @@ export function NormalModeIntentPanel() {
                     <p className="normal-reason">
                       {managerId
                         ? `PredictManager ready: ${managerId}`
-                        : "Connect or create a PredictManager for this wallet before opening."}
+                        : managerStatus === "checking"
+                          ? "StructX is checking this wallet for an existing PredictManager."
+                          : managerStatus === "creating"
+                            ? "Approve the wallet request to create your PredictManager."
+                            : account?.address
+                              ? "When you open the position, StructX will find your PredictManager or ask your wallet to create one."
+                              : "Connect your Sui Testnet wallet before opening the position."}
                     </p>
+                    {managerError && (
+                      <p className="normal-reason">Manager setup: {managerError}</p>
+                    )}
                     <p className="normal-reason">
                       Quotes expire quickly. If this one goes stale, StructX will refresh it before
                       preparing the wallet transaction.
@@ -859,10 +1112,14 @@ export function NormalModeIntentPanel() {
                         <button
                           type="button"
                           className="normal-cta"
-                          disabled={loading || !managerId}
+                          disabled={loading}
                           onClick={() => void handleSignAndExecute()}
                         >
-                          {loading ? "Waiting for wallet..." : "Review and open position"}
+                          {loading
+                            ? managerStatus === "creating"
+                              ? "Creating your manager..."
+                              : "Waiting for wallet..."
+                            : "Review and open position"}
                         </button>
                       )}
                     </div>
