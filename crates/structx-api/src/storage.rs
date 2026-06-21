@@ -3,6 +3,7 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use serde::{de::DeserializeOwned, Serialize};
+use sha2::{Digest, Sha256};
 
 pub fn state_root() -> PathBuf {
     std::env::var("STRUCTX_STATE_DIR")
@@ -35,17 +36,35 @@ pub fn btc_markets_cache_path() -> PathBuf {
 }
 
 pub fn positions_path(owner: &str, manager_id: &str) -> PathBuf {
-    let owner = owner.to_lowercase();
-    let manager = manager_id.to_lowercase();
+    let owner = safe_component(owner);
+    let manager = safe_component(manager_id);
     positions_dir().join(owner).join(format!("{manager}.positions.json"))
 }
 
 pub fn audit_record_path(digest: &str) -> PathBuf {
-    audits_dir().join(format!("{digest}.record.json"))
+    audits_dir().join(format!("{}.record.json", safe_component(digest)))
 }
 
 pub fn redeem_record_path(digest: &str) -> PathBuf {
-    redeems_dir().join(format!("{digest}.redeem.json"))
+    redeems_dir().join(format!("{}.redeem.json", safe_component(digest)))
+}
+
+/// Keep user-controlled identifiers inside the configured state directory.
+/// Normal Sui addresses, digests, and generated IDs retain their readable
+/// filenames. Any other value is represented by a stable hash.
+pub fn safe_component(value: &str) -> String {
+    let normalized = value.trim().to_ascii_lowercase();
+    let is_safe = !normalized.is_empty()
+        && normalized.len() <= 160
+        && normalized
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_' || byte == b'-');
+    if is_safe {
+        return normalized;
+    }
+
+    let digest = Sha256::digest(normalized.as_bytes());
+    format!("unsafe_{digest:x}")
 }
 
 /// Make sure `path`'s parent directory exists. No-op if it already does.
@@ -154,5 +173,17 @@ mod tests {
         let path = dir.path().join("a").join("b").join("c.json");
         atomic_write_json(&path, &Sample { x: 1, s: "x".into() }).unwrap();
         assert!(path.exists());
+    }
+
+    #[test]
+    fn user_controlled_path_components_cannot_escape_state_directories() {
+        let component = safe_component("../../outside");
+        assert!(!component.contains('/'));
+        assert!(!component.contains(".."));
+
+        let positions = positions_path("/tmp/owner", "../../manager");
+        assert!(positions.starts_with(positions_dir()));
+        let audit = audit_record_path("../../digest");
+        assert!(audit.starts_with(audits_dir()));
     }
 }

@@ -33,7 +33,10 @@ impl DiskMarketStore {
     }
 
     pub fn default_state_dir() -> Self {
-        Self::new("artifacts/structx_state/markets")
+        let root = std::env::var("STRUCTX_STATE_DIR")
+            .map(PathBuf::from)
+            .unwrap_or_else(|_| PathBuf::from("artifacts/structx_state"));
+        Self::new(root.join("markets"))
     }
 
     fn latest_path(&self) -> PathBuf {

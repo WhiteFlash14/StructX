@@ -58,10 +58,10 @@ pub async fn audit_open_execution(
         "objectChanges": extract_object_changes(&input.execution_result),
     });
 
-    let path = std::env::temp_dir().join(format!(
-        "structx_audit_{}.json",
-        artifact.get("digest").and_then(serde_json::Value::as_str).unwrap_or("unknown")
-    ));
+    let artifact_digest =
+        artifact.get("digest").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+    let path = std::env::temp_dir()
+        .join(format!("structx_audit_{}.json", storage::safe_component(artifact_digest)));
     std::fs::write(&path, serde_json::to_vec_pretty(&artifact)?)?;
 
     let execution_status = input

@@ -2731,7 +2731,11 @@ fn parse_dusdc_to_raw(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "budget overflow"))?;
     let mut frac_string = frac.to_string();
     if frac_string.len() > 6 {
-        frac_string.truncate(6);
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "dUSDC budget supports up to 6 decimal places",
+        )
+        .into());
     }
     while frac_string.len() < 6 {
         frac_string.push('0');
@@ -2741,6 +2745,22 @@ fn parse_dusdc_to_raw(value: &str) -> Result<u64, Box<dyn std::error::Error>> {
     whole_raw
         .checked_add(frac_raw)
         .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "budget overflow").into())
+}
+
+#[cfg(test)]
+mod amount_parsing_tests {
+    use super::parse_dusdc_to_raw;
+
+    #[test]
+    fn accepts_six_decimal_dusdc_amounts() {
+        assert_eq!(parse_dusdc_to_raw("1.234567").unwrap(), 1_234_567);
+    }
+
+    #[test]
+    fn rejects_precision_that_would_be_silently_truncated() {
+        let error = parse_dusdc_to_raw("1.2345678").unwrap_err();
+        assert!(error.to_string().contains("up to 6 decimal places"));
+    }
 }
 
 fn dusdc_f64_to_raw(value: f64) -> Result<u64, Box<dyn std::error::Error>> {

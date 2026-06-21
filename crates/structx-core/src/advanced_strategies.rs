@@ -1358,6 +1358,7 @@ fn scale_weight_bps(weight: u64, bps: u16) -> Result<u64, AdvancedStrategyError>
     u64_checked(scaled)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn crash_bucket_leg(
     kind: AdvancedLegKind,
     role: &'static str,
@@ -1398,6 +1399,7 @@ fn crash_bucket_leg(
     })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn tail_ladder_leg(
     kind: AdvancedLegKind,
     role: &'static str,

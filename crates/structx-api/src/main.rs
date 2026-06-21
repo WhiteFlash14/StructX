@@ -7,7 +7,7 @@ mod storage;
 
 use axum::{
     extract::{Path, Query, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     response::IntoResponse,
     routing::{get, post},
     Json, Router,
@@ -115,6 +115,28 @@ fn normalize_address(address: &str) -> String {
     }
 }
 
+fn is_sui_hex_id(value: &str) -> bool {
+    let value = value.trim();
+    let Some(hex) = value.strip_prefix("0x").or_else(|| value.strip_prefix("0X")) else {
+        return false;
+    };
+    !hex.is_empty() && hex.len() <= 64 && hex.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn cors_layer() -> CorsLayer {
+    let configured = env::var("STRUCTX_ALLOWED_ORIGINS")
+        .unwrap_or_else(|_| "http://localhost:3000,http://127.0.0.1:3000".to_string());
+    let origins = configured
+        .split(',')
+        .filter_map(|origin| origin.trim().parse::<HeaderValue>().ok())
+        .collect::<Vec<_>>();
+
+    CorsLayer::new()
+        .allow_origin(origins)
+        .allow_methods([Method::GET, Method::POST])
+        .allow_headers([header::CONTENT_TYPE])
+}
+
 fn load_managers(path: &std::path::Path) -> HashMap<String, String> {
     match std::fs::read_to_string(path) {
         Ok(contents) => {
@@ -174,10 +196,12 @@ struct AuditOpenStrategyRequest {
     #[serde(rename = "compiledStrategyId")]
     compiled_strategy_id: String,
     digest: String,
-    effects: serde_json::Value,
-    events: Vec<serde_json::Value>,
+    #[serde(rename = "effects")]
+    _effects: serde_json::Value,
+    #[serde(rename = "events")]
+    _events: Vec<serde_json::Value>,
     #[serde(rename = "objectChanges")]
-    object_changes: Vec<serde_json::Value>,
+    _object_changes: Vec<serde_json::Value>,
 }
 
 #[derive(Debug, Serialize)]
@@ -280,7 +304,8 @@ struct AuditIntentExecutionRequest {
     tx_digest: String,
     user_address: Option<String>,
     manager_id: Option<String>,
-    execution_result: Option<serde_json::Value>,
+    #[serde(rename = "execution_result")]
+    _execution_result: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -486,9 +511,12 @@ async fn main() {
         );
     }
 
-    let managers_path = env::var("STRUCTX_MANAGERS_PATH")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("data/managers.json"));
+    let managers_path = env::var("STRUCTX_MANAGERS_PATH").map(PathBuf::from).unwrap_or_else(|_| {
+        env::var("STRUCTX_STATE_DIR")
+            .map(PathBuf::from)
+            .map(|root| root.join("managers.json"))
+            .unwrap_or_else(|_| PathBuf::from("data/managers.json"))
+    });
     let managers_initial = load_managers(&managers_path);
     println!(
         "Loaded {} stored PredictManager(s) from {}",
@@ -541,7 +569,7 @@ async fn main() {
         )
         .route("/api/devinspect-mint-breakout", post(devinspect_mint_breakout))
         .route("/api/devinspect-redeem-breakout", post(devinspect_redeem_breakout))
-        .layer(CorsLayer::permissive())
+        .layer(cors_layer())
         .with_state(state);
 
     let addr: SocketAddr = env::var("STRUCTX_API_ADDR")
@@ -559,6 +587,28 @@ async fn build_open_strategy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<BuildOpenStrategyRequest>,
 ) -> impl IntoResponse {
+    if req.slippage_bps > 10_000 {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(serde_json::json!({
+                "ok": false,
+                "error": "slippageBps must be between 0 and 10000"
+            })),
+        );
+    }
+    let max_premium_raw = match req.max_premium_raw.parse::<u128>() {
+        Ok(value) if value > 0 => value,
+        _ => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": "maxPremiumRaw must be a positive integer"
+                })),
+            );
+        }
+    };
+
     let cached_compiled = {
         let cache = state.compiled.lock().await;
         cache.get(&req.compiled_strategy_id).cloned()
@@ -574,8 +624,10 @@ async fn build_open_strategy(
         );
     };
 
-    let max_premium_after_slippage =
-        ceil_mul_bps(&req.max_premium_raw, req.slippage_bps).parse::<u128>().unwrap_or(u128::MAX);
+    let max_premium_after_slippage = max_premium_raw
+        .saturating_mul(10_000u128 + u128::from(req.slippage_bps))
+        .saturating_add(9_999)
+        / 10_000;
     let mut excluded_oracle_ids = Vec::new();
     let mut last_mintability_error: Option<serde_json::Value> = None;
     let mut attempted_oracle_ids = Vec::new();
@@ -606,10 +658,18 @@ async fn build_open_strategy(
             .unwrap_or(u128::MAX);
 
         if premium_required > max_premium_after_slippage {
-            best_effort_warnings.push(format!(
-                "Live premium {} exceeded the preview slippage-adjusted cap {}; best-effort sizing is being used instead of the exact preview amount.",
-                premium_required, max_premium_after_slippage
-            ));
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "code": "PREMIUM_EXCEEDS_SLIPPAGE_CAP",
+                    "title": "Price moved beyond your limit",
+                    "message": format!(
+                        "The live premium is {premium_required} raw dUSDC, above your limit of {max_premium_after_slippage}."
+                    ),
+                    "action": "Preview the strategy again to review the latest price before opening it."
+                })),
+            );
         }
 
         let compiled_strategy_id = refreshed_compiled
@@ -632,6 +692,7 @@ async fn build_open_strategy(
             &req.manager_id,
             &refreshed_compiled,
             &expiry_ms,
+            true,
         )
         .await
         {
@@ -686,7 +747,7 @@ async fn build_open_strategy(
     let mut warnings =
         compiled.get("warnings").and_then(serde_json::Value::as_array).cloned().unwrap_or_default();
     warnings.push(serde_json::Value::String(
-        "Slippage is enforced before transaction build; Predict mint entrypoints do not take max-cost arguments.".to_string(),
+        "StructX checks your price limit before building and checks the complete transaction again before your wallet opens it.".to_string(),
     ));
     for warning in best_effort_warnings {
         warnings.push(serde_json::Value::String(warning));
@@ -736,6 +797,19 @@ async fn audit_open_strategy(
     State(state): State<Arc<AppState>>,
     Json(req): Json<AuditOpenStrategyRequest>,
 ) -> impl IntoResponse {
+    let execution_result = match fetch_verified_execution(&req.digest, Some(&req.owner)).await {
+        Ok(result) => result,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "error": error
+                })),
+            );
+        }
+    };
+
     let raw_compiled_strategy = {
         let cache = state.compiled.lock().await;
         cache.get(&req.compiled_strategy_id).cloned()
@@ -752,12 +826,7 @@ async fn audit_open_strategy(
         user_address: Some(req.owner.clone()),
         manager_id: Some(req.manager_id.clone()),
         tx_digest: req.digest.clone(),
-        execution_result: serde_json::json!({
-            "digest": req.digest,
-            "effects": req.effects,
-            "events": req.events,
-            "objectChanges": req.object_changes,
-        }),
+        execution_result,
         raw_compiled_strategy,
         intent_proposal: None,
     };
@@ -800,6 +869,34 @@ async fn audit_open_strategy(
             )),
         ),
     }
+}
+
+async fn fetch_verified_execution(
+    digest: &str,
+    expected_sender: Option<&str>,
+) -> Result<serde_json::Value, String> {
+    let rpc = SuiRpcClient::new(DEFAULT_SUI_TESTNET_RPC_URL, Duration::from_secs(20))
+        .map_err(|err| format!("Unable to initialize Sui RPC verification: {err}"))?;
+    let result = rpc
+        .get_transaction_block(digest)
+        .await
+        .map_err(|err| format!("Unable to verify transaction {digest} on Sui Testnet: {err}"))?;
+
+    if let Some(expected) = expected_sender {
+        let actual = result
+            .get("transaction")
+            .and_then(|transaction| transaction.get("data"))
+            .and_then(|data| data.get("sender"))
+            .and_then(serde_json::Value::as_str)
+            .ok_or_else(|| "The verified transaction is missing its sender address.".to_string())?;
+        if normalize_address(actual) != normalize_address(expected) {
+            return Err(format!(
+                "The transaction sender {actual} does not match the connected wallet {expected}."
+            ));
+        }
+    }
+
+    Ok(result)
 }
 
 fn json_value_as_u128_string(value: &serde_json::Value) -> Option<String> {
@@ -1088,12 +1185,20 @@ async fn audit_intent_execution(Json(req): Json<AuditIntentExecutionRequest>) ->
         }
     };
 
-    let raw_execution_result = req.execution_result.unwrap_or_else(|| {
-        serde_json::json!({
-            "digest": req.tx_digest,
-            "source": "frontend_wallet_execution"
-        })
-    });
+    let expected_sender = req.user_address.as_deref().or(stored.proposal.user_address.as_deref());
+    let raw_execution_result = match fetch_verified_execution(&req.tx_digest, expected_sender).await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "message": error
+                })),
+            );
+        }
+    };
 
     let now = intent_audit_now_ms();
     let mut warnings = stored.proposal.warnings.clone();
@@ -1431,6 +1536,16 @@ async fn compile_strategy_json_value(
     barrier_near_range_weight_bps: Option<u16>,
     barrier_tail_gamma_bps: Option<u16>,
 ) -> Result<serde_json::Value, (StatusCode, serde_json::Value)> {
+    if slippage_bps > 10_000 {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            serde_json::json!({
+                "ok": false,
+                "error": "slippageBps must be between 0 and 10000"
+            }),
+        ));
+    }
+
     let requested = normalize_strategy_id(strategy);
     let needs_template = false;
     let args = service::CompileStrategyJsonArgs {
@@ -1856,9 +1971,11 @@ fn deterministic_parse_intent(req: &ParseIntentRequest) -> ParsedIntent {
         reasoning_summary: reasoning_for_recommendation(goal, recommended_strategy).to_string(),
         missing_fields,
         warnings: vec![
-            "AI-assisted strategy discovery is not financial advice.".to_string(),
-            "DeepBook Predict integration is testnet-only.".to_string(),
-            "Final premium, payoff, and transaction are produced by deterministic StructX compiler logic.".to_string(),
+            "Use this strategy suggestion as a starting point and review the payoff before opening."
+                .to_string(),
+            "This version uses DeepBook Predict on Sui Testnet.".to_string(),
+            "StructX calculates the premium and payoff from the selected market before your wallet opens the position."
+                .to_string(),
         ],
     };
 
@@ -1903,16 +2020,15 @@ fn validate_and_rewrite_intent(parsed: &mut ParsedIntent) {
         parsed.missing_fields.push("budgetDUSDC".to_string());
     }
 
-    if !parsed
-        .warnings
-        .iter()
-        .any(|warning| warning.to_lowercase().contains("not financial advice"))
-    {
-        parsed.warnings.push("AI-assisted strategy discovery is not financial advice.".to_string());
+    if !parsed.warnings.iter().any(|warning| warning.to_lowercase().contains("starting point")) {
+        parsed.warnings.push(
+            "Use this strategy suggestion as a starting point and review the payoff before opening."
+                .to_string(),
+        );
     }
 
     if !parsed.warnings.iter().any(|warning| warning.to_lowercase().contains("testnet")) {
-        parsed.warnings.push("DeepBook Predict integration is testnet-only.".to_string());
+        parsed.warnings.push("This version uses DeepBook Predict on Sui Testnet.".to_string());
     }
 
     parsed.ok = parsed.missing_fields.is_empty();
@@ -1954,44 +2070,44 @@ fn style_from_goal_and_risk(goal: &str, risk: &str) -> &'static str {
 fn reasoning_for_recommendation(goal: &str, recommended_strategy: &str) -> &'static str {
     match recommended_strategy {
         "PORTFOLIO_CRASH_SHIELD" => {
-            "Portfolio-Aware Crash Shield is recommended because it targets downside protection against deeper BTC sell-offs while keeping risk defined by premium."
+            "Crash Insurance fits your view by sizing downside protection around a deeper BTC sell-off. Your maximum loss is the premium."
         }
         "CONVEX_TAIL_LADDER" => {
-            "Convex Tail Ladder is recommended because it buys two-sided terminal move exposure, with more payoff allocated to larger expiry moves."
+            "Convex Tail Ladder covers moves in either direction and puts more of the payout in the largest expiry moves."
         }
         "EXPIRY_MOVE_NOTE" => {
-            "Expiry Move Note is recommended because it expresses a view that BTC will settle meaningfully away from the current oracle price at expiry."
+            "Expiry Move Note fits a view that BTC will finish well away from its current price."
         }
         "MOONSHOT_UPSIDE" => {
-            "Moonshot Upside is recommended because it keeps risk defined while concentrating payoff into upside expiry outcomes above the upper band."
+            "Moonshot Upside focuses the payout above the upper band while keeping your maximum loss to the premium."
         }
         "UPSIDE_STEP_LADDER" => {
-            "Upside Step Ladder is recommended because it stages defined-risk upside payout across a grind-higher range, a breakout range, and a continuation tail."
+            "Upside Step Ladder builds the payout across a steady rise, a breakout, and a larger continuation move."
         }
         "DOWNSIDE_STEP_LADDER" => {
-            "Downside Step Ladder is recommended because it stages defined-risk bearish payout across a mild breakdown range, a lower breakdown range, and a continuation tail."
+            "Downside Step Ladder builds the payout across a steady decline, a breakdown, and a larger continuation move."
         }
         "CENTER_BAND_CONDOR" => {
-            "Center Band Condor is recommended because it concentrates payout near the center band while still keeping smaller outside wings on both sides."
+            "Center Band Condor puts most of the payout near the current price and keeps smaller ranges on either side."
         }
         "DOWNSIDE_CONVEXITY" => {
-            "Downside Convexity is recommended because it concentrates defined-risk payoff into bearish expiry outcomes below the lower breakdown band."
+            "Downside Convexity focuses the payout below the lower band while keeping your maximum loss to the premium."
         }
         "SMART_BUDGET_SELECTOR" => {
-            "Smart Budget Selector is recommended because it compares multiple executable strategy candidates and chooses the best fit for your budget and style."
+            "StructX compared the available strategies and chose the one that fits your budget and preferred payoff style."
         }
         _ => match goal {
             "downside_protection" => {
-                "Breakout Protection is recommended because it can allocate more exposure to downside tail protection while keeping risk defined by the premium."
+                "Breakout Protection can put more of your budget into the downside tail while keeping your maximum loss to the premium."
             }
             "upside_speculation" => {
-                "Breakout Protection is recommended for this milestone because the breakout structure can still express upside participation with defined risk."
+                "Breakout Protection gives you upside participation with a maximum loss set by the premium."
             }
             "two_sided_breakout" => {
-                "Breakout Protection is recommended because the user is expressing a large-move view without requiring a single direction."
+                "Breakout Protection fits a large-move view that covers either direction."
             }
             _ => {
-                "Breakout Protection is recommended as the currently supported defined-risk strategy."
+                "Breakout Protection gives you a clear, defined-risk payoff across both sides of the market."
             }
         },
     }
@@ -2300,8 +2416,14 @@ async fn find_mintable_strategy(
         );
     };
 
-    match find_best_effort_mintable_compiled(&req.owner, &req.manager_id, &compiled, &expiry_ms)
-        .await
+    match find_best_effort_mintable_compiled(
+        &req.owner,
+        &req.manager_id,
+        &compiled,
+        &expiry_ms,
+        false,
+    )
+    .await
     {
         Ok((mintable_compiled, extra_warnings)) => {
             if let Some(id) =
@@ -3499,12 +3621,12 @@ async fn put_manager_for_address(
     let started = Instant::now();
     let key = normalize_address(&address);
     let manager_id = body.manager_id.trim().to_string();
-    if !manager_id.starts_with("0x") || manager_id.len() < 4 {
+    if !is_sui_hex_id(&address) || !is_sui_hex_id(&manager_id) {
         return Err((
             StatusCode::BAD_REQUEST,
             Json(serde_json::json!({
                 "ok": false,
-                "error": "managerId must be a 0x-prefixed object id"
+                "error": "address and managerId must be valid 0x-prefixed Sui identifiers"
             })),
         ));
     }
@@ -3806,9 +3928,19 @@ async fn find_best_effort_mintable_compiled(
     manager_id: &str,
     compiled: &serde_json::Value,
     expiry_ms: &str,
+    allow_manager_funding: bool,
 ) -> Result<(serde_json::Value, Vec<String>), (StatusCode, serde_json::Value)> {
     match assert_compiled_plan_mintable(owner, manager_id, compiled, expiry_ms).await {
         Ok(()) => return Ok((compiled.clone(), Vec::new())),
+        Err((_, value)) if allow_manager_funding && is_balance_manager_funding_failure(&value) => {
+            return Ok((
+                compiled.clone(),
+                vec![
+                    "The selected PredictManager needs funding. The wallet will add the required dUSDC in the same transaction before the positions are opened."
+                        .to_string(),
+                ],
+            ));
+        }
         Err((status, value)) if !is_mintable_ask_failure(&value) => {
             return Err((status, value));
         }
@@ -3830,7 +3962,7 @@ async fn find_best_effort_mintable_compiled(
                 return Ok((
                     adjusted,
                     vec![format!(
-                        "Best-effort execution reduced the live mint size to {}% of the previewed quantities so the transaction could pass mintability checks.",
+                        "The live market could support {}% of the previewed size, so StructX reduced each position before preparing the transaction.",
                         format_bps_percent(scale_bps)
                     )],
                 ));
@@ -4146,6 +4278,45 @@ fn is_mintable_ask_failure(value: &serde_json::Value) -> bool {
                 || message.contains("code 7")
         })
         .unwrap_or(false)
+}
+
+fn is_balance_manager_funding_failure(value: &serde_json::Value) -> bool {
+    let error_matches = value
+        .get("error")
+        .and_then(serde_json::Value::as_str)
+        .map(|message| {
+            let message = message.to_ascii_lowercase();
+            (message.contains("balance_manager")
+                && message.contains("withdraw_with_proof")
+                && message.contains("code 3"))
+                || message.contains("ebalancemanagerbalancetoolow")
+        })
+        .unwrap_or(false);
+
+    let abort = value
+        .get("details")
+        .and_then(|details| details.get("effects"))
+        .and_then(|effects| effects.get("abortError"));
+    let structured_matches = abort
+        .map(|abort| {
+            let module = abort
+                .get("module_id")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let function = abort
+                .get("function")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let code = abort.get("error_code").and_then(serde_json::Value::as_u64);
+            module.contains("balance_manager")
+                && function == "withdraw_with_proof"
+                && code == Some(3)
+        })
+        .unwrap_or(false);
+
+    error_matches || structured_matches
 }
 
 fn format_bps_percent(scale_bps: u16) -> String {
@@ -4613,5 +4784,46 @@ async fn devinspect_redeem_breakout(
                 stderr: err.to_string(),
             }),
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{is_balance_manager_funding_failure, is_sui_hex_id};
+
+    #[test]
+    fn recognizes_structured_manager_funding_abort() {
+        let value = serde_json::json!({
+            "error": "devInspect failed",
+            "details": {
+                "effects": {
+                    "abortError": {
+                        "module_id": "0x74cd::balance_manager",
+                        "function": "withdraw_with_proof",
+                        "error_code": 3
+                    }
+                }
+            }
+        });
+
+        assert!(is_balance_manager_funding_failure(&value));
+    }
+
+    #[test]
+    fn rejects_unrelated_code_three_abort() {
+        let value = serde_json::json!({
+            "error": "devInspect failed: abort=0x1::other::withdraw_with_proof code 3"
+        });
+
+        assert!(!is_balance_manager_funding_failure(&value));
+    }
+
+    #[test]
+    fn validates_sui_identifiers_used_by_manager_storage() {
+        assert!(is_sui_hex_id("0x55a0"));
+        assert!(is_sui_hex_id(&format!("0x{}", "a".repeat(64))));
+        assert!(!is_sui_hex_id("../../manager"));
+        assert!(!is_sui_hex_id("0xzz"));
+        assert!(!is_sui_hex_id(&format!("0x{}", "a".repeat(65))));
     }
 }

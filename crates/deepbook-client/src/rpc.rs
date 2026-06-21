@@ -48,6 +48,24 @@ impl SuiRpcClient {
         .await
     }
 
+    pub async fn get_transaction_block(&self, digest: &str) -> Result<Value> {
+        self.call(
+            "sui_getTransactionBlock",
+            json!([
+                digest,
+                {
+                    "showInput": true,
+                    "showRawInput": false,
+                    "showEffects": true,
+                    "showEvents": true,
+                    "showObjectChanges": true,
+                    "showBalanceChanges": true
+                }
+            ]),
+        )
+        .await
+    }
+
     pub async fn dev_inspect_transaction_kind(
         &self,
         sender: &str,

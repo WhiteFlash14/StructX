@@ -121,7 +121,7 @@ pub fn parse_intent_deterministic(request: UserIntentRequest) -> anyhow::Result<
     if normalized.contains("touch") || normalized.contains("hit ") || normalized.contains("reaches")
     {
         warnings.push(
-            "DeepBook Predict settles at expiry; this is not a touch/barrier product unless the protocol market explicitly settles that way."
+            "DeepBook Predict uses the final settlement price at expiry. A price touching the level earlier does not trigger this strategy."
                 .to_string(),
         );
     }
