@@ -18,7 +18,33 @@
 
 ---
 
-**Explore:** [The idea](#the-idea) · [Product experience](#product-experience) · [Strategy library](#strategy-library) · [Execution](#how-execution-works) · [Architecture](#architecture) · [Run locally](#run-locally) · [DeepBook integration](#deepbook-integration) · [Vision](#vision)
+## Table of Contents
+
+- [The idea](#the-idea)
+- [Why StructX matters](#why-structx-matters)
+- [Product experience](#product-experience)
+  - [Normal Mode](#normal-mode)
+  - [Advanced Mode](#advanced-mode)
+- [Strategy library](#strategy-library)
+  - [Example: Breakout Protection](#example-breakout-protection)
+- [How execution works](#how-execution-works)
+- [Architecture](#architecture)
+  - [Crate responsibilities](#crate-responsibilities)
+  - [Frontend surfaces](#frontend-surfaces)
+- [Safety model](#safety-model)
+- [Transaction Hashes](#transaction-hashes)
+- [Repository layout](#repository-layout)
+- [Run locally](#run-locally)
+  - [Prerequisites](#prerequisites)
+  - [1. Clone the repository](#1-clone-the-repository)
+  - [2. Start the Rust API](#2-start-the-rust-api)
+  - [3. Start the frontend](#3-start-the-frontend)
+  - [4. Open a strategy](#4-open-a-strategy)
+- [Configuration](#configuration)
+- [CLI and diagnostics](#cli-and-diagnostics)
+- [Verification](#verification)
+- [DeepBook integration](#deepbook-integration)
+- [License](#license)
 
 ## The idea
 
@@ -166,6 +192,13 @@ The interface shows the important transaction details before the wallet opens. T
 - **Object validation:** shared object ownership, versions, types, and Predict ABI shapes are checked before transaction construction.
 - **Freshness rules:** stale price, SVI, and expiry data are filtered before market selection.
 - **Durable records:** proposals, audits, redemptions, market snapshots, and positions are stored with atomic writes and safe path handling.
+
+## Transaction Hashes
+
+`Normal Mode : ` https://testnet.suivision.xyz/txblock/2v7X7TKDyGqAcPSNPTQTFdh3QkHADXEf7TVsrAiLkokf
+
+`Advanced Mode: ` https://testnet.suivision.xyz/txblock/EsTe9VFgSHrm4rsYgBigwVtTpCFGUVqF5rxL54WRBpb4
+
 
 ## Repository layout
 
