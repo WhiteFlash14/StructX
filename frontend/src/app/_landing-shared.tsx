@@ -4,6 +4,7 @@
 import Link from "next/link";
 
 import { HeaderConnect } from "@/components/landing/HeaderConnect";
+import Image from "next/image";
 
 export function BrandMark({ size = 44 }: { size?: number }) {
   // Flat teal square (small corner radius) with a bold "X" cross — Aleph-style monogram.
@@ -44,7 +45,14 @@ export function LandingHeader({
         */}
         <div className="landing-brand-wrap">
           <Link href="/" className="landing-brand" aria-label="StructX home">
-            <BrandMark />
+            <Image
+              src="/structx_x_logo_transparent_1x1.png"
+              alt=""
+              width={42}
+              height={42}
+              className="landing-brand-logo"
+              priority
+            />
             <span className="landing-brand-text">StructX</span>
           </Link>
           <a
@@ -92,7 +100,14 @@ export function LandingFooter() {
         <div className="landing-footer-meta">
           <div className="landing-footer-brand-block">
             <div className="landing-footer-brand">
-              <BrandMark size={22} />
+              <Image
+                src="/structx_x_logo_transparent_1x1.png"
+                alt=""
+                width={22}
+                height={22}
+                className="landing-brand-logo"
+                priority
+              />
               <strong>StructX</strong>
               <span className="landing-footer-year">© {new Date().getFullYear()}</span>
             </div>
