@@ -96,8 +96,18 @@ pub async fn quote_intent_plan<S: MarketStore + ?Sized>(
     let max_loss = extract_u64_any(&raw_compiled_strategy, &["maxLossRaw", "max_loss", "maxLoss"])
         .unwrap_or(total_premium);
 
-    let payoff_table = extract_payoff_rows(&raw_compiled_strategy)
+    let mut payoff_table = extract_payoff_rows(&raw_compiled_strategy)
         .unwrap_or_else(|| fallback_payoff_table(&legs, total_premium));
+
+    if paying_legs_leave_a_gap(&legs) && !payoff_table.iter().any(|row| row.gross_payout == 0) {
+        payoff_table.push(PayoffRow {
+            label: "Any BTC settlement price outside the paying regions".to_string(),
+            settlement_lower: None,
+            settlement_upper: None,
+            gross_payout: 0,
+            net_pnl: -(total_premium as i128),
+        });
+    }
 
     let net_pnl_table = payoff_table
         .iter()
@@ -132,10 +142,10 @@ pub async fn quote_intent_plan<S: MarketStore + ?Sized>(
         ));
     }
     if selected_market.oracle_id != requested_market.oracle_id {
-        warnings.push(format!(
-            "The first market was unavailable for a clean quote, so StructX used oracle {} for this preview.",
-            selected_market.oracle_id
-        ));
+        warnings.push(
+            "StructX could not get a reliable quote from the first matching market, so it used another active BTC market for this preview."
+                .to_string(),
+        );
     }
 
     Ok(ExecutionProposal {
@@ -144,8 +154,8 @@ pub async fn quote_intent_plan<S: MarketStore + ?Sized>(
         raw_prompt: request.intent_plan.raw_prompt.clone(),
         selected_market: selected_market.clone(),
         reason_for_selection: format!(
-            "Selected active {} market matching '{}'.",
-            selected_market.underlying, request.intent_plan.market_query
+            "StructX selected the nearest active {} market that matched your request.",
+            selected_market.underlying
         ),
         strategy_template: request.intent_plan.strategy_template,
         backend_strategy_id,
@@ -476,6 +486,48 @@ fn fallback_payoff_table(legs: &[CompiledProposalLeg], total_premium: u64) -> Ve
         .collect()
 }
 
+fn paying_legs_leave_a_gap(legs: &[CompiledProposalLeg]) -> bool {
+    let furthest_down = legs
+        .iter()
+        .filter(|leg| leg.kind.eq_ignore_ascii_case("DOWN"))
+        .filter_map(|leg| leg.strike)
+        .max();
+    let nearest_up = legs
+        .iter()
+        .filter(|leg| leg.kind.eq_ignore_ascii_case("UP"))
+        .filter_map(|leg| leg.strike)
+        .min();
+
+    let (Some(mut covered_through), Some(nearest_up)) = (furthest_down, nearest_up) else {
+        return true;
+    };
+    if nearest_up <= covered_through {
+        return false;
+    }
+
+    let mut ranges = legs
+        .iter()
+        .filter(|leg| leg.kind.eq_ignore_ascii_case("RANGE"))
+        .filter_map(|leg| Some((leg.lower?, leg.upper?)))
+        .collect::<Vec<_>>();
+    ranges.sort_by_key(|(lower, _)| *lower);
+
+    for (lower, upper) in ranges {
+        if lower >= nearest_up {
+            break;
+        }
+        if lower > covered_through {
+            return true;
+        }
+        covered_through = covered_through.max(upper);
+        if covered_through >= nearest_up {
+            return false;
+        }
+    }
+
+    nearest_up > covered_through
+}
+
 fn extract_string_any(raw: &Value, paths: &[&str]) -> Option<String> {
     paths.iter().find_map(|path| {
         let value = get_path(raw, path)?;
@@ -594,5 +646,65 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].gross_payout, 25_000_000);
         assert_eq!(rows[0].net_pnl, 5_000_000);
+    }
+    #[test]
+    fn detects_uncovered_moonshot_settlement_region() {
+        let legs = vec![
+            CompiledProposalLeg {
+                kind: "RANGE".to_string(),
+                oracle_id: "0xoracle".to_string(),
+                expiry_ms: 1,
+                strike: None,
+                lower: Some(64_360),
+                upper: Some(64_610),
+                quantity: 100,
+                ask_price: Some(1),
+                premium: Some(1),
+                role: None,
+                label: None,
+            },
+            CompiledProposalLeg {
+                kind: "UP".to_string(),
+                oracle_id: "0xoracle".to_string(),
+                expiry_ms: 1,
+                strike: Some(64_610),
+                lower: None,
+                upper: None,
+                quantity: 100,
+                ask_price: Some(1),
+                premium: Some(1),
+                role: None,
+                label: None,
+            },
+        ];
+
+        assert!(paying_legs_leave_a_gap(&legs));
+    }
+
+    #[test]
+    fn recognizes_full_coverage_between_binary_tails() {
+        let make_leg = |kind: &str,
+                        strike: Option<u64>,
+                        lower: Option<u64>,
+                        upper: Option<u64>| CompiledProposalLeg {
+            kind: kind.to_string(),
+            oracle_id: "0xoracle".to_string(),
+            expiry_ms: 1,
+            strike,
+            lower,
+            upper,
+            quantity: 100,
+            ask_price: Some(1),
+            premium: Some(1),
+            role: None,
+            label: None,
+        };
+        let legs = vec![
+            make_leg("DOWN", Some(60), None, None),
+            make_leg("RANGE", None, Some(60), Some(70)),
+            make_leg("UP", Some(70), None, None),
+        ];
+
+        assert!(!paying_legs_leave_a_gap(&legs));
     }
 }

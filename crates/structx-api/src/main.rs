@@ -1108,6 +1108,19 @@ async fn execute_intent_plan(
                 );
             }
         };
+    if let (Some(requested), Some(quoted)) =
+        (req.user_address.as_deref(), stored.proposal.user_address.as_deref())
+    {
+        if normalize_address(requested) != normalize_address(quoted) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "message": "The connected wallet is different from the wallet that requested this quote. Plan the strategy again with the connected wallet."
+                })),
+            );
+        }
+    }
 
     let compiled_strategy_id = stored
         .proposal
@@ -1124,15 +1137,15 @@ async fn execute_intent_plan(
             .insert(id.clone(), stored.proposal.raw_compiled_strategy.clone());
     }
 
-    let mut warnings = stored.proposal.warnings.clone();
-    warnings.push(
-        "Frontend must build and sign the Sui transaction with the connected wallet. Backend validates and caches the compiled proposal but does not sign."
+    let warnings = vec![
+        "The quote is ready. Your connected wallet will show the complete Sui transaction before you approve it."
             .to_string(),
-    );
+    ];
+    let user_address = stored.proposal.user_address.clone().or(req.user_address);
 
     let response = IntentExecutePlanResponse {
         proposal_id: stored.proposal_id,
-        user_address: req.user_address.or(stored.proposal.user_address.clone()),
+        user_address,
         compiled_strategy_id,
         raw_compiled_strategy: stored.proposal.raw_compiled_strategy.clone(),
         proposal: stored.proposal,
@@ -1185,7 +1198,21 @@ async fn audit_intent_execution(Json(req): Json<AuditIntentExecutionRequest>) ->
         }
     };
 
-    let expected_sender = req.user_address.as_deref().or(stored.proposal.user_address.as_deref());
+    if let (Some(requested), Some(quoted)) =
+        (req.user_address.as_deref(), stored.proposal.user_address.as_deref())
+    {
+        if normalize_address(requested) != normalize_address(quoted) {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::json!({
+                    "ok": false,
+                    "message": "The transaction wallet does not match the wallet that requested this quote."
+                })),
+            );
+        }
+    }
+
+    let expected_sender = stored.proposal.user_address.as_deref().or(req.user_address.as_deref());
     let raw_execution_result = match fetch_verified_execution(&req.tx_digest, expected_sender).await
     {
         Ok(result) => result,
@@ -1212,12 +1239,13 @@ async fn audit_intent_execution(Json(req): Json<AuditIntentExecutionRequest>) ->
                 .to_string(),
         );
     }
+    let user_address = stored.proposal.user_address.clone().or(req.user_address);
 
     let audit = IntentExecutionAudit {
         schema_version: 1,
         audit_id: make_audit_id(&req.proposal_id, &req.tx_digest),
         proposal_id: req.proposal_id.clone(),
-        user_address: req.user_address.or(stored.proposal.user_address.clone()),
+        user_address,
         manager_id: inferred_manager_id.clone(),
         tx_digest: req.tx_digest.clone(),
         status: inferred_status,
